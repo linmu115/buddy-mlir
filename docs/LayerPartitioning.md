@@ -213,3 +213,16 @@ On the f32 DeepSeek R1 Distill Qwen 1.5B experiment:
 
 These numbers are machine- and job-count-dependent, but they show the expected
 benefit of compiling smaller graph fragments in parallel.
+
+## Pipeline-Parallel Stage Export
+
+The FP16 DeepSeek R1 Distill Qwen pipeline example traces one decoder layer
+interval at a time. The interval uses zero-based indices and excludes the end.
+The first stage takes token IDs. Other stages take hidden states. The final
+stage produces vocabulary logits, and earlier stages produce hidden states.
+Each stage owns two KV tensors per selected layer.
+
+The stage importer reuses the DeepSeek prefill and decode traces and lowering
+passes. Stage artifacts have their own weights and public ABI. See the
+[pipeline example](../examples/BuddyDeepSeekR1/pipeline/README.md) for the
+native x86 build, MPI run and output checks.
