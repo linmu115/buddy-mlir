@@ -197,9 +197,18 @@ def load_qwen3_moe(model_path: str, activation: str):
 # ──────────────────────────────────────────────────────────────────────────────
 
 
-def compile_graphs(model, config: dict):
+def compile_graphs(model, config: dict, *, hidden_input: bool = False):
     """Run DynamoCompiler to produce prefill and decode graphs."""
     max_token_len = config["shape"]["max_token_len"]
+
+    def trace_input(tokens):
+        if hidden_input:
+            return {
+                "inputs_embeds": torch.zeros(
+                    (1, tokens, model.config.hidden_size), dtype=model.dtype
+                )
+            }
+        return {"input_ids": torch.zeros((1, tokens), dtype=torch.int64)}
 
     prefill_compiler = DynamoCompiler(
         primary_registry=tosa.ops_registry,
@@ -217,21 +226,19 @@ def compile_graphs(model, config: dict):
             config=model.config, max_cache_len=max_token_len
         )
 
-        data_prefill = {
-            "input_ids": torch.zeros((1, max_token_len), dtype=torch.int64)
-        }
-        data_decode = {"input_ids": torch.zeros((1, 1), dtype=torch.int64)}
+        data_prefill = trace_input(max_token_len)
+        data_decode = trace_input(1)
         cache_position = decode_trace_position(max_token_len)
 
         graphs_prefill = prefill_compiler.importer(
             model,
-            input_ids=data_prefill["input_ids"],
+            **data_prefill,
             use_cache=True,
             cache_implementation="static",
         )
 
         model(
-            input_ids=data_decode["input_ids"],
+            **data_decode,
             past_key_values=past_kv_decode,
             use_cache=True,
             cache_implementation="static",
@@ -239,7 +246,7 @@ def compile_graphs(model, config: dict):
 
         graphs_decode = decode_compiler.importer(
             model,
-            input_ids=data_decode["input_ids"],
+            **data_decode,
             use_cache=True,
             cache_position=cache_position,
             past_key_values=past_kv_decode,
