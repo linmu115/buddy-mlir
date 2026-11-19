@@ -21,6 +21,7 @@
 #include <mpi.h>
 
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -29,6 +30,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 
 inline constexpr int32_t kActivationProtocolVersion = 1;
 inline constexpr int kActivationHeaderCount = 4;
@@ -304,8 +306,13 @@ private:
       os << formatActivationHeader(*received);
     else
       os << "<unavailable>";
-    const std::string message = os.str();
-    std::cerr << message << std::endl;
+    const std::string message = os.str() + '\n';
+    std::cerr.write(message.data(),
+                    static_cast<std::streamsize>(message.size()));
+    std::cerr.flush();
+    // Give the MPI launcher a moment to drain the redirected stderr pipe;
+    // otherwise MPI_Abort can race the diagnostic and drop it.
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
     MPI_Abort(comm, 1);
     std::_Exit(1);
   }
