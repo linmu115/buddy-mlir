@@ -1160,25 +1160,29 @@ def export_plain_weights_direct(
         )
 
     path = os.path.join(output_dir, weight[file_key])
-    mm = numpy.memmap(path, dtype=dtype, mode="w+", shape=(total_elements,))
-    offset = 0
     activation = config["precision"]["activation_type"]
-    for p in params:
-        count = p.numel()
-        tensor = p.detach()
-        if activation == "bf16":
-            param_f32 = tensor.float().numpy().reshape([-1])
-            part = numpy.frombuffer(
-                param_f32.astype(numpy.float32).tobytes(), dtype=numpy.uint16
-            )[1::2]
-            mm[offset : offset + count] = part
-        elif activation == "f16":
-            mm[offset : offset + count] = tensor.numpy().reshape([-1])
-        else:
-            mm[offset : offset + count] = tensor.numpy().reshape([-1])
-        offset += count
-    mm.flush()
-    del mm
+    written_elements = 0
+    with open(path, "wb") as f:
+        for p in params:
+            count = p.numel()
+            tensor = p.detach().contiguous()
+            if activation == "bf16":
+                param_f32 = tensor.float().numpy().reshape([-1])
+                part = numpy.frombuffer(
+                    param_f32.astype(numpy.float32, copy=False).tobytes(),
+                    dtype=numpy.uint16,
+                )[1::2]
+                numpy.ascontiguousarray(part, dtype=dtype).tofile(f)
+            else:
+                numpy.ascontiguousarray(
+                    tensor.numpy().reshape([-1]), dtype=dtype
+                ).tofile(f)
+            written_elements += count
+    if written_elements != total_elements:
+        raise RuntimeError(
+            f"wrote {written_elements} elements to {path}, "
+            f"expected {total_elements}"
+        )
 
     size_mb = os.path.getsize(path) / (1024 * 1024)
     print(
