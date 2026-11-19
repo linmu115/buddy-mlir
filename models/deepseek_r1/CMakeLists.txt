@@ -101,3 +101,34 @@ buddy_add_model(
   TIERED_KV_CACHE "${_BUDDY_DSR1_TIERED_ENABLED}"
   TIERED_CACHE_SIZES "${_BUDDY_DSR1_TIERED_CACHE_SIZES}"
 )
+
+# Optional MPI pipeline-parallel runner plugin (skipped when MPI is unavailable).
+find_package(MPI COMPONENTS CXX QUIET)
+if(MPI_CXX_FOUND)
+  add_library(buddy_models_deepseek_r1_pipeline_runner SHARED
+    pipeline/PipelineRunner.cpp
+    pipeline/PipelineRunnerPlugin.cpp
+  )
+  set_target_properties(buddy_models_deepseek_r1_pipeline_runner PROPERTIES
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
+    OUTPUT_NAME "deepseek_r1_pipeline_runner"
+    PREFIX ""
+  )
+  target_include_directories(buddy_models_deepseek_r1_pipeline_runner PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/pipeline"
+    "${CMAKE_SOURCE_DIR}/frontend/Interfaces"
+    "${CMAKE_BINARY_DIR}/frontend/Interfaces"
+  )
+  target_link_libraries(buddy_models_deepseek_r1_pipeline_runner PRIVATE
+    buddy_runtime_core
+    MPI::MPI_CXX
+    ${CMAKE_DL_LIBS}
+  )
+  target_compile_features(buddy_models_deepseek_r1_pipeline_runner PRIVATE
+    cxx_std_17
+  )
+else()
+  message(STATUS
+    "[deepseek_r1] MPI not found; skipping deepseek_r1_pipeline_runner plugin.")
+endif()
