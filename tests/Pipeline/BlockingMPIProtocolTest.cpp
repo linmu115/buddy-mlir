@@ -23,6 +23,7 @@
 #include <array>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <sstream>
 #include <stdexcept>
@@ -43,7 +44,8 @@ constexpr int kContext = 64;
 constexpr int kWidth = 1536;
 constexpr int kPromptRows = 5;
 
-StageConfig makeTestConfig() {
+StageConfig makeTestConfig(ActivationType dtype = ActivationType::F16,
+                           int prefillChunk = 0) {
   StageConfig cfg{};
   cfg.startLayer = 0;
   cfg.endLayer = 14;
@@ -52,8 +54,38 @@ StageConfig makeTestConfig() {
   cfg.activationWidth = kWidth;
   cfg.vocabSize = 151936;
   cfg.eosId = 151643;
-  cfg.dtype = ActivationType::F16;
+  cfg.dtype = dtype;
+  cfg.prefillChunk = prefillChunk;
   return cfg;
+}
+
+uint32_t makePatternF32Bits(int step, size_t index) {
+  // Include edge-case FP32 bit patterns (+0.0, -0.0, 1.0, subnormal, FLT_MAX,
+  // -FLT_MAX, quiet NaN) to verify raw MPI_FLOAT bit preservation.
+  static constexpr std::array<uint32_t, 7> special = {
+      0x00000000u, 0x80000000u, 0x3f800000u, 0x00000001u,
+      0x7f7fffffu, 0xff7fffffu, 0x7fc00001u};
+  if (index < special.size())
+    return special[index] ^ static_cast<uint32_t>(step * 0x01010101u);
+  return static_cast<uint32_t>((step + 1) * 2654435761u + index * 1315423911u);
+}
+
+std::vector<float> fillPayloadF32(int step, int rows) {
+  const size_t total = static_cast<size_t>(rows) * kWidth;
+  std::vector<float> buf(total);
+  for (size_t i = 0; i < total; ++i) {
+    const uint32_t bits = makePatternF32Bits(step, i);
+    std::memcpy(&buf[i], &bits, sizeof(float));
+  }
+  return buf;
+}
+
+void sendRawFrameF32(int peer, const std::array<int32_t, 4> &wireHeader,
+                     const float *payload, int payloadElements) {
+  mpiCheck(MPI_Send(wireHeader.data(), 4, MPI_INT32_T, peer, kHeaderTag,
+                    MPI_COMM_WORLD));
+  mpiCheck(MPI_Send(payload, payloadElements, MPI_FLOAT, peer, kActivationTag,
+                    MPI_COMM_WORLD));
 }
 
 uint16_t makePattern(int step, size_t index) {
@@ -333,6 +365,181 @@ int runBadInjection(const std::string &mode, const std::string &counterFile,
   return 0;
 }
 
+int runNormal2RankF32(int rank, int ranks) {
+  if (ranks != 2)
+    throw std::runtime_error("normal-f32 mode requires exactly 2 ranks");
+  const StageConfig cfg = makeTestConfig(ActivationType::F32, 0);
+  BlockingActivation activation(cfg, MPI_COMM_WORLD);
+  std::vector<float> recvBuf(static_cast<size_t>(kContext) * kWidth, 0.0f);
+
+  for (int step = 0; step < 3; ++step) {
+    const ActivationHeader expected =
+        makeActivationHeader(step, kPromptRows, kContext);
+    if (rank == 0) {
+      auto payload = fillPayloadF32(step, expected.rows);
+      activation.send(expected, payload.data(), 1);
+      int token = -1;
+      mpiCheck(MPI_Recv(&token, 1, MPI_INT, 1, kTokenTag, MPI_COMM_WORLD,
+                        MPI_STATUS_IGNORE));
+      if (token != 3000 + step)
+        throw std::runtime_error("rank 0 received unexpected token (f32)");
+    } else {
+      const ActivationHeader got =
+          activation.receive(recvBuf.data(), recvBuf.size(), 0, expected);
+      if (got != expected)
+        throw std::runtime_error("received f32 header does not match expected");
+      const size_t n = static_cast<size_t>(got.rows) * kWidth;
+      for (size_t i = 0; i < n; ++i) {
+        uint32_t gotBits = 0;
+        std::memcpy(&gotBits, &recvBuf[i], sizeof(uint32_t));
+        const uint32_t wantBits = makePatternF32Bits(step, i);
+        if (gotBits != wantBits) {
+          std::ostringstream os;
+          os << "f32 bit pattern mismatch at step=" << step << " idx=" << i
+             << " got=0x" << std::hex << gotBits << " want=0x" << wantBits;
+          throw std::runtime_error(os.str());
+        }
+      }
+      const int token = 3000 + step;
+      mpiCheck(MPI_Send(&token, 1, MPI_INT, 0, kTokenTag, MPI_COMM_WORLD));
+    }
+  }
+  if (rank == 1) {
+    std::cout << "PASS normal-2rank-f32: prefill=1 decode=2 bit-exact"
+              << std::endl;
+  }
+  return 0;
+}
+
+int runChunked2RankF32(int rank, int ranks) {
+  if (ranks != 2)
+    throw std::runtime_error("chunked-f32 mode requires exactly 2 ranks");
+  constexpr int kChunk = 32;
+  const StageConfig cfg = makeTestConfig(ActivationType::F32, kChunk);
+  BlockingActivation activation(cfg, MPI_COMM_WORLD);
+  std::vector<float> recvBuf(static_cast<size_t>(kChunk) * kWidth, 0.0f);
+
+  // Two prefill chunks (prompt len 40: [0..31], right-aligned [8..39]) + 2
+  // decode steps (pos 40, pos 41).
+  const std::array<ActivationHeader, 4> frames = {
+      makeChunkPrefillHeader(0, 0, kChunk, kContext),
+      makeChunkPrefillHeader(1, 8, kChunk, kContext),
+      makeChunkDecodeHeader(2, 40, kContext),
+      makeChunkDecodeHeader(3, 41, kContext),
+  };
+
+  for (size_t idx = 0; idx < frames.size(); ++idx) {
+    const ActivationHeader &expected = frames[idx];
+    const int step = static_cast<int>(idx);
+    if (rank == 0) {
+      auto payload = fillPayloadF32(step, expected.rows);
+      activation.send(expected, payload.data(), 1);
+      int token = -1;
+      mpiCheck(MPI_Recv(&token, 1, MPI_INT, 1, kTokenTag, MPI_COMM_WORLD,
+                        MPI_STATUS_IGNORE));
+      if (token != 4000 + step)
+        throw std::runtime_error("rank 0 received unexpected token (chunked)");
+    } else {
+      const ActivationHeader got =
+          activation.receive(recvBuf.data(), recvBuf.size(), 0, expected);
+      if (got != expected)
+        throw std::runtime_error("chunked f32 header mismatch");
+      const size_t n = static_cast<size_t>(got.rows) * kWidth;
+      for (size_t i = 0; i < n; ++i) {
+        uint32_t gotBits = 0;
+        std::memcpy(&gotBits, &recvBuf[i], sizeof(uint32_t));
+        const uint32_t wantBits = makePatternF32Bits(step, i);
+        if (gotBits != wantBits)
+          throw std::runtime_error("chunked f32 bit pattern mismatch");
+      }
+      const int token = 4000 + step;
+      mpiCheck(MPI_Send(&token, 1, MPI_INT, 0, kTokenTag, MPI_COMM_WORLD));
+    }
+  }
+  if (rank == 1) {
+    std::cout << "PASS chunked-2rank-f32: chunks=2 decode=2 bit-exact"
+              << std::endl;
+  }
+  return 0;
+}
+
+int runBadInjectionF32(const std::string &mode, const std::string &counterFile,
+                       int rank, int ranks) {
+  if (ranks != 2)
+    throw std::runtime_error(mode + " mode requires exactly 2 ranks");
+  constexpr int kChunk = 32;
+  const bool chunked =
+      (mode == "bad-chunk-rows-f32" || mode == "bad-short-chunk-f32");
+  const StageConfig cfg =
+      makeTestConfig(ActivationType::F32, chunked ? kChunk : 0);
+  BlockingActivation activation(cfg, MPI_COMM_WORLD);
+  const size_t cap =
+      static_cast<size_t>(chunked ? kChunk : kContext) * kWidth;
+  std::vector<float> recvBuf(cap, 0.0f);
+
+  int totalCalls = 0;
+  int prefillCalls = 0;
+  int decodeCalls = 0;
+  if (rank == 1)
+    writeCounterFile(counterFile, 0, 0, 0, -1, -1);
+
+  const int badStep = (mode == "bad-short-payload-f32") ? 1 : 0;
+  for (int step = 0; step <= badStep; ++step) {
+    const ActivationHeader expected =
+        chunked ? makeChunkPrefillHeader(step, 0, kChunk, kContext)
+                : makeActivationHeader(step, kPromptRows, kContext);
+    if (rank == 0) {
+      if (step < badStep) {
+        auto payload = fillPayloadF32(step, expected.rows);
+        activation.send(expected, payload.data(), 1);
+        int token = -1;
+        mpiCheck(MPI_Recv(&token, 1, MPI_INT, 1, kTokenTag, MPI_COMM_WORLD,
+                          MPI_STATUS_IGNORE));
+      } else if (mode == "bad-short-payload-f32") {
+        auto payload = fillPayloadF32(1, 1);
+        const std::array<int32_t, 4> validHeader = {kActivationProtocolVersion,
+                                                    1, kPromptRows, 1};
+        sendRawFrameF32(1, validHeader, payload.data(), kWidth - 1);
+        int token = -1;
+        mpiCheck(MPI_Recv(&token, 1, MPI_INT, 1, kTokenTag, MPI_COMM_WORLD,
+                          MPI_STATUS_IGNORE));
+      } else if (mode == "bad-chunk-rows-f32") {
+        auto payload = fillPayloadF32(0, kChunk / 2);
+        const std::array<int32_t, 4> badRowsHeader = {
+            kActivationProtocolVersion, 0, 0, kChunk / 2};
+        sendRawFrameF32(1, badRowsHeader, payload.data(),
+                        (kChunk / 2) * kWidth);
+        int token = -1;
+        mpiCheck(MPI_Recv(&token, 1, MPI_INT, 1, kTokenTag, MPI_COMM_WORLD,
+                          MPI_STATUS_IGNORE));
+      } else if (mode == "bad-short-chunk-f32") {
+        auto payload = fillPayloadF32(0, kChunk);
+        const std::array<int32_t, 4> validHeader = {kActivationProtocolVersion,
+                                                    0, 0, kChunk};
+        sendRawFrameF32(1, validHeader, payload.data(), kChunk * kWidth - 1);
+        int token = -1;
+        mpiCheck(MPI_Recv(&token, 1, MPI_INT, 1, kTokenTag, MPI_COMM_WORLD,
+                          MPI_STATUS_IGNORE));
+      } else {
+        throw std::runtime_error("unknown f32 bad injection mode: " + mode);
+      }
+    } else {
+      const ActivationHeader got =
+          activation.receive(recvBuf.data(), recvBuf.size(), 0, expected);
+      ++totalCalls;
+      if (got.rows > 1)
+        ++prefillCalls;
+      else
+        ++decodeCalls;
+      writeCounterFile(counterFile, totalCalls, prefillCalls, decodeCalls,
+                       got.step, got.pos);
+      const int token = 5000 + step;
+      mpiCheck(MPI_Send(&token, 1, MPI_INT, 0, kTokenTag, MPI_COMM_WORLD));
+    }
+  }
+  return 0;
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -354,6 +561,13 @@ int main(int argc, char **argv) {
       rc = runNormal2Rank(rank, ranks);
     else if (mode == "forward3")
       rc = runForward3Rank(rank, ranks);
+    else if (mode == "normal-f32")
+      rc = runNormal2RankF32(rank, ranks);
+    else if (mode == "chunked-f32")
+      rc = runChunked2RankF32(rank, ranks);
+    else if (mode == "bad-short-payload-f32" || mode == "bad-chunk-rows-f32" ||
+             mode == "bad-short-chunk-f32")
+      rc = runBadInjectionF32(mode, counterFile, rank, ranks);
     else
       rc = runBadInjection(mode, counterFile, rank, ranks);
     if (rc != 0) {

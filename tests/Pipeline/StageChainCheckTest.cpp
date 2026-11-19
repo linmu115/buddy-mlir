@@ -43,7 +43,8 @@ private:
 StageConfig makeStageConfig(int startLayer, int endLayer, int totalLayers = 28,
                             int context = 64, int activationWidth = 1536,
                             int vocabSize = 151936, int eosId = 151643,
-                            ActivationType dtype = ActivationType::F16) {
+                            ActivationType dtype = ActivationType::F16,
+                            int prefillChunk = 0) {
   StageConfig cfg{};
   cfg.startLayer = startLayer;
   cfg.endLayer = endLayer;
@@ -53,6 +54,7 @@ StageConfig makeStageConfig(int startLayer, int endLayer, int totalLayers = 28,
   cfg.vocabSize = vocabSize;
   cfg.eosId = eosId;
   cfg.dtype = dtype;
+  cfg.prefillChunk = prefillChunk;
   return cfg;
 }
 
@@ -99,6 +101,14 @@ void runValid2Rank(int rank, int ranks) {
                  makeCheckOpts("deepseek_r1_f16", true));
   checkAllStages(MPI_COMM_WORLD, rank, ranks, stage.configuration(),
                  makeCheckOpts("", false));
+  // Valid 2-rank f32 + chunked prefill (w4g32).
+  FakeStage f32Stage(
+      rank == 0 ? makeStageConfig(0, 14, 28, 1024, 1536, 151936, 151643,
+                                  ActivationType::F32, 64)
+                : makeStageConfig(14, 28, 28, 1024, 1536, 151936, 151643,
+                                  ActivationType::F32, 64));
+  checkAllStages(MPI_COMM_WORLD, rank, ranks, f32Stage.configuration(),
+                 makeCheckOpts("deepseek_r1_w4g32_prefill_chunk64", true));
   if (rank == 0)
     std::cout << "PASS stage-chain valid-2rank\n";
 }
@@ -238,6 +248,15 @@ void runFieldMismatch(int rank, int ranks) {
                           : makeStageConfig(14, 28, 28, 64, 1536, 151936,
                                             151643, ActivationType::F32),
                 opts, "dtype mismatch", "dtype-mismatch");
+
+  // prefillChunk mismatch
+  expectFailure(
+      rank, ranks,
+      rank == 0 ? makeStageConfig(0, 14, 28, 1024, 1536, 151936, 151643,
+                                  ActivationType::F32, 64)
+                : makeStageConfig(14, 28, 28, 1024, 1536, 151936, 151643,
+                                  ActivationType::F32, 32),
+      opts, "prefillChunk mismatch", "prefillChunk-mismatch");
 
   // Local inverted/empty interval on rank 1
   expectFailure(rank, ranks,

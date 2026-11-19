@@ -78,6 +78,11 @@ set(_BUDDY_PIPELINE_PROTOCOL_TESTS
   buddy-pipeline-protocol-bad-oob-pos
   buddy-pipeline-protocol-bad-short-payload
   buddy-pipeline-protocol-bad-short-prefill
+  buddy-pipeline-protocol-normal-f32
+  buddy-pipeline-protocol-chunked-f32
+  buddy-pipeline-protocol-bad-short-payload-f32
+  buddy-pipeline-protocol-bad-chunk-rows-f32
+  buddy-pipeline-protocol-bad-short-chunk-f32
 )
 
 set(_BUDDY_PIPELINE_CHAIN_TESTS
@@ -199,6 +204,71 @@ if(_BUDDY_PIPELINE_HAVE_MPI)
       --expect-fail
       --expect-output "payload element count mismatch"
       --counter-file "${_BUDDY_PIPELINE_PROTOCOL_WORK_DIR}/bad-short-prefill.counter"
+      --expect-compute-calls 0
+      --expect-prefill-calls 0
+      --expect-decode-calls 0
+  )
+  add_test(NAME buddy-pipeline-protocol-normal-f32
+    COMMAND "${Python3_EXECUTABLE}" "${_BUDDY_PIPELINE_PROTOCOL_RUNNER}"
+      --mpiexec "${MPIEXEC_EXECUTABLE}"
+      "--numproc-flag=${_BUDDY_PIPELINE_MPI_NUMPROC_FLAG}"
+      --ranks 2
+      --binary "$<TARGET_FILE:buddy-pipeline-protocol-test>"
+      --mode normal-f32
+      --timeout 60
+      --expect-output "PASS normal-2rank-f32"
+  )
+  add_test(NAME buddy-pipeline-protocol-chunked-f32
+    COMMAND "${Python3_EXECUTABLE}" "${_BUDDY_PIPELINE_PROTOCOL_RUNNER}"
+      --mpiexec "${MPIEXEC_EXECUTABLE}"
+      "--numproc-flag=${_BUDDY_PIPELINE_MPI_NUMPROC_FLAG}"
+      --ranks 2
+      --binary "$<TARGET_FILE:buddy-pipeline-protocol-test>"
+      --mode chunked-f32
+      --timeout 60
+      --expect-output "PASS chunked-2rank-f32"
+  )
+  add_test(NAME buddy-pipeline-protocol-bad-short-payload-f32
+    COMMAND "${Python3_EXECUTABLE}" "${_BUDDY_PIPELINE_PROTOCOL_RUNNER}"
+      --mpiexec "${MPIEXEC_EXECUTABLE}"
+      "--numproc-flag=${_BUDDY_PIPELINE_MPI_NUMPROC_FLAG}"
+      --ranks 2
+      --binary "$<TARGET_FILE:buddy-pipeline-protocol-test>"
+      --mode bad-short-payload-f32
+      --timeout 60
+      --expect-fail
+      --expect-output "payload element count mismatch"
+      --counter-file "${_BUDDY_PIPELINE_PROTOCOL_WORK_DIR}/bad-short-payload-f32.counter"
+      --expect-compute-calls 1
+      --expect-prefill-calls 1
+      --expect-decode-calls 0
+  )
+  add_test(NAME buddy-pipeline-protocol-bad-chunk-rows-f32
+    COMMAND "${Python3_EXECUTABLE}" "${_BUDDY_PIPELINE_PROTOCOL_RUNNER}"
+      --mpiexec "${MPIEXEC_EXECUTABLE}"
+      "--numproc-flag=${_BUDDY_PIPELINE_MPI_NUMPROC_FLAG}"
+      --ranks 2
+      --binary "$<TARGET_FILE:buddy-pipeline-protocol-test>"
+      --mode bad-chunk-rows-f32
+      --timeout 60
+      --expect-fail
+      --expect-output "header phase/pos/rows invalid"
+      --counter-file "${_BUDDY_PIPELINE_PROTOCOL_WORK_DIR}/bad-chunk-rows-f32.counter"
+      --expect-compute-calls 0
+      --expect-prefill-calls 0
+      --expect-decode-calls 0
+  )
+  add_test(NAME buddy-pipeline-protocol-bad-short-chunk-f32
+    COMMAND "${Python3_EXECUTABLE}" "${_BUDDY_PIPELINE_PROTOCOL_RUNNER}"
+      --mpiexec "${MPIEXEC_EXECUTABLE}"
+      "--numproc-flag=${_BUDDY_PIPELINE_MPI_NUMPROC_FLAG}"
+      --ranks 2
+      --binary "$<TARGET_FILE:buddy-pipeline-protocol-test>"
+      --mode bad-short-chunk-f32
+      --timeout 60
+      --expect-fail
+      --expect-output "payload element count mismatch"
+      --counter-file "${_BUDDY_PIPELINE_PROTOCOL_WORK_DIR}/bad-short-chunk-f32.counter"
       --expect-compute-calls 0
       --expect-prefill-calls 0
       --expect-decode-calls 0

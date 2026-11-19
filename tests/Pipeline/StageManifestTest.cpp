@@ -94,25 +94,40 @@ void testValidStages() {
   };
 
   for (const auto &tc : cases) {
-    Attrs attrs = makeValidStageAttrs(tc.start, tc.end, tc.total);
-    // Unrelated module attributes (such as model_name, vocab_uri,
-    // runner_library) must be ignored by parseStageV1.
-    attrs["model_name"] = "deepseek_r1_f16";
-    attrs["runner_library"] = "file:deepseek_r1_pipeline_runner.so";
-    if (tc.expectedStart == 0)
-      attrs["vocab_uri"] = "file:vocab.txt";
+    for (const std::string &dtype : {"f16", "f32"}) {
+      Attrs attrs = makeValidStageAttrs(tc.start, tc.end, tc.total, dtype);
+      // Unrelated module attributes (such as model_name, vocab_uri,
+      // runner_library) must be ignored by parseStageV1.
+      attrs["model_name"] =
+          dtype == "f16" ? "deepseek_r1_f16" : "deepseek_r1_w4g32";
+      attrs["runner_library"] = "file:deepseek_r1_pipeline_runner.so";
+      if (tc.expectedStart == 0)
+        attrs["vocab_uri"] = "file:vocab.txt";
 
+      const auto parsed = buddy::runtime::parseStageV1(attrs);
+      expectEqual(parsed.startLayer, tc.expectedStart,
+                  std::string(tc.name) + "." + dtype + ".startLayer");
+      expectEqual(parsed.endLayer, tc.expectedEnd,
+                  std::string(tc.name) + "." + dtype + ".endLayer");
+      expectEqual(parsed.totalLayers, tc.expectedTotal,
+                  std::string(tc.name) + "." + dtype + ".totalLayers");
+      expectEqual(parsed.activationType, dtype,
+                  std::string(tc.name) + "." + dtype + ".activationType");
+      expectEqual(parsed.activationWidth, 1536,
+                  std::string(tc.name) + "." + dtype + ".activationWidth");
+      expectEqual(parsed.prefillChunk, 0,
+                  std::string(tc.name) + "." + dtype + ".prefillChunk");
+    }
+  }
+
+  // Optional pp_prefill_chunk for w4g32 / chunked f32 stages.
+  for (const std::pair<const char *, int> &chunkCase :
+       {std::pair{"0", 0}, std::pair{"32", 32}, std::pair{"64", 64}}) {
+    Attrs attrs = makeValidStageAttrs("0", "14", "28", "f32", "1536");
+    attrs["pp_prefill_chunk"] = chunkCase.first;
     const auto parsed = buddy::runtime::parseStageV1(attrs);
-    expectEqual(parsed.startLayer, tc.expectedStart,
-                std::string(tc.name) + ".startLayer");
-    expectEqual(parsed.endLayer, tc.expectedEnd,
-                std::string(tc.name) + ".endLayer");
-    expectEqual(parsed.totalLayers, tc.expectedTotal,
-                std::string(tc.name) + ".totalLayers");
-    expectEqual(parsed.activationType, "f16",
-                std::string(tc.name) + ".activationType");
-    expectEqual(parsed.activationWidth, 1536,
-                std::string(tc.name) + ".activationWidth");
+    expectEqual(parsed.activationType, "f32", "chunked.activationType");
+    expectEqual(parsed.prefillChunk, chunkCase.second, "chunked.prefillChunk");
   }
 }
 
@@ -146,7 +161,7 @@ void testInvalidVersionAndDtype() {
                        "bad-version-" + badVersion);
   }
 
-  for (const std::string &badDtype : {"", "f32", "bf16", "FP16", "int8"}) {
+  for (const std::string &badDtype : {"", "bf16", "FP16", "FP32", "int8"}) {
     Attrs attrs = makeValidStageAttrs("0", "14", "28", badDtype);
     expectParseFailure(attrs, {"pp_activation_type"}, "bad-dtype-" + badDtype);
   }
@@ -172,6 +187,20 @@ void testInvalidIntervalsAndBounds() {
                      {"pp_activation_width"}, "zero-width");
   expectParseFailure(makeValidStageAttrs("0", "14", "28", "f16", "-1536"),
                      {"pp_activation_width"}, "negative-width");
+
+  // Negative or malformed optional pp_prefill_chunk.
+  {
+    Attrs attrs = makeValidStageAttrs("0", "14", "28", "f32");
+    attrs["pp_prefill_chunk"] = "-1";
+    expectParseFailure(attrs, {"pp_prefill_chunk", "non-negative"},
+                       "negative-prefill-chunk");
+  }
+  for (const std::string &badChunk : {"", "abc", "64 ", " 64"}) {
+    Attrs attrs = makeValidStageAttrs("0", "14", "28", "f32");
+    attrs["pp_prefill_chunk"] = badChunk;
+    expectParseFailure(attrs, {"pp_prefill_chunk", "integer"},
+                       "malformed-prefill-chunk-" + badChunk);
+  }
 }
 
 void testMalformedIntegers() {
