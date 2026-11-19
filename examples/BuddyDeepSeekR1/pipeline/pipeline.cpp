@@ -19,6 +19,7 @@
 #include "buddy/LLM/TextContainer.h"
 #include "buddy/runtime/llm/KVCacheManager.h"
 #include "buddy/runtime/llm/Sampler.h"
+#include "buddy/runtime/pipeline/Stage.h"
 
 #include <dlfcn.h>
 
@@ -38,20 +39,28 @@ constexpr int tokenTag = 1;
 class StageLibrary {
 public:
   explicit StageLibrary(const std::filesystem::path &directory) {
-    handle = dlopen((directory / "stage.so").c_str(), RTLD_NOW | RTLD_LOCAL);
+    const auto path = directory / "stage.so";
+    handle = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
     if (!handle)
-      throw std::runtime_error(dlerror());
+      throw std::runtime_error("cannot load " + path.string() + ": " +
+                               dlerror());
   }
   ~StageLibrary() { dlclose(handle); }
   StageLibrary(const StageLibrary &) = delete;
   StageLibrary &operator=(const StageLibrary &) = delete;
 
   std::unique_ptr<Stage> create(const char *directory) const {
+    dlerror();
     auto createStage =
         reinterpret_cast<CreateStage>(dlsym(handle, "createPipelineStage"));
+    if (const char *error = dlerror())
+      throw std::runtime_error(std::string("createPipelineStage: ") + error);
     if (!createStage)
-      throw std::runtime_error(dlerror());
-    return std::unique_ptr<Stage>(createStage(directory));
+      throw std::runtime_error("createPipelineStage symbol is null");
+    std::unique_ptr<Stage> stage(createStage(directory));
+    if (!stage)
+      throw std::runtime_error("createPipelineStage returned null");
+    return stage;
   }
 
 private:

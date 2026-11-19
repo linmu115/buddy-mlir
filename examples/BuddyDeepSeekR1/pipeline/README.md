@@ -43,7 +43,8 @@ build_stage() {
     --output-dir "$stage" --buddy-opt "$BUDDY_BUILD/bin/buddy-opt" \
     --llvm-tools-dir "$LLVM_BUILD/bin" --llc-attrs=-mcpu=native -j 1 || return
   "$LLVM_BUILD/bin/clang++" -O2 -std=c++17 -fPIC -shared \
-    -I"$stage" -I"$MLIR_INCLUDE" "$SRC/Stage.cpp" \
+    -I"$stage" -I"$MLIR_INCLUDE" -Iruntime/include \
+    models/deepseek_r1/pipeline/Stage.cpp \
     "$stage"/{forward_prefill,forward_decode,subgraph_prefill,subgraph_decode}.o \
     -L"$LLVM_BUILD/lib" -lmlir_c_runner_utils "$MODEL/libomp.so" \
     -Wl,-z,defs -o "$stage/stage.so"

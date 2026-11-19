@@ -14,7 +14,7 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "Stage.h"
+#include "buddy/runtime/pipeline/Stage.h"
 
 #include "mlir/ExecutionEngine/CRunnerUtils.h"
 
@@ -25,6 +25,7 @@
 #include <filesystem>
 #include <fstream>
 #include <stdexcept>
+#include <string>
 #include <type_traits>
 #include <unordered_set>
 #include <utility>
@@ -126,16 +127,32 @@ private:
   std::unordered_set<void *> allocations;
 };
 
+std::vector<uint16_t> loadWeights(const std::filesystem::path &path) {
+  std::ifstream file(path, std::ios::binary | std::ios::ate);
+  if (!file)
+    throw std::runtime_error("cannot open weight file " + path.string());
+
+  constexpr std::streamsize expectedBytes = weightElements * sizeof(uint16_t);
+  const std::streamoff actualBytes = file.tellg();
+  if (actualBytes < 0)
+    throw std::runtime_error("cannot determine weight size for " + path.string());
+  if (actualBytes != expectedBytes)
+    throw std::runtime_error("weight byte count mismatch for " + path.string() +
+                             ": expected " + std::to_string(expectedBytes) +
+                             ", got " + std::to_string(actualBytes));
+
+  std::vector<uint16_t> weights(weightElements);
+  if (!file.seekg(0) ||
+      !file.read(reinterpret_cast<char *>(weights.data()), expectedBytes))
+    throw std::runtime_error("cannot read weight file " + path.string());
+  return weights;
+}
+
 class DeepSeekStage final : public Stage {
 public:
-  explicit DeepSeekStage(const std::filesystem::path &directory)
-      : weights(weightElements), kvStorage(2 * layers * kvElements),
+  explicit DeepSeekStage(const std::filesystem::path &weightPath)
+      : weights(loadWeights(weightPath)), kvStorage(2 * layers * kvElements),
         output(config.context * outputWidth) {
-    auto path = directory / weightFile;
-    std::ifstream file(path, std::ios::binary);
-    if (!file.read(reinterpret_cast<char *>(weights.data()),
-                   weights.size() * sizeof(uint16_t)))
-      throw std::runtime_error("cannot read " + path.string());
     weightRef =
         descriptor(weights.data(), std::array<int64_t, 1>{weightElements});
     for (size_t i = 0; i < kv.size(); ++i)
@@ -199,6 +216,18 @@ private:
 };
 } // namespace
 
+extern "C" Stage *
+buddy_create_pipeline_stage_v1(const char *resolvedWeightPath) {
+  if (!resolvedWeightPath || !*resolvedWeightPath)
+    throw std::invalid_argument("resolvedWeightPath must be non-empty");
+  return new DeepSeekStage(resolvedWeightPath);
+}
+
+extern "C" void buddy_destroy_pipeline_stage_v1(Stage *stage) { delete stage; }
+
 extern "C" Stage *createPipelineStage(const char *directory) {
-  return new DeepSeekStage(directory);
+  if (!directory || !*directory)
+    throw std::invalid_argument("stage directory must be non-empty");
+  const auto path = std::filesystem::path(directory) / weightFile;
+  return buddy_create_pipeline_stage_v1(path.c_str());
 }
