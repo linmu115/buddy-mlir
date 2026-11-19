@@ -79,8 +79,16 @@ build_stage 21 28
 python "$SRC/check_result.py" "$OUT/baseline.json" "$OUT/four.json"
 ```
 
-The rank order follows the stage directory order. The receiver obtains the
-activation row count through `MPI_Probe` and `MPI_Get_count`, then validates it
-against the compiled prefill or decode shape. The fourth argument to the
-runner is a path for raw FP16 logits at the sampled positions. Pass `-` to
-disable the dump.
+The rank order follows the stage directory order. On each step, rank zero
+creates a 16-byte `int32_t[4]` header `{version, step, pos, rows}` (`version=1`,
+`step=0`/`pos=-1`/`rows=context` for prefill, and
+`step>=1`/`pos=promptRows+step-1`/`rows=1` for decode) and sends it on tag 2
+before sending the FP16 activation payload (`MPI_UINT16_T`) on tag 0; sampled
+token IDs return to rank zero on tag 1. Middle stages forward the validated
+header verbatim. Each receiver checks the source, tag, header element count,
+version, and expected step/pos/rows (with `0 <= pos < context` for decode),
+probes the payload with `MPI_Probe` and `MPI_Get_count` to confirm
+`rows * activationWidth` elements fit in the allocated buffer, and passes the
+received `pos` to `decode`; any mismatch logs diagnostics and calls `MPI_Abort`.
+The fourth argument to the runner is a path for raw FP16 logits at the sampled
+positions. Pass `-` to disable the dump.

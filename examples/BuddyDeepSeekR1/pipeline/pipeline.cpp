@@ -14,12 +14,11 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "BlockingMPI.h"
-
 #include "buddy/LLM/TextContainer.h"
 #include "buddy/runtime/llm/KVCacheManager.h"
 #include "buddy/runtime/llm/Sampler.h"
 #include "buddy/runtime/pipeline/Stage.h"
+#include "buddy/runtime/pipeline/mpi/BlockingMPI.h"
 
 #include <dlfcn.h>
 
@@ -33,9 +32,6 @@
 #include <vector>
 
 namespace {
-constexpr int activationTag = 0;
-constexpr int tokenTag = 1;
-
 class StageLibrary {
 public:
   explicit StageLibrary(const std::filesystem::path &directory) {
@@ -132,18 +128,18 @@ void generate(int count, const std::string &prompt, const char *vocab,
   buddy::Sampler sampler(buddy::SamplerConfig{});
   std::vector<int> generated;
   for (int step = 0; step < count; ++step) {
-    const int rows = step == 0 ? config.context : 1;
+    const ActivationHeader expected =
+        makeActivationHeader(step, promptRows, config.context);
+    ActivationHeader header = expected;
     void *input = tokenInput.data();
     if (!first) {
-      const int received = activation.receive(hidden.data(), config.context,
-                                              rank - 1, activationTag);
-      if (received != rows)
-        throw std::runtime_error("activation rows differ from graph schedule");
+      header = activation.receive(hidden.data(), hidden.size(), rank - 1,
+                                  expected);
       input = hidden.data();
     }
-    const uint16_t *output = step == 0
-                                 ? stage.prefill(input)
-                                 : stage.decode(input, promptRows + step - 1);
+    const uint16_t *output =
+        header.step == 0 ? stage.prefill(input)
+                         : stage.decode(input, header.pos);
     int token = 0;
     if (last) {
       if (step == 0)
@@ -156,11 +152,11 @@ void generate(int count, const std::string &prompt, const char *vocab,
       token = sampler.sample(logits.data(), logits.size(), generated);
       generated.push_back(token);
       if (!first)
-        mpiCheck(MPI_Send(&token, 1, MPI_INT, 0, tokenTag, MPI_COMM_WORLD));
+        mpiCheck(MPI_Send(&token, 1, MPI_INT, 0, kTokenTag, MPI_COMM_WORLD));
     } else {
-      activation.send(output, rows, rank + 1, activationTag);
+      activation.send(header, output, rank + 1);
       if (first)
-        mpiCheck(MPI_Recv(&token, 1, MPI_INT, ranks - 1, tokenTag,
+        mpiCheck(MPI_Recv(&token, 1, MPI_INT, ranks - 1, kTokenTag,
                           MPI_COMM_WORLD, MPI_STATUS_IGNORE));
     }
 
