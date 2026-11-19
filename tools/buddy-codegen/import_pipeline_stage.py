@@ -15,7 +15,7 @@
 #
 # ===----------------------------------------------------------------------===//
 #
-"""Export one DeepSeek R1 Distill Qwen FP16 stage with a stage-local KV ABI."""
+"""Export one DeepSeek R1 Distill Qwen stage (FP16 or K3 w4g32) with a stage-local KV ABI."""
 
 import argparse
 import gc
@@ -26,10 +26,13 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
+import numpy
 import torch
 from import_model import (
     apply_fusion,
+    apply_k3_w4,
     apply_pre_transforms,
+    compile_chunk_graphs,
     compile_graphs,
     create_drivers,
     export_mlir,
@@ -247,17 +250,112 @@ def check_parameter_layout(prefill, decode):
             )
 
 
+def stage_w4g32_param_counts(hf_config, start, end, total, ime):
+    """Expected (f32_elements, i8_elements) for a Qwen2 w4g32 stage [start, end)."""
+    h = hf_config.hidden_size
+    heads = hf_config.num_attention_heads
+    d = getattr(hf_config, "head_dim", h // heads)
+    kv = getattr(hf_config, "num_key_value_heads", heads) * d
+    inter = hf_config.intermediate_size
+    vocab = hf_config.vocab_size
+    count = end - start
+    linears = [
+        (h, heads * d),
+        (h, kv),
+        (h, kv),
+        (heads * d, h),
+        (h, inter),
+        (h, inter),
+        (inter, h),
+    ]
+    per_layer = sum(k * n for k, n in linears) * (2 if ime else 1)
+    lm_head = h * vocab if end == total else 0
+    i8 = (count * per_layer + lm_head) * 9 // 16
+    f32_layer = 2 * h + heads * d + 2 * kv
+    f32 = (
+        (vocab * h if start == 0 else 0)
+        + count * f32_layer
+        + (h if end == total else 0)
+        + d // 2
+    )
+    return {"f32_params": f32, "i8_params": i8}
+
+
+def export_k3_weights_direct(graph, config, output_dir, expected_counts):
+    """Stream w4g32 f32_params and i8_params directly to disk without concatenate."""
+    from buddy.compiler.graph.type import TensorDType
+
+    tag_to_weight = {w["tag"]: w for w in config["weights"]}
+    for required in ("f32_params", "i8_params"):
+        if required not in tag_to_weight:
+            raise ValueError(f"w4g32 stage config missing weight bucket {required}")
+
+    f32_path = Path(output_dir) / tag_to_weight["f32_params"]["file"]
+    i8_path = Path(output_dir) / tag_to_weight["i8_params"]["file"]
+    counts = {"f32_params": 0, "i8_params": 0}
+
+    with open(f32_path, "wb") as f_f32, open(i8_path, "wb") as f_i8:
+        for node, ref in zip(graph.params, graph._params_ref):
+            data = ref.detach().contiguous().numpy().reshape(-1)
+            if node.tensor_meta["dtype"] == TensorDType.Int8:
+                arr = numpy.ascontiguousarray(data, dtype=numpy.int8)
+                arr.tofile(f_i8)
+                counts["i8_params"] += arr.size
+            else:
+                arr = numpy.ascontiguousarray(data, dtype=numpy.float32)
+                arr.tofile(f_f32)
+                counts["f32_params"] += arr.size
+
+    for tag in ("f32_params", "i8_params"):
+        if counts[tag] != expected_counts[tag]:
+            raise RuntimeError(
+                f"w4g32 stage {tag} has {counts[tag]} elements, "
+                f"expected {expected_counts[tag]}"
+            )
+        weight = tag_to_weight[tag]
+        if int(weight["num_elements"]) != counts[tag]:
+            print(
+                f"[import] Updated {tag}: {weight['num_elements']} → {counts[tag]}",
+                file=sys.stderr,
+            )
+            weight["num_elements"] = counts[tag]
+        path = Path(output_dir) / weight["file"]
+        size_mb = path.stat().st_size / (1024 * 1024)
+        print(
+            f"[import] Written: {weight['file']} ({size_mb:.1f} MB, "
+            f"{counts[tag]:,} elements)",
+            file=sys.stderr,
+        )
+    return counts
+
+
 def export_stage(config, start, end, out, load_mode="lazy"):
+    variant = config["variant"]
+    is_w4g32 = variant == "w4g32"
     if (
         config["architecture"] != "Qwen2ForCausalLM"
-        or config["variant"] != "f16"
-        or config.get("prefill_chunk")
-        or config.get("arena")
         or config.get("tiered_kv_cache", {}).get("enabled")
         or config.get("decode_pack", {}).get("enabled")
     ):
         raise ValueError(
-            "stage export needs the plain FP16 Qwen2 configuration"
+            "stage export supports Qwen2ForCausalLM without tiered KV or decode_pack"
+        )
+    if variant == "f16":
+        if config.get("prefill_chunk") or config.get("arena"):
+            raise ValueError(
+                "stage export needs the plain FP16 Qwen2 configuration"
+            )
+    elif is_w4g32:
+        if not config.get("prefill_chunk"):
+            raise ValueError("w4g32 stage export requires prefill_chunk > 0")
+        if (config.get("kernels") or "k3") != "k3":
+            raise ValueError(
+                f"w4g32 stage export currently supports kernels='k3' only "
+                f"(got {config.get('kernels')!r})"
+            )
+    else:
+        raise ValueError(
+            f"stage export supports variant 'f16' or 'w4g32', got {variant!r}"
         )
     if load_mode not in ("lazy", "full"):
         raise ValueError(f"unsupported load mode: {load_mode}")
@@ -268,10 +366,26 @@ def export_stage(config, start, end, out, load_mode="lazy"):
         else:
             model, total, width = load_stage_full(config, start, end)
 
-    with timed_import_step("compile_stage_graphs"):
-        (prefill,), (decode,), params = compile_graphs(
-            model, config, hidden_input=start > 0
+    expected_w4_counts = (
+        stage_w4g32_param_counts(
+            model.config, start, end, total, bool(config.get("prefill_ime"))
         )
+        if is_w4g32
+        else None
+    )
+
+    with timed_import_step("compile_stage_graphs"):
+        if is_w4g32:
+            (prefill,), (decode,), params = compile_chunk_graphs(
+                model,
+                config,
+                hidden_input=start > 0,
+                logits_to_keep=1 if end == total else None,
+            )
+        else:
+            (prefill,), (decode,), params = compile_graphs(
+                model, config, hidden_input=start > 0
+            )
 
     del model
     torch._dynamo.reset()
@@ -279,6 +393,37 @@ def export_stage(config, start, end, out, load_mode="lazy"):
 
     apply_pre_transforms(prefill, decode)
     check_parameter_layout(prefill, decode)
+    if is_w4g32:
+        # Share the underlying pre-transformed tensors while keeping distinct
+        # parameter lists so k3_w4_rewrite can repack prefill and decode
+        # independently without doubling float weight RSS first.
+        decode._params_ref = list(prefill._params_ref)
+        gc.collect()
+        out.mkdir(parents=True, exist_ok=True)
+        with timed_import_step("k3_w4"):
+            apply_k3_w4(prefill, decode, config, str(out))
+        check_parameter_layout(prefill, decode)
+        decode._params_ref = prefill._params_ref
+        gc.collect()
+        with timed_import_step("export_stage_weights"):
+            export_k3_weights_direct(prefill, config, out, expected_w4_counts)
+        apply_fusion(prefill, decode, chunked_prefill=True)
+        drivers = create_drivers(prefill, decode)
+        export_mlir(*drivers, config, out)
+        del drivers, prefill, decode
+        gc.collect()
+        config["shape"]["num_hidden_layers"] = end - start
+        config["shape"]["kv_layers"] = 2 * (end - start)
+        config["pipeline_stage"] = {
+            "start_layer": start,
+            "end_layer": end,
+            "total_layers": total,
+            "activation_type": config["precision"]["activation_type"],
+            "activation_width": width,
+        }
+        (out / "config.json").write_text(json.dumps(config, indent=2) + "\n")
+        return
+
     decode._params_ref = prefill._params_ref
     gc.collect()
     apply_fusion(prefill, decode)

@@ -273,14 +273,23 @@ def decode_trace_position(max_token_len: int) -> torch.Tensor:
     return torch.tensor([min(1, max_token_len - 1)], dtype=torch.int64)
 
 
-def _warmed_static_cache(model, max_token_len: int):
+def _warmed_static_cache(model, max_token_len: int, *, hidden_input: bool = False):
     """A StaticCache whose layers are allocated: StaticCache allocates them on
     the first update, and a cache passed to a trace must already hold its
     tensors so that they become graph inputs. Allocated by a one-token call
     at position 0, which also advances the cache by one token."""
     cache = StaticCache(config=model.config, max_cache_len=max_token_len)
+    trace_in = (
+        {
+            "inputs_embeds": torch.zeros(
+                (1, 1, model.config.hidden_size), dtype=model.dtype
+            )
+        }
+        if hidden_input
+        else {"input_ids": torch.zeros((1, 1), dtype=torch.int64)}
+    )
     model(
-        input_ids=torch.zeros((1, 1), dtype=torch.int64),
+        **trace_in,
         past_key_values=cache,
         use_cache=True,
         cache_implementation="static",
@@ -288,14 +297,21 @@ def _warmed_static_cache(model, max_token_len: int):
     return cache
 
 
-def compile_chunk_graphs(model, config: dict):
+def compile_chunk_graphs(
+    model,
+    config: dict,
+    *,
+    hidden_input: bool = False,
+    logits_to_keep: int | None = 1,
+):
     """Like compile_graphs, for chunked prefill (config["prefill_chunk"]):
     forward_prefill is traced like forward_decode, with prefill_chunk tokens
     and their start position in and the KV cache in and out, so that the
     session prefills a prompt chunk by chunk (docs/ChunkedPrefill.md). Both
     graphs have the decode ABI and differ in the number of tokens only;
     forward_prefill returns the logits of the chunk's last row only
-    (logits_to_keep=1), the only row the session uses.
+    (logits_to_keep=1), the only row the session uses (unless logits_to_keep is
+    None, e.g. for non-final pipeline stages that emit all chunk rows).
 
     Each trace gets its own cache: tracing runs the model and advances the
     cache it is given. forward_prefill is traced on an empty cache (allocated,
@@ -310,6 +326,15 @@ def compile_chunk_graphs(model, config: dict):
             f"({max_token_len})"
         )
 
+    def trace_input(tokens):
+        if hidden_input:
+            return {
+                "inputs_embeds": torch.zeros(
+                    (1, tokens, model.config.hidden_size), dtype=model.dtype
+                )
+            }
+        return {"input_ids": torch.zeros((1, tokens), dtype=torch.int64)}
+
     prefill_compiler = DynamoCompiler(
         primary_registry=tosa.ops_registry,
         aot_autograd_decomposition=inductor_decomp,
@@ -322,23 +347,28 @@ def compile_chunk_graphs(model, config: dict):
     )
 
     with torch.no_grad():
-        past_kv_prefill = _warmed_static_cache(model, max_token_len)
+        past_kv_prefill = _warmed_static_cache(
+            model, max_token_len, hidden_input=hidden_input
+        )
         past_kv_prefill.reset()  # logically empty: no tokens, zero K/V
-        graphs_prefill = prefill_compiler.importer(
-            model,
-            input_ids=torch.zeros((1, chunk), dtype=torch.int64),
+        prefill_kwargs = dict(
+            **trace_input(chunk),
             use_cache=True,
             cache_position=torch.arange(chunk, dtype=torch.int64),
             past_key_values=past_kv_prefill,
             cache_implementation="static",
-            # the session uses the logits of the chunk's last row only
-            logits_to_keep=1,
         )
+        if logits_to_keep is not None:
+            # the session uses the logits of the chunk's last row only
+            prefill_kwargs["logits_to_keep"] = logits_to_keep
+        graphs_prefill = prefill_compiler.importer(model, **prefill_kwargs)
 
-        past_kv_decode = _warmed_static_cache(model, max_token_len)
+        past_kv_decode = _warmed_static_cache(
+            model, max_token_len, hidden_input=hidden_input
+        )
         graphs_decode = decode_compiler.importer(
             model,
-            input_ids=torch.zeros((1, 1), dtype=torch.int64),
+            **trace_input(1),
             use_cache=True,
             cache_position=decode_trace_position(max_token_len),
             past_key_values=past_kv_decode,

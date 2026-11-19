@@ -74,6 +74,7 @@ def gen_manifest(
     stage = config.get("pipeline_stage")
     stage_attrs = {}
     first_stage = last_stage = True
+    stage_act_type = "f16"
     if stage is not None:
         stage_attrs["pp_stage_version"] = "1"
         for field in (
@@ -85,11 +86,26 @@ def gen_manifest(
             stage_attrs[f"pp_{field}"] = str(stage[field])
         first_stage = stage["start_layer"] == 0
         last_stage = stage["end_layer"] == stage["total_layers"]
-        if (len(weights) != 1 or weights[0]["mlir_type"] != "f16"
-                or weights[0].get("decode_file")):
-            raise ValueError("pipeline_stage requires one external f16 weight")
-        if int(config.get("prefill_chunk", 0)):
-            raise ValueError("pipeline_stage requires prefill_chunk = 0")
+        stage_act_type = stage["activation_type"]
+        if config.get("variant") == "w4g32":
+            if (
+                stage_act_type != "f32"
+                or len(weights) != 2
+                or {w["mlir_type"] for w in weights} != {"f32", "i8"}
+                or any(w.get("decode_file") for w in weights)
+            ):
+                raise ValueError(
+                    "w4g32 pipeline_stage requires f32 activation_type and "
+                    "f32 + i8 external weights"
+                )
+            if int(config.get("prefill_chunk", 0)) <= 0:
+                raise ValueError("w4g32 pipeline_stage requires prefill_chunk > 0")
+        else:
+            if (len(weights) != 1 or weights[0]["mlir_type"] != "f16"
+                    or weights[0].get("decode_file")):
+                raise ValueError("pipeline_stage requires one external f16 weight")
+            if int(config.get("prefill_chunk", 0)):
+                raise ValueError("pipeline_stage requires prefill_chunk = 0")
 
     so_name = "stage.so" if stage is not None else compilation["so_name"]
     runner_suffix = "_pipeline_runner.so" if stage is not None else "_runner.so"
@@ -169,8 +185,8 @@ def gen_manifest(
     else:
         prefill_input, decode_input = "hidden_prefill_in", "hidden_decode_in"
         width = stage["activation_width"]
-        prefill_type = f"tensor<1x{prefill_len}x{width}xf16>"
-        decode_type = f"tensor<1x1x{width}xf16>"
+        prefill_type = f"tensor<1x{prefill_len}x{width}x{stage_act_type}>"
+        decode_type = f"tensor<1x1x{width}x{stage_act_type}>"
     p(f'  rhal.buffer @{prefill_input} {{space = "host", type = {prefill_type}}}')
     p(f'  rhal.buffer @{decode_input} {{space = "host", type = {decode_type}}}')
     p('  rhal.buffer @cache_position {space = "host", type = tensor<1xi64>}')
@@ -189,13 +205,13 @@ def gen_manifest(
     if last_stage:
         prefill_output, decode_output = "logits_prefill", "logits_decode"
         output_width = vocab_size
-        output_type = logits_mlir if stage is None else "f16"
+        output_type = logits_mlir if stage is None else stage_act_type
     else:
         prefill_output, decode_output = "hidden_prefill_out", "hidden_decode_out"
         output_width = stage["activation_width"]
-        output_type = "f16"
-    # Chunked prefill returns the logits of the last row only.
-    output_rows = 1 if chunk else max_token_len
+        output_type = stage_act_type
+    # Chunked prefill returns the logits of the last row only on the final stage.
+    output_rows = 1 if (chunk and last_stage) else (chunk or max_token_len)
     prefill_result = f"tensor<1x{output_rows}x{output_width}x{output_type}>"
     decode_result = f"tensor<1x1x{output_width}x{output_type}>"
     p(f'  rhal.buffer @{prefill_output} {{space = "host", type = {prefill_result}}}')
