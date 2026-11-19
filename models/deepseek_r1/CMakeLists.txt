@@ -132,3 +132,365 @@ else()
   message(STATUS
     "[deepseek_r1] MPI not found; skipping deepseek_r1_pipeline_runner plugin.")
 endif()
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Pipeline-parallel stage RAX targets (deepseek_r1_pipeline_rax)
+#
+# Enabled only when DEEPSEEKR1_PIPELINE_STAGE_DIRS is set (ordered list of stage
+# directories corresponding to MPI ranks 0, 1, ...). Unset by default so normal
+# whole-model builds are unaffected.
+# ══════════════════════════════════════════════════════════════════════════════
+set(DEEPSEEKR1_PIPELINE_STAGE_DIRS "" CACHE STRING
+  "Ordered semicolon-separated list of pipeline stage directories (rank 0, 1, ...)")
+option(DEEPSEEKR1_PIPELINE_EMBED_PAYLOAD
+  "Embed weights, stage.so, runner, deps, and vocab into stage<i>.rax (OFF = manifest-only)"
+  ON)
+set(DEEPSEEKR1_PIPELINE_OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/pipeline_rax" CACHE PATH
+  "Directory where published stage<i>.rax artifacts are placed")
+set(DEEPSEEKR1_PIPELINE_RAX_PACK "" CACHE FILEPATH
+  "Optional pre-built rax-pack executable (defaults to in-tree rax-pack target)")
+set(DEEPSEEKR1_PIPELINE_VOCAB_FILE
+  "${CMAKE_SOURCE_DIR}/examples/BuddyDeepSeekR1/vocab.txt" CACHE FILEPATH
+  "Fallback vocab.txt for the first pipeline stage when absent from its stage dir")
+
+if(DEEPSEEKR1_PIPELINE_STAGE_DIRS)
+  if(NOT MPI_CXX_FOUND)
+    message(FATAL_ERROR
+      "[deepseek_r1] DEEPSEEKR1_PIPELINE_STAGE_DIRS is set, but MPI (CXX) was not found. "
+      "Building deepseek_r1_pipeline_rax requires MPI for deepseek_r1_pipeline_runner.so.")
+  endif()
+
+  set(_DSR1_PP_VERIFY_SCRIPT
+    "${CMAKE_SOURCE_DIR}/tools/buddy-codegen/verify_pipeline_stage.py")
+  set(_DSR1_PP_GEN_MANIFEST_SCRIPT
+    "${CMAKE_SOURCE_DIR}/tools/buddy-codegen/gen_manifest.py")
+  foreach(_req_script "${_DSR1_PP_VERIFY_SCRIPT}" "${_DSR1_PP_GEN_MANIFEST_SCRIPT}")
+    if(NOT EXISTS "${_req_script}")
+      message(FATAL_ERROR
+        "[deepseek_r1] Missing required pipeline script: ${_req_script}")
+    endif()
+  endforeach()
+
+  if(DEEPSEEKR1_PIPELINE_RAX_PACK)
+    if(NOT EXISTS "${DEEPSEEKR1_PIPELINE_RAX_PACK}")
+      message(FATAL_ERROR
+        "[deepseek_r1] DEEPSEEKR1_PIPELINE_RAX_PACK not found: ${DEEPSEEKR1_PIPELINE_RAX_PACK}")
+    endif()
+    set(_DSR1_PP_RAX_PACK_BIN "${DEEPSEEKR1_PIPELINE_RAX_PACK}")
+    set(_DSR1_PP_RAX_PACK_DEP "${DEEPSEEKR1_PIPELINE_RAX_PACK}")
+  else()
+    set(_DSR1_PP_RAX_PACK_BIN "$<TARGET_FILE:rax-pack>")
+    set(_DSR1_PP_RAX_PACK_DEP rax-pack)
+  endif()
+
+  # Resolve real runtime shared library dependencies for stage.so in load order:
+  # transitive MLIR deps -> libmlir_c_runner_utils -> OpenMP runtime.
+  set(_DSR1_PP_CRUNNER_CAND
+    "${LLVM_LIBRARY_DIR}/libmlir_c_runner_utils${CMAKE_SHARED_LIBRARY_SUFFIX}")
+  if(NOT EXISTS "${_DSR1_PP_CRUNNER_CAND}")
+    message(FATAL_ERROR
+      "[deepseek_r1] Missing required MLIR runtime library: ${_DSR1_PP_CRUNNER_CAND}")
+  endif()
+  file(REAL_PATH "${_DSR1_PP_CRUNNER_CAND}" _DSR1_PP_CRUNNER_REAL)
+  get_filename_component(_DSR1_PP_CRUNNER_NAME "${_DSR1_PP_CRUNNER_REAL}" NAME)
+
+  set(_DSR1_PP_OMP_LIB "")
+  if(BUDDY_OPENMP_RUNTIME_LIBRARY AND EXISTS "${BUDDY_OPENMP_RUNTIME_LIBRARY}")
+    set(_DSR1_PP_OMP_LIB "${BUDDY_OPENMP_RUNTIME_LIBRARY}")
+  else()
+    get_filename_component(_DSR1_PP_LLVM_ROOT "${LLVM_LIBRARY_DIR}" DIRECTORY)
+    foreach(_omp_cand
+      "${_DSR1_PP_LLVM_ROOT}/runtimes/runtimes-bins/openmp/runtime/src/libomp${CMAKE_SHARED_LIBRARY_SUFFIX}"
+      "${LLVM_LIBRARY_DIR}/libomp${CMAKE_SHARED_LIBRARY_SUFFIX}"
+    )
+      if(EXISTS "${_omp_cand}")
+        set(_DSR1_PP_OMP_LIB "${_omp_cand}")
+        break()
+      endif()
+    endforeach()
+  endif()
+  if(NOT _DSR1_PP_OMP_LIB)
+    find_library(_DSR1_PP_OMP_LIB NAMES omp)
+  endif()
+  if(NOT _DSR1_PP_OMP_LIB OR NOT EXISTS "${_DSR1_PP_OMP_LIB}")
+    message(FATAL_ERROR
+      "[deepseek_r1] Missing required OpenMP runtime library (set BUDDY_OPENMP_RUNTIME_LIBRARY).")
+  endif()
+  file(REAL_PATH "${_DSR1_PP_OMP_LIB}" _DSR1_PP_OMP_REAL)
+  get_filename_component(_DSR1_PP_OMP_NAME "${_DSR1_PP_OMP_REAL}" NAME)
+
+  set(_DSR1_PP_DEP_LIB_PATHS)
+  set(_DSR1_PP_DEP_LIB_NAMES)
+  foreach(_mlir_dep_base libmlir_apfloat_wrappers libmlir_float16_utils)
+    set(_mlir_dep_cand
+      "${LLVM_LIBRARY_DIR}/${_mlir_dep_base}${CMAKE_SHARED_LIBRARY_SUFFIX}")
+    if(EXISTS "${_mlir_dep_cand}")
+      file(REAL_PATH "${_mlir_dep_cand}" _mlir_dep_real)
+      get_filename_component(_mlir_dep_name "${_mlir_dep_real}" NAME)
+      list(APPEND _DSR1_PP_DEP_LIB_PATHS "${_mlir_dep_real}")
+      list(APPEND _DSR1_PP_DEP_LIB_NAMES "${_mlir_dep_name}")
+    endif()
+  endforeach()
+  list(APPEND _DSR1_PP_DEP_LIB_PATHS "${_DSR1_PP_CRUNNER_REAL}" "${_DSR1_PP_OMP_REAL}")
+  list(APPEND _DSR1_PP_DEP_LIB_NAMES "${_DSR1_PP_CRUNNER_NAME}" "${_DSR1_PP_OMP_NAME}")
+
+  set(_DSR1_PP_DEP_MANIFEST_ARGS)
+  foreach(_dep_name IN LISTS _DSR1_PP_DEP_LIB_NAMES)
+    list(APPEND _DSR1_PP_DEP_MANIFEST_ARGS --dep-shared-lib "${_dep_name}")
+  endforeach()
+  list(LENGTH _DSR1_PP_DEP_LIB_PATHS _DSR1_PP_DEP_COUNT)
+  math(EXPR _DSR1_PP_DEP_LAST "${_DSR1_PP_DEP_COUNT} - 1")
+
+  get_filename_component(_DSR1_PP_OUT_DIR "${DEEPSEEKR1_PIPELINE_OUTPUT_DIR}" ABSOLUTE)
+
+  set(_DSR1_PP_SYMCHECK_PY
+    "import os, subprocess, sys; so = sys.argv[1]; req = {'buddy_create_pipeline_stage_v1', 'buddy_destroy_pipeline_stage_v1', '_mlir_ciface_forward_prefill', '_mlir_ciface_forward_decode'}; out = subprocess.check_output(['nm', '-D', '--defined-only', so], text=True); defs = {l.split()[-1].split('@')[0] for l in out.splitlines() if l.strip()}; miss = sorted(req - defs); miss and (os.remove(so), sys.exit(f'stage.so missing required symbols: {miss}'))")
+  # Hardlink large weight blobs into staging (fall back to copy across filesystems).
+  set(_DSR1_PP_HARDLINK_PY
+    "import os, shutil, sys; s, d = sys.argv[1], sys.argv[2]; exec('if os.path.lexists(d):\\n  try:\\n    if not os.path.islink(d) and os.path.samefile(s, d): sys.exit(0)\\n  except OSError: pass\\n  os.unlink(d)\\ntry: os.link(s, d)\\nexcept OSError: shutil.copy2(s, d)')")
+
+  set(_DSR1_PP_STAGE_TARGETS)
+  set(_DSR1_PP_RANK 0)
+  foreach(_DSR1_PP_RAW_DIR IN LISTS DEEPSEEKR1_PIPELINE_STAGE_DIRS)
+    get_filename_component(_DSR1_PP_STAGE_DIR "${_DSR1_PP_RAW_DIR}" ABSOLUTE)
+    if(NOT IS_DIRECTORY "${_DSR1_PP_STAGE_DIR}")
+      message(FATAL_ERROR
+        "[deepseek_r1] stage ${_DSR1_PP_RANK}: stage directory does not exist: ${_DSR1_PP_STAGE_DIR}")
+    endif()
+
+    set(_DSR1_PP_CONFIG "${_DSR1_PP_STAGE_DIR}/config.json")
+    if(NOT EXISTS "${_DSR1_PP_CONFIG}")
+      message(FATAL_ERROR
+        "[deepseek_r1] stage ${_DSR1_PP_RANK}: missing required input file: ${_DSR1_PP_CONFIG}")
+    endif()
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_DSR1_PP_CONFIG}")
+
+    file(READ "${_DSR1_PP_CONFIG}" _DSR1_PP_CFG_JSON)
+    string(JSON _DSR1_PP_START_LAYER ERROR_VARIABLE _DSR1_PP_JSON_ERR
+      GET "${_DSR1_PP_CFG_JSON}" pipeline_stage start_layer)
+    if(_DSR1_PP_JSON_ERR)
+      message(FATAL_ERROR
+        "[deepseek_r1] stage ${_DSR1_PP_RANK}: failed to read pipeline_stage.start_layer from ${_DSR1_PP_CONFIG}: ${_DSR1_PP_JSON_ERR}")
+    endif()
+    string(JSON _DSR1_PP_WEIGHT_FILE ERROR_VARIABLE _DSR1_PP_JSON_ERR
+      GET "${_DSR1_PP_CFG_JSON}" weights 0 file)
+    if(_DSR1_PP_JSON_ERR)
+      message(FATAL_ERROR
+        "[deepseek_r1] stage ${_DSR1_PP_RANK}: failed to read weights[0].file from ${_DSR1_PP_CONFIG}: ${_DSR1_PP_JSON_ERR}")
+    endif()
+    string(JSON _DSR1_PP_VOCAB_FILE ERROR_VARIABLE _DSR1_PP_JSON_ERR
+      GET "${_DSR1_PP_CFG_JSON}" tokens vocab_file)
+    if(_DSR1_PP_JSON_ERR)
+      message(FATAL_ERROR
+        "[deepseek_r1] stage ${_DSR1_PP_RANK}: failed to read tokens.vocab_file from ${_DSR1_PP_CONFIG}: ${_DSR1_PP_JSON_ERR}")
+    endif()
+
+    set(_DSR1_PP_IS_FIRST FALSE)
+    if(_DSR1_PP_START_LAYER EQUAL 0)
+      set(_DSR1_PP_IS_FIRST TRUE)
+    endif()
+
+    set(_DSR1_PP_PREFILL_MLIR "${_DSR1_PP_STAGE_DIR}/forward_prefill-f16.mlir")
+    set(_DSR1_PP_DECODE_MLIR "${_DSR1_PP_STAGE_DIR}/forward_decode-f16.mlir")
+    set(_DSR1_PP_PREFILL_O "${_DSR1_PP_STAGE_DIR}/forward_prefill.o")
+    set(_DSR1_PP_DECODE_O "${_DSR1_PP_STAGE_DIR}/forward_decode.o")
+    set(_DSR1_PP_SUB_PREFILL_O "${_DSR1_PP_STAGE_DIR}/subgraph_prefill.o")
+    set(_DSR1_PP_SUB_DECODE_O "${_DSR1_PP_STAGE_DIR}/subgraph_decode.o")
+    set(_DSR1_PP_WEIGHT_PATH "${_DSR1_PP_STAGE_DIR}/${_DSR1_PP_WEIGHT_FILE}")
+
+    foreach(_req_file
+      "${_DSR1_PP_PREFILL_MLIR}"
+      "${_DSR1_PP_DECODE_MLIR}"
+      "${_DSR1_PP_PREFILL_O}"
+      "${_DSR1_PP_DECODE_O}"
+      "${_DSR1_PP_SUB_PREFILL_O}"
+      "${_DSR1_PP_SUB_DECODE_O}"
+      "${_DSR1_PP_WEIGHT_PATH}"
+    )
+      if(NOT EXISTS "${_req_file}")
+        message(FATAL_ERROR
+          "[deepseek_r1] stage ${_DSR1_PP_RANK}: missing required input file: ${_req_file}")
+      endif()
+    endforeach()
+
+    set(_DSR1_PP_VOCAB_SRC "")
+    if(_DSR1_PP_IS_FIRST)
+      if(EXISTS "${_DSR1_PP_STAGE_DIR}/${_DSR1_PP_VOCAB_FILE}")
+        set(_DSR1_PP_VOCAB_SRC "${_DSR1_PP_STAGE_DIR}/${_DSR1_PP_VOCAB_FILE}")
+      else()
+        set(_DSR1_PP_VOCAB_SRC "${DEEPSEEKR1_PIPELINE_VOCAB_FILE}")
+      endif()
+      if(NOT EXISTS "${_DSR1_PP_VOCAB_SRC}")
+        message(FATAL_ERROR
+          "[deepseek_r1] stage ${_DSR1_PP_RANK}: missing required vocab file: ${_DSR1_PP_VOCAB_SRC}")
+      endif()
+    endif()
+
+    set(_DSR1_PP_WORK_DIR
+      "${CMAKE_CURRENT_BINARY_DIR}/pipeline_stages/stage${_DSR1_PP_RANK}")
+    set(_DSR1_PP_CONFIG_INC "${_DSR1_PP_WORK_DIR}/stage-config.inc")
+    set(_DSR1_PP_MANIFEST "${_DSR1_PP_WORK_DIR}/stage.mlir")
+
+    # 1. Verify stage MLIR ABI & weights, emit stage-config.inc.
+    add_custom_command(
+      OUTPUT "${_DSR1_PP_CONFIG_INC}"
+      COMMAND "${CMAKE_COMMAND}" -E make_directory "${_DSR1_PP_WORK_DIR}"
+      COMMAND "${Python3_EXECUTABLE}" "${_DSR1_PP_VERIFY_SCRIPT}"
+        --stage-dir "${_DSR1_PP_STAGE_DIR}"
+        --header "${_DSR1_PP_CONFIG_INC}"
+      DEPENDS
+        "${_DSR1_PP_VERIFY_SCRIPT}"
+        "${_DSR1_PP_CONFIG}"
+        "${_DSR1_PP_PREFILL_MLIR}"
+        "${_DSR1_PP_DECODE_MLIR}"
+        "${_DSR1_PP_WEIGHT_PATH}"
+      COMMENT "[deepseek_r1_pipeline] stage${_DSR1_PP_RANK}: verifying ABI and generating stage-config.inc"
+      VERBATIM
+    )
+
+    # 2. Compile Stage.cpp + link stage.so with symbol closure & export check.
+    set(_DSR1_PP_SO_TARGET "deepseek_r1_pipeline_stage_${_DSR1_PP_RANK}_so")
+    set(_DSR1_PP_OBJS
+      "${_DSR1_PP_PREFILL_O}"
+      "${_DSR1_PP_DECODE_O}"
+      "${_DSR1_PP_SUB_PREFILL_O}"
+      "${_DSR1_PP_SUB_DECODE_O}"
+    )
+    set_source_files_properties(${_DSR1_PP_OBJS} PROPERTIES
+      EXTERNAL_OBJECT TRUE
+    )
+    add_library(${_DSR1_PP_SO_TARGET} SHARED EXCLUDE_FROM_ALL
+      pipeline/Stage.cpp
+      "${_DSR1_PP_CONFIG_INC}"
+      ${_DSR1_PP_OBJS}
+    )
+    set_target_properties(${_DSR1_PP_SO_TARGET} PROPERTIES
+      LIBRARY_OUTPUT_DIRECTORY "${_DSR1_PP_WORK_DIR}"
+      RUNTIME_OUTPUT_DIRECTORY "${_DSR1_PP_WORK_DIR}"
+      OUTPUT_NAME "stage"
+      PREFIX ""
+      BUILD_WITH_INSTALL_RPATH TRUE
+      INSTALL_RPATH "\$ORIGIN"
+    )
+    target_include_directories(${_DSR1_PP_SO_TARGET} PRIVATE
+      "${_DSR1_PP_WORK_DIR}"
+      ${MLIR_INCLUDE_DIRS}
+      "${CMAKE_SOURCE_DIR}/runtime/include"
+    )
+    target_link_libraries(${_DSR1_PP_SO_TARGET} PRIVATE
+      "${_DSR1_PP_CRUNNER_REAL}"
+      "${_DSR1_PP_OMP_REAL}"
+    )
+    if(NOT APPLE)
+      target_link_options(${_DSR1_PP_SO_TARGET} PRIVATE "-Wl,-z,defs")
+    endif()
+    target_compile_features(${_DSR1_PP_SO_TARGET} PRIVATE cxx_std_17)
+    add_custom_command(TARGET ${_DSR1_PP_SO_TARGET} POST_BUILD
+      COMMAND "${Python3_EXECUTABLE}" -c "${_DSR1_PP_SYMCHECK_PY}"
+        "$<TARGET_FILE:${_DSR1_PP_SO_TARGET}>"
+      COMMENT "[deepseek_r1_pipeline] stage${_DSR1_PP_RANK}: verifying stage.so v1 factory and MLIR entry symbols"
+      VERBATIM
+    )
+
+    # 3. Generate per-stage RHAL manifest (stage.mlir).
+    set(_DSR1_PP_VERSION_ARGS)
+    if(DEFINED BUDDY_VERSION AND NOT "${BUDDY_VERSION}" STREQUAL "")
+      set(_DSR1_PP_VERSION_ARGS --version "${BUDDY_VERSION}")
+    endif()
+    add_custom_command(
+      OUTPUT "${_DSR1_PP_MANIFEST}"
+      COMMAND "${CMAKE_COMMAND}" -E make_directory "${_DSR1_PP_WORK_DIR}"
+      COMMAND "${Python3_EXECUTABLE}" "${_DSR1_PP_GEN_MANIFEST_SCRIPT}"
+        --config "${_DSR1_PP_CONFIG}"
+        ${_DSR1_PP_DEP_MANIFEST_ARGS}
+        --runner-library "$<TARGET_FILE_NAME:buddy_models_deepseek_r1_pipeline_runner>"
+        ${_DSR1_PP_VERSION_ARGS}
+        -o "${_DSR1_PP_MANIFEST}"
+      DEPENDS
+        "${_DSR1_PP_GEN_MANIFEST_SCRIPT}"
+        "${_DSR1_PP_CONFIG}"
+      COMMENT "[deepseek_r1_pipeline] stage${_DSR1_PP_RANK}: generating RHAL manifest"
+      VERBATIM
+    )
+
+    # 4. Stage referenced files, run rax-pack, and publish stage<i>.rax.
+    if(DEEPSEEKR1_PIPELINE_EMBED_PAYLOAD)
+      set(_DSR1_PP_STAGE_OUT_DIR "${_DSR1_PP_WORK_DIR}")
+      set(_DSR1_PP_RAX_TMP "${_DSR1_PP_WORK_DIR}/stage${_DSR1_PP_RANK}.rax.tmp")
+      set(_DSR1_PP_RAX_OUT "${_DSR1_PP_OUT_DIR}/stage${_DSR1_PP_RANK}.rax")
+      set(_DSR1_PP_RAX_PACK_EXTRA_ARGS --embed-payload)
+      set(_DSR1_PP_STAGE_SO_CMD)
+    else()
+      set(_DSR1_PP_STAGE_OUT_DIR "${_DSR1_PP_OUT_DIR}/stage${_DSR1_PP_RANK}")
+      set(_DSR1_PP_RAX_TMP "${_DSR1_PP_STAGE_OUT_DIR}/stage${_DSR1_PP_RANK}.rax.tmp")
+      set(_DSR1_PP_RAX_OUT "${_DSR1_PP_STAGE_OUT_DIR}/stage${_DSR1_PP_RANK}.rax")
+      set(_DSR1_PP_RAX_PACK_EXTRA_ARGS)
+      set(_DSR1_PP_STAGE_SO_CMD
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+          "$<TARGET_FILE:${_DSR1_PP_SO_TARGET}>"
+          "${_DSR1_PP_STAGE_OUT_DIR}/stage.so")
+    endif()
+
+    set(_DSR1_PP_STAGE_DEP_CMDS)
+    foreach(_dep_idx RANGE 0 ${_DSR1_PP_DEP_LAST})
+      list(GET _DSR1_PP_DEP_LIB_PATHS ${_dep_idx} _dep_path)
+      list(GET _DSR1_PP_DEP_LIB_NAMES ${_dep_idx} _dep_name)
+      list(APPEND _DSR1_PP_STAGE_DEP_CMDS
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+          "${_dep_path}" "${_DSR1_PP_STAGE_OUT_DIR}/${_dep_name}")
+    endforeach()
+
+    set(_DSR1_PP_STAGE_VOCAB_CMD)
+    set(_DSR1_PP_VOCAB_DEP)
+    if(_DSR1_PP_IS_FIRST)
+      set(_DSR1_PP_STAGE_VOCAB_CMD
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+          "${_DSR1_PP_VOCAB_SRC}" "${_DSR1_PP_STAGE_OUT_DIR}/${_DSR1_PP_VOCAB_FILE}")
+      set(_DSR1_PP_VOCAB_DEP "${_DSR1_PP_VOCAB_SRC}")
+    endif()
+
+    add_custom_command(
+      OUTPUT "${_DSR1_PP_RAX_OUT}"
+      COMMAND "${CMAKE_COMMAND}" -E make_directory
+        "${_DSR1_PP_STAGE_OUT_DIR}" "${_DSR1_PP_OUT_DIR}"
+      ${_DSR1_PP_STAGE_SO_CMD}
+      COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+        "$<TARGET_FILE:buddy_models_deepseek_r1_pipeline_runner>"
+        "${_DSR1_PP_STAGE_OUT_DIR}/$<TARGET_FILE_NAME:buddy_models_deepseek_r1_pipeline_runner>"
+      ${_DSR1_PP_STAGE_DEP_CMDS}
+      ${_DSR1_PP_STAGE_VOCAB_CMD}
+      COMMAND "${Python3_EXECUTABLE}" -c "${_DSR1_PP_HARDLINK_PY}"
+        "${_DSR1_PP_WEIGHT_PATH}"
+        "${_DSR1_PP_STAGE_OUT_DIR}/${_DSR1_PP_WEIGHT_FILE}"
+      COMMAND "${_DSR1_PP_RAX_PACK_BIN}" "${_DSR1_PP_MANIFEST}"
+        -o "${_DSR1_PP_RAX_TMP}" ${_DSR1_PP_RAX_PACK_EXTRA_ARGS}
+      COMMAND "${CMAKE_COMMAND}" -E rename
+        "${_DSR1_PP_RAX_TMP}" "${_DSR1_PP_RAX_OUT}"
+      DEPENDS
+        ${_DSR1_PP_RAX_PACK_DEP}
+        "${_DSR1_PP_MANIFEST}"
+        ${_DSR1_PP_SO_TARGET}
+        "$<TARGET_FILE:${_DSR1_PP_SO_TARGET}>"
+        buddy_models_deepseek_r1_pipeline_runner
+        "$<TARGET_FILE:buddy_models_deepseek_r1_pipeline_runner>"
+        "${_DSR1_PP_WEIGHT_PATH}"
+        ${_DSR1_PP_DEP_LIB_PATHS}
+        ${_DSR1_PP_VOCAB_DEP}
+      COMMENT "[deepseek_r1_pipeline] stage${_DSR1_PP_RANK}: packing ${_DSR1_PP_RAX_OUT}"
+      VERBATIM
+    )
+
+    set(_DSR1_PP_STAGE_TARGET "deepseek_r1_pipeline_stage_${_DSR1_PP_RANK}_rax")
+    add_custom_target(${_DSR1_PP_STAGE_TARGET} DEPENDS "${_DSR1_PP_RAX_OUT}")
+    list(APPEND _DSR1_PP_STAGE_TARGETS ${_DSR1_PP_STAGE_TARGET})
+
+    math(EXPR _DSR1_PP_RANK "${_DSR1_PP_RANK} + 1")
+  endforeach()
+
+  add_custom_target(deepseek_r1_pipeline_rax
+    DEPENDS ${_DSR1_PP_STAGE_TARGETS}
+  )
+  message(STATUS
+    "[deepseek_r1] Registered deepseek_r1_pipeline_rax for ${_DSR1_PP_RANK} stage(s) "
+    "(embed=${DEEPSEEKR1_PIPELINE_EMBED_PAYLOAD}, out=${_DSR1_PP_OUT_DIR}).")
+endif()
