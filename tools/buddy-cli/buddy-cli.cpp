@@ -29,6 +29,9 @@
 #include "buddy/runtime/core/InferenceRunner.h"
 #include "buddy/runtime/core/ModelManifest.h"
 #include "buddy/runtime/core/RaxDependenciesHandle.h"
+#ifdef BUDDY_CLI_HAVE_MPI
+#include "buddy/runtime/pipeline/StageManifest.h"
+#endif
 #ifdef BUDDY_CLI_HAVE_DEEPSEEK_R1_MODEL
 #include "buddy/runtime/models/DeepSeekR1Runner.h"
 #endif
@@ -49,6 +52,13 @@
 #include <vector>
 
 #include <CLI11.hpp>
+
+#ifdef BUDDY_CLI_HAVE_MPI
+#include <chrono>
+#include <cstdlib>
+#include <mpi.h>
+#include <thread>
+#endif
 
 #ifdef BUDDY_CLI_HAVE_NUMA
 #include <numa.h>
@@ -264,12 +274,31 @@ static std::string resolvePathRelativeToRax(const std::string &path,
   return (fs::absolute(fs::path(raxPath)).parent_path() / p).string();
 }
 
+#ifdef BUDDY_CLI_HAVE_MPI
+[[noreturn]] static void abortStageJob(MPI_Comm comm, int rank,
+                                       const std::string &raxPath,
+                                       const std::string &detail) {
+  std::ostringstream os;
+  os << "buddy-cli: rank " << rank << " [package="
+     << (raxPath.empty() ? "<unset>" : raxPath) << "]: " << detail << '\n';
+  const std::string msg = os.str();
+  std::cerr.write(msg.data(), static_cast<std::streamsize>(msg.size()));
+  std::cerr.flush();
+  // Give the MPI process manager a brief window to drain redirected stderr
+  // pipes before MPI_Abort tears down the job.
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  MPI_Abort(comm, 1);
+  std::_Exit(1);
+}
+#endif
+
 //===----------------------------------------------------------------------===//
 // CLI
 //===----------------------------------------------------------------------===//
 
 int main(int argc, char **argv) {
   std::string raxPath;
+  std::vector<std::string> stageModels;
   std::string modelSoPath;
   std::string weightsPath;
   std::string vocabPath;
@@ -316,9 +345,14 @@ int main(int argc, char **argv) {
       "taskset -c 0-47\n"
       "  buddy-cli --numa 0,1,2,3 --cpus 0-47 --model deepseek_r1.rax "
       "--prompt \"Hello\"\n"
+      "  mpiexec -n 2 buddy-cli --stage-model stage0.rax "
+      "--stage-model stage1.rax --prompt \"Hello\" --max-tokens 32\n"
       "  buddy-cli --model-so model.so --weights arg0.data --prompt \"Hi\"");
 
   app.add_option("--model", raxPath, "Model manifest (recommended)")
+      ->group("Model source");
+  app.add_option("--stage-model", stageModels,
+                 "Pipeline stage .rax package (repeat in MPI rank order)")
       ->group("Model source");
   app.add_option("--model-so", modelSoPath,
                  "Model shared library (legacy mode)")
@@ -438,10 +472,190 @@ int main(int argc, char **argv) {
   if (!cpuSpec.empty())
     applyCpuAffinity(cpuSpec);
 
+  // ── Pipeline stage mode (--stage-model) ──────────────────────────────────
+  // Enter BEFORE single-model validation, stdin prompt reads, or opening any
+  // .rax so SPMD ranks initialize MPI, validate options, and select only their
+  // own stage package.
+  if (!stageModels.empty()) {
+#ifndef BUDDY_CLI_HAVE_MPI
+    std::cerr << "\033[31;1m[Error]\033[0m --stage-model requires an "
+                 "MPI-enabled build of buddy-cli. Rebuild with MPI available "
+                 "and -DBUDDY_CLI_ENABLE_MPI=ON.\n";
+    return 2;
+#else
+    int mpiInitialized = 0;
+    int mpiFinalized = 0;
+    if (MPI_Initialized(&mpiInitialized) != MPI_SUCCESS) {
+      std::cerr << "\033[31;1m[Error]\033[0m buddy-cli: MPI_Initialized "
+                   "failed\n";
+      return 1;
+    }
+    if (MPI_Finalized(&mpiFinalized) != MPI_SUCCESS) {
+      std::cerr << "\033[31;1m[Error]\033[0m buddy-cli: MPI_Finalized "
+                   "failed\n";
+      return 1;
+    }
+    if (mpiFinalized) {
+      std::cerr << "\033[31;1m[Error]\033[0m buddy-cli: MPI is already "
+                   "finalized\n";
+      return 1;
+    }
+    bool ownsMpi = false;
+    if (!mpiInitialized) {
+      if (MPI_Init(&argc, &argv) != MPI_SUCCESS) {
+        std::cerr << "\033[31;1m[Error]\033[0m buddy-cli: MPI_Init failed\n";
+        return 1;
+      }
+      ownsMpi = true;
+    }
+
+    const MPI_Comm comm = MPI_COMM_WORLD;
+    int rank = -1;
+    int worldSize = 0;
+    std::string selectedRaxPath;
+    try {
+      if (MPI_Comm_set_errhandler(comm, MPI_ERRORS_RETURN) != MPI_SUCCESS)
+        throw std::runtime_error("MPI_Comm_set_errhandler failed");
+      if (MPI_Comm_rank(comm, &rank) != MPI_SUCCESS)
+        throw std::runtime_error("MPI_Comm_rank failed");
+      if (MPI_Comm_size(comm, &worldSize) != MPI_SUCCESS)
+        throw std::runtime_error("MPI_Comm_size failed");
+
+      if (rank >= 0 && static_cast<size_t>(rank) < stageModels.size())
+        selectedRaxPath = stageModels[static_cast<size_t>(rank)];
+
+      // Mutually exclusive model source and explicit override options.
+      if (app.get_option("--model")->count() > 0)
+        throw std::runtime_error(
+            "--stage-model cannot be combined with --model");
+      if (app.get_option("--model-so")->count() > 0)
+        throw std::runtime_error(
+            "--stage-model cannot be combined with --model-so");
+      if (app.get_option("--weights")->count() > 0)
+        throw std::runtime_error(
+            "--stage-model cannot be combined with --weights");
+      if (app.get_option("--vocab")->count() > 0)
+        throw std::runtime_error(
+            "--stage-model cannot be combined with --vocab");
+      if (app.get_option("--runner-so")->count() > 0)
+        throw std::runtime_error(
+            "--stage-model cannot be combined with --runner-so");
+
+      // Options not supported in pipeline stage mode (avoid multi-rank stdin
+      // reads or silent ignores).
+      if (interactive)
+        throw std::runtime_error(
+            "--interactive is not supported with --stage-model");
+      if (app.get_option("--prompt-file")->count() > 0)
+        throw std::runtime_error(
+            "--prompt-file is not supported with --stage-model");
+      if (app.get_option("--prompt-length")->count() > 0)
+        throw std::runtime_error(
+            "--prompt-length is not supported with --stage-model");
+      if (app.get_option("--audio")->count() > 0)
+        throw std::runtime_error("--audio is not supported with --stage-model");
+      if (app.get_option("--image")->count() > 0)
+        throw std::runtime_error("--image is not supported with --stage-model");
+      if (app.get_option("--chat-template")->count() > 0)
+        throw std::runtime_error(
+            "--chat-template is not supported with --stage-model");
+      if (app.get_option("--perplexity")->count() > 0 ||
+          app.get_option("--ppl-context")->count() > 0 ||
+          app.get_option("--ppl-chunks")->count() > 0)
+        throw std::runtime_error(
+            "--perplexity/--ppl-* options are not supported with "
+            "--stage-model");
+      if (deferDecodeTokenReadback)
+        throw std::runtime_error(
+            "--defer-decode-token-readback is not supported with "
+            "--stage-model");
+      if (printAllBatchOutputs)
+        throw std::runtime_error(
+            "--print-all-batch is not supported with --stage-model");
+      if (batchSize != 0 && batchSize != 1)
+        throw std::runtime_error(
+            "--stage-model only supports default or --batch-size 1 (got " +
+            std::to_string(batchSize) + ")");
+      if (maxTokens < 0)
+        throw std::runtime_error(
+            "--max-tokens must be non-negative with --stage-model (got " +
+            std::to_string(maxTokens) + ")");
+      if (prompt.empty())
+        throw std::runtime_error(
+            "--stage-model requires an explicit non-empty --prompt");
+
+      if (static_cast<int>(stageModels.size()) != worldSize)
+        throw std::runtime_error(
+            "number of --stage-model packages (" +
+            std::to_string(stageModels.size()) +
+            ") does not match MPI world size (" + std::to_string(worldSize) +
+            ")");
+      if (selectedRaxPath.empty())
+        throw std::runtime_error(
+            "--stage-model path for this rank must be non-empty");
+
+      // Load only this rank's selected package and verify stage markers and
+      // runner_library before dispatch (never fall back to a builtin runner).
+      auto manifest =
+          buddy::runtime::ModelManifest::loadFromRax(selectedRaxPath);
+      (void)buddy::runtime::parseStageV1(manifest.moduleAttrs);
+      if (manifest.runnerLibraryPath.empty())
+        throw std::runtime_error(
+            "stage package is missing required runner_library attribute");
+      const std::string stageRunnerSoPath =
+          resolvePathRelativeToRax(manifest.runnerLibraryPath, selectedRaxPath);
+      if (stageRunnerSoPath.empty())
+        throw std::runtime_error(
+            "stage package resolved empty runner_library path");
+
+      buddy::runtime::RunConfig cfg;
+      cfg.raxPath = selectedRaxPath;
+      cfg.prompt = prompt;
+      cfg.maxNewTokens = maxTokens;
+      cfg.batchSize = batchSize;
+      cfg.samplerConfig.temperature = temperature;
+      cfg.samplerConfig.topK = topK;
+      cfg.samplerConfig.topP = topP;
+      cfg.samplerConfig.minP = minP;
+      cfg.samplerConfig.repeatPenalty = repeatPenalty;
+      cfg.samplerConfig.repeatLastN = repeatLastN;
+      cfg.samplerConfig.seed = seed;
+      cfg.suppressStats = suppressStats;
+      cfg.streamJsonl = streamJsonl;
+
+      {
+        std::unique_ptr<buddy::runtime::RaxDependenciesHandle> raxDependencies;
+        if (!manifest.dependentSoPaths.empty())
+          raxDependencies =
+              std::make_unique<buddy::runtime::RaxDependenciesHandle>(
+                  manifest.dependentSoPaths, "buddy-cli");
+
+        RunnerHandle runner(stageRunnerSoPath, manifest.modelName);
+        runner.get().run(cfg);
+      }
+    } catch (const std::exception &e) {
+      abortStageJob(comm, rank, selectedRaxPath, e.what());
+    } catch (...) {
+      abortStageJob(comm, rank, selectedRaxPath, "unknown exception");
+    }
+
+    if (ownsMpi) {
+      if (MPI_Finalize() != MPI_SUCCESS) {
+        std::cerr << "\033[31;1m[Error]\033[0m buddy-cli: rank " << rank
+                  << " [package=" << selectedRaxPath
+                  << "]: MPI_Finalize failed\n";
+        return 1;
+      }
+    }
+    return 0;
+#endif
+  }
+
   // ── Validate ─────────────────────────────────────────────────────────────
   if (raxPath.empty() && modelSoPath.empty()) {
     std::cerr << "\033[31;1m[Error]\033[0m "
-                 "Provide --model <path.rax> or --model-so <path.so>.\n\n";
+                 "Provide --model <path.rax>, --stage-model <path.rax>, or "
+                 "--model-so <path.so>.\n\n";
     std::cerr << app.help() << "\n";
     return 2;
   }

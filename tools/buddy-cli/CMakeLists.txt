@@ -65,6 +65,28 @@ if(BUDDY_CLI_ENABLE_NUMA)
   endif()
 endif()
 
+# ── MPI (optional, enables --stage-model pipeline-parallel launches) ───────
+if(CMAKE_CROSSCOMPILING)
+  set(_buddy_cli_mpi_default OFF)
+else()
+  set(_buddy_cli_mpi_default ON)
+endif()
+option(BUDDY_CLI_ENABLE_MPI
+  "Enable MPI pipeline-parallel support in buddy-cli (--stage-model)"
+  ${_buddy_cli_mpi_default})
+if(BUDDY_CLI_ENABLE_MPI)
+  find_package(MPI COMPONENTS CXX QUIET)
+  if(MPI_CXX_FOUND)
+    target_compile_definitions(buddy-cli PRIVATE BUDDY_CLI_HAVE_MPI)
+    target_link_libraries(buddy-cli PRIVATE MPI::MPI_CXX)
+    message(STATUS "[buddy-cli] MPI found; enabling --stage-model support.")
+  else()
+    message(STATUS "[buddy-cli] MPI not found; building without --stage-model MPI support.")
+  endif()
+else()
+  message(STATUS "[buddy-cli] BUDDY_CLI_ENABLE_MPI=OFF; building without --stage-model MPI support.")
+endif()
+
 if(BUDDY_MLIR_USE_MIMALLOC)
   target_link_libraries(buddy-cli PRIVATE mimalloc)
 endif()
