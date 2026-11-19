@@ -100,6 +100,7 @@ def gen_manifest(
                 )
             if int(config.get("prefill_chunk", 0)) <= 0:
                 raise ValueError("w4g32 pipeline_stage requires prefill_chunk > 0")
+            stage_attrs["pp_prefill_chunk"] = str(int(config["prefill_chunk"]))
         else:
             if (len(weights) != 1 or weights[0]["mlir_type"] != "f16"
                     or weights[0].get("decode_file")):

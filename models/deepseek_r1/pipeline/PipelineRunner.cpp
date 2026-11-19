@@ -50,17 +50,27 @@ void requireActiveMPI() {
                              "(MPI_Finalize already called)");
 }
 
-void requireOneExternalWeight(const ModelManifest &m) {
+void requireExternalWeights(const ModelManifest &m, const StageManifest &spec) {
   if (m.soPath.empty())
     throw std::runtime_error("missing HostSharedLib code object (soPath)");
-  if (m.weightPaths.size() != 1)
-    throw std::runtime_error(
-        "field constants (external weights) must contain exactly 1 weight "
-        "(got " +
-        std::to_string(m.weightPaths.size()) + ")");
-  if (m.weightPaths[0].empty())
-    throw std::runtime_error(
-        "field constants[0] (external weight path) must be non-empty");
+  if (spec.activationType == "f16") {
+    if (m.weightPaths.size() != 1)
+      throw std::runtime_error(
+          "field constants (external weights) must contain exactly 1 weight "
+          "for f16 stage (got " +
+          std::to_string(m.weightPaths.size()) + ")");
+  } else {
+    if (m.weightPaths.empty() || m.weightPaths.size() > 2)
+      throw std::runtime_error(
+          "field constants (external weights) must contain 1 or 2 weights "
+          "for f32 stage (got " +
+          std::to_string(m.weightPaths.size()) + ")");
+  }
+  for (size_t i = 0; i < m.weightPaths.size(); ++i) {
+    if (m.weightPaths[i].empty())
+      throw std::runtime_error("field constants[" + std::to_string(i) +
+                               "] (external weight path) must be non-empty");
+  }
 }
 
 struct StageDeleter {
@@ -95,15 +105,7 @@ public:
   StageLibrary(const StageLibrary &) = delete;
   StageLibrary &operator=(const StageLibrary &) = delete;
 
-  StagePtr createV1(const std::string &weightPath) const {
-    dlerror();
-    auto *createSym = dlsym(handle, "buddy_create_pipeline_stage_v1");
-    if (const char *err = dlerror())
-      throw std::runtime_error(
-          std::string("missing buddy_create_pipeline_stage_v1: ") + err);
-    if (!createSym)
-      throw std::runtime_error("buddy_create_pipeline_stage_v1 symbol is null");
-
+  StagePtr create(const std::vector<std::string> &weightPaths) const {
     dlerror();
     auto *destroySym = dlsym(handle, "buddy_destroy_pipeline_stage_v1");
     if (const char *err = dlerror())
@@ -112,10 +114,35 @@ public:
     if (!destroySym)
       throw std::runtime_error(
           "buddy_destroy_pipeline_stage_v1 symbol is null");
+    auto destroyFn = reinterpret_cast<DestroyStageV1>(destroySym);
+
+    if (weightPaths.size() > 1) {
+      dlerror();
+      auto *createV2Sym = dlsym(handle, "buddy_create_pipeline_stage_v2");
+      if (!dlerror() && createV2Sym) {
+        std::vector<const char *> ptrs;
+        ptrs.reserve(weightPaths.size());
+        for (const auto &p : weightPaths)
+          ptrs.push_back(p.c_str());
+        auto createV2Fn = reinterpret_cast<CreateStageV2>(createV2Sym);
+        Stage *raw = createV2Fn(ptrs.data(), ptrs.size());
+        if (!raw)
+          throw std::runtime_error(
+              "buddy_create_pipeline_stage_v2 returned null");
+        return StagePtr(raw, StageDeleter{destroyFn});
+      }
+    }
+
+    dlerror();
+    auto *createSym = dlsym(handle, "buddy_create_pipeline_stage_v1");
+    if (const char *err = dlerror())
+      throw std::runtime_error(
+          std::string("missing buddy_create_pipeline_stage_v1: ") + err);
+    if (!createSym)
+      throw std::runtime_error("buddy_create_pipeline_stage_v1 symbol is null");
 
     auto createFn = reinterpret_cast<CreateStageV1>(createSym);
-    auto destroyFn = reinterpret_cast<DestroyStageV1>(destroySym);
-    Stage *raw = createFn(weightPath.c_str());
+    Stage *raw = createFn(weightPaths.at(0).c_str());
     if (!raw)
       throw std::runtime_error("buddy_create_pipeline_stage_v1 returned null");
     return StagePtr(raw, StageDeleter{destroyFn});
@@ -148,7 +175,9 @@ void checkLocalConfig(const StageManifest &spec, const StageConfig &config) {
         std::to_string(config.activationWidth));
 
   const std::string libType = pipeline::activationTypeName(config.dtype);
-  if (spec.activationType != libType || config.dtype != ActivationType::F16)
+  if (spec.activationType != libType ||
+      (config.dtype != ActivationType::F16 &&
+       config.dtype != ActivationType::F32))
     throw std::runtime_error(
         "local config mismatch on field pp_activation_type: manifest has '" +
         spec.activationType + "', stage library reports '" + libType + "'");
@@ -161,6 +190,15 @@ void checkLocalConfig(const StageManifest &spec, const StageConfig &config) {
     throw std::runtime_error(
         "stage library reports non-positive field vocabSize (" +
         std::to_string(config.vocabSize) + ")");
+  if (config.prefillChunk < 0 || config.prefillChunk > config.context)
+    throw std::runtime_error(
+        "stage library reports out-of-range field prefillChunk (" +
+        std::to_string(config.prefillChunk) + ")");
+  if (spec.prefillChunk > 0 && spec.prefillChunk != config.prefillChunk)
+    throw std::runtime_error(
+        "local config mismatch on field pp_prefill_chunk: manifest has " +
+        std::to_string(spec.prefillChunk) + ", stage library reports " +
+        std::to_string(config.prefillChunk));
 }
 
 void validateRunConfig(const RunConfig &cfg) {
@@ -248,10 +286,10 @@ void PipelineRunner::run(const RunConfig &cfg) {
     modelName = m.modelName;
 
     auto spec = parseStageV1(m.moduleAttrs);
-    requireOneExternalWeight(m);
+    requireExternalWeights(m, spec);
 
     StageLibrary lib(m.soPath);
-    auto stage = lib.createV1(m.weightPaths.at(0));
+    auto stage = lib.create(m.weightPaths);
     checkLocalConfig(spec, stage->configuration());
 
     pipeline::StageCheckOptions checkOpts;

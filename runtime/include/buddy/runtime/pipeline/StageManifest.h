@@ -30,6 +30,7 @@ struct StageManifest {
   int totalLayers;
   std::string activationType;
   int activationWidth;
+  int prefillChunk = 0;
 };
 
 inline StageManifest
@@ -40,8 +41,7 @@ parseStageV1(const std::unordered_map<std::string, std::string> &moduleAttrs) {
       throw std::runtime_error(std::string("missing stage field ") + field);
     return it->second;
   };
-  auto parseInt = [&](const char *field) {
-    const std::string &value = require(field);
+  auto parseIntValue = [&](const char *field, const std::string &value) {
     int number;
     const char *end = value.data() + value.size();
     auto result = std::from_chars(value.data(), end, number);
@@ -49,23 +49,31 @@ parseStageV1(const std::unordered_map<std::string, std::string> &moduleAttrs) {
       throw std::runtime_error(std::string(field) + " must be an integer");
     return number;
   };
+  auto parseInt = [&](const char *field) {
+    return parseIntValue(field, require(field));
+  };
 
   if (require("pp_stage_version") != "1")
     throw std::runtime_error("pp_stage_version must be 1");
+  int prefillChunk = 0;
+  if (auto it = moduleAttrs.find("pp_prefill_chunk"); it != moduleAttrs.end())
+    prefillChunk = parseIntValue("pp_prefill_chunk", it->second);
   StageManifest stage{parseInt("pp_start_layer"), parseInt("pp_end_layer"),
                       parseInt("pp_total_layers"),
                       require("pp_activation_type"),
-                      parseInt("pp_activation_width")};
+                      parseInt("pp_activation_width"), prefillChunk};
   if (stage.startLayer < 0)
     throw std::runtime_error("pp_start_layer must be non-negative");
   if (stage.endLayer <= stage.startLayer)
     throw std::runtime_error("pp_end_layer must exceed pp_start_layer");
   if (stage.totalLayers < stage.endLayer)
     throw std::runtime_error("pp_total_layers must be at least pp_end_layer");
-  if (stage.activationType != "f16")
-    throw std::runtime_error("pp_activation_type must be f16");
+  if (stage.activationType != "f16" && stage.activationType != "f32")
+    throw std::runtime_error("pp_activation_type must be f16 or f32");
   if (stage.activationWidth <= 0)
     throw std::runtime_error("pp_activation_width must be positive");
+  if (stage.prefillChunk < 0)
+    throw std::runtime_error("pp_prefill_chunk must be non-negative");
   return stage;
 }
 

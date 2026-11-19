@@ -90,14 +90,49 @@ inline ActivationHeader makeActivationHeader(int step, int promptRows,
                           static_cast<int32_t>(pos64), 1};
 }
 
+inline ActivationHeader makeChunkPrefillHeader(int step, int pos,
+                                               int prefillChunk, int context) {
+  if (context <= 0)
+    throw std::invalid_argument("activation context must be positive");
+  if (prefillChunk <= 0 || prefillChunk > context)
+    throw std::invalid_argument(
+        "activation prefillChunk must satisfy 0 < prefillChunk <= context");
+  if (step < 0)
+    throw std::invalid_argument("activation step must be non-negative");
+  if (pos < 0 || pos >= context)
+    throw std::invalid_argument("prefill chunk pos out of context range");
+  return ActivationHeader{kActivationProtocolVersion,
+                          static_cast<int32_t>(step),
+                          static_cast<int32_t>(pos),
+                          static_cast<int32_t>(prefillChunk)};
+}
+
+inline ActivationHeader makeChunkDecodeHeader(int step, int pos, int context) {
+  if (context <= 0)
+    throw std::invalid_argument("activation context must be positive");
+  if (step < 0)
+    throw std::invalid_argument("activation step must be non-negative");
+  if (pos < 0 || pos >= context)
+    throw std::invalid_argument("decode pos out of context range");
+  return ActivationHeader{kActivationProtocolVersion,
+                          static_cast<int32_t>(step),
+                          static_cast<int32_t>(pos), 1};
+}
+
 class BlockingActivation {
 public:
   BlockingActivation(const StageConfig &config, MPI_Comm comm)
       : width(config.activationWidth), context(config.context),
+        prefillChunk(config.prefillChunk),
         type(config.dtype == ActivationType::F16 ? MPI_UINT16_T : MPI_FLOAT),
         comm(comm) {
     if (width <= 0 || context <= 0)
       throw std::invalid_argument("invalid activation width or context");
+    if (prefillChunk < 0 || prefillChunk > context)
+      throw std::invalid_argument("invalid activation prefillChunk");
+    if (config.dtype != ActivationType::F16 &&
+        config.dtype != ActivationType::F32)
+      throw std::invalid_argument("unsupported activation dtype");
     mpiCheck(MPI_Comm_rank(comm, &rank));
     checkedElementCount(1);
   }
@@ -253,6 +288,19 @@ private:
       reason = "step must be non-negative";
       return false;
     }
+    if (prefillChunk > 0) {
+      if (header.pos < 0 || header.pos >= context) {
+        reason = "chunked pos must satisfy 0 <= pos < " +
+                 std::to_string(context);
+        return false;
+      }
+      if (header.rows != prefillChunk && header.rows != 1) {
+        reason = "chunked rows must be 1 or prefillChunk (" +
+                 std::to_string(prefillChunk) + ")";
+        return false;
+      }
+      return true;
+    }
     if (header.step == 0) {
       if (header.pos != -1) {
         reason = "prefill pos must be -1";
@@ -319,6 +367,7 @@ private:
 
   int width;
   int context;
+  int prefillChunk;
   MPI_Datatype type;
   MPI_Comm comm;
   int rank = 0;
