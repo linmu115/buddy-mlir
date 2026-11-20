@@ -21,6 +21,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace buddy::runtime {
 
@@ -31,6 +32,8 @@ struct StageManifest {
   std::string activationType;
   int activationWidth;
   int prefillChunk = 0;
+  std::string tokenizer = "deepseek_r1";
+  std::vector<int> stopTokenIds;
 };
 
 inline StageManifest
@@ -52,16 +55,49 @@ parseStageV1(const std::unordered_map<std::string, std::string> &moduleAttrs) {
   auto parseInt = [&](const char *field) {
     return parseIntValue(field, require(field));
   };
+  auto parseStopTokenIds = [&](const std::string &raw) {
+    if (raw.empty())
+      throw std::runtime_error("pp_stop_token_ids must not be empty");
+    std::vector<int> ids;
+    size_t pos = 0;
+    while (true) {
+      size_t comma = raw.find(',', pos);
+      std::string token = (comma == std::string::npos)
+                              ? raw.substr(pos)
+                              : raw.substr(pos, comma - pos);
+      int id = parseIntValue("pp_stop_token_ids", token);
+      if (id < 0)
+        throw std::runtime_error("pp_stop_token_ids entries must be non-negative");
+      ids.push_back(id);
+      if (comma == std::string::npos)
+        break;
+      pos = comma + 1;
+    }
+    return ids;
+  };
 
   if (require("pp_stage_version") != "1")
     throw std::runtime_error("pp_stage_version must be 1");
   int prefillChunk = 0;
   if (auto it = moduleAttrs.find("pp_prefill_chunk"); it != moduleAttrs.end())
     prefillChunk = parseIntValue("pp_prefill_chunk", it->second);
-  StageManifest stage{parseInt("pp_start_layer"), parseInt("pp_end_layer"),
+  std::string tokenizer = "deepseek_r1";
+  if (auto it = moduleAttrs.find("pp_tokenizer"); it != moduleAttrs.end()) {
+    tokenizer = it->second;
+    if (tokenizer != "deepseek_r1" && tokenizer != "qwen3")
+      throw std::runtime_error("pp_tokenizer must be deepseek_r1 or qwen3");
+  }
+  std::vector<int> stopTokenIds;
+  if (auto it = moduleAttrs.find("pp_stop_token_ids"); it != moduleAttrs.end())
+    stopTokenIds = parseStopTokenIds(it->second);
+  StageManifest stage{parseInt("pp_start_layer"),
+                      parseInt("pp_end_layer"),
                       parseInt("pp_total_layers"),
                       require("pp_activation_type"),
-                      parseInt("pp_activation_width"), prefillChunk};
+                      parseInt("pp_activation_width"),
+                      prefillChunk,
+                      std::move(tokenizer),
+                      std::move(stopTokenIds)};
   if (stage.startLayer < 0)
     throw std::runtime_error("pp_start_layer must be non-negative");
   if (stage.endLayer <= stage.startLayer)

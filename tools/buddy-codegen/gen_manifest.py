@@ -31,6 +31,15 @@ import sys
 from io import StringIO
 
 
+_PIPELINE_TOKENIZER_MAP = {
+    "deepseek_r1": "deepseek_r1",
+    "qwen3": "qwen3",
+    "qwen3_moe": "qwen3",
+    "qwen3_vl": "qwen3",
+    "qwen3_vl_moe": "qwen3",
+}
+
+
 def _normalize_dep_uri(raw: str) -> str:
     s = raw.strip()
     if not s:
@@ -107,6 +116,43 @@ def gen_manifest(
                 raise ValueError("pipeline_stage requires one external f16 weight")
             if int(config.get("prefill_chunk", 0)):
                 raise ValueError("pipeline_stage requires prefill_chunk = 0")
+
+        raw_tokenizer = tokens.get("tokenizer")
+        if raw_tokenizer is not None and raw_tokenizer != "unknown":
+            if not isinstance(raw_tokenizer, str):
+                raise ValueError(
+                    f"tokens.tokenizer must be a string, got {raw_tokenizer!r}"
+                )
+            norm_tokenizer = _PIPELINE_TOKENIZER_MAP.get(raw_tokenizer)
+            if norm_tokenizer is None:
+                raise ValueError(
+                    f"unsupported pipeline_stage tokenizer: {raw_tokenizer!r} "
+                    f"(expected 'deepseek_r1' or 'qwen3')"
+                )
+            stage_attrs["pp_tokenizer"] = norm_tokenizer
+
+        raw_stops = tokens.get("stop_token_ids")
+        if raw_stops is not None:
+            if not isinstance(raw_stops, (list, tuple)) or not raw_stops:
+                raise ValueError(
+                    "tokens.stop_token_ids must be a non-empty list of integers"
+                )
+            norm_stops: list[int] = []
+            for item in raw_stops:
+                if (
+                    isinstance(item, bool)
+                    or not isinstance(item, int)
+                    or item < 0
+                ):
+                    raise ValueError(
+                        "tokens.stop_token_ids entry must be a non-negative "
+                        f"integer, got {item!r}"
+                    )
+                if item not in norm_stops:
+                    norm_stops.append(item)
+            stage_attrs["pp_stop_token_ids"] = ",".join(
+                str(tok) for tok in norm_stops
+            )
 
     so_name = "stage.so" if stage is not None else compilation["so_name"]
     runner_suffix = "_pipeline_runner.so" if stage is not None else "_runner.so"

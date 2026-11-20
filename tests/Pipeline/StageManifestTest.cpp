@@ -117,6 +117,10 @@ void testValidStages() {
                   std::string(tc.name) + "." + dtype + ".activationWidth");
       expectEqual(parsed.prefillChunk, 0,
                   std::string(tc.name) + "." + dtype + ".prefillChunk");
+      expectEqual(parsed.tokenizer, "deepseek_r1",
+                  std::string(tc.name) + "." + dtype + ".tokenizer");
+      expectEqual(static_cast<int>(parsed.stopTokenIds.size()), 0,
+                  std::string(tc.name) + "." + dtype + ".stopTokenIds.size");
     }
   }
 
@@ -128,6 +132,54 @@ void testValidStages() {
     const auto parsed = buddy::runtime::parseStageV1(attrs);
     expectEqual(parsed.activationType, "f32", "chunked.activationType");
     expectEqual(parsed.prefillChunk, chunkCase.second, "chunked.prefillChunk");
+    expectEqual(parsed.tokenizer, "deepseek_r1", "chunked.tokenizer");
+  }
+}
+
+void testTokenizerAndStopTokenIds() {
+  for (const std::string &tok : {"deepseek_r1", "qwen3"}) {
+    Attrs attrs = makeValidStageAttrs("0", "2", "4", "f32", "256");
+    attrs["pp_prefill_chunk"] = "32";
+    attrs["pp_tokenizer"] = tok;
+    const auto parsed = buddy::runtime::parseStageV1(attrs);
+    expectEqual(parsed.tokenizer, tok, "valid-tokenizer-" + tok);
+  }
+
+  for (const std::string &badTok :
+       {"", "qwen3_vl_moe", "Qwen3", "qwen3 ", " qwen3", "llama", "unknown"}) {
+    Attrs attrs = makeValidStageAttrs("0", "2", "4", "f32", "256");
+    attrs["pp_tokenizer"] = badTok;
+    expectParseFailure(attrs, {"pp_tokenizer", "deepseek_r1", "qwen3"},
+                       "bad-tokenizer-" + badTok);
+  }
+
+  {
+    Attrs attrs = makeValidStageAttrs("0", "2", "4", "f32", "256");
+    attrs["pp_tokenizer"] = "qwen3";
+    attrs["pp_stop_token_ids"] = "151645";
+    const auto parsed = buddy::runtime::parseStageV1(attrs);
+    expectEqual(static_cast<int>(parsed.stopTokenIds.size()), 1,
+                "single-stop.size");
+    expectEqual(parsed.stopTokenIds[0], 151645, "single-stop[0]");
+  }
+  {
+    Attrs attrs = makeValidStageAttrs("0", "2", "4", "f32", "256");
+    attrs["pp_tokenizer"] = "qwen3";
+    attrs["pp_stop_token_ids"] = "151645,151643,0";
+    const auto parsed = buddy::runtime::parseStageV1(attrs);
+    expectEqual(static_cast<int>(parsed.stopTokenIds.size()), 3,
+                "multi-stop.size");
+    expectEqual(parsed.stopTokenIds[0], 151645, "multi-stop[0]");
+    expectEqual(parsed.stopTokenIds[1], 151643, "multi-stop[1]");
+    expectEqual(parsed.stopTokenIds[2], 0, "multi-stop[2]");
+  }
+
+  for (const std::string &badStops :
+       {"", ",", "151645,", ",151645", "151645,,151643", "151645, 151643",
+        "abc", "-1", "151645,-2", "99999999999999999999"}) {
+    Attrs attrs = makeValidStageAttrs("0", "2", "4", "f32", "256");
+    attrs["pp_stop_token_ids"] = badStops;
+    expectParseFailure(attrs, {"pp_stop_token_ids"}, "bad-stops-" + badStops);
   }
 }
 
@@ -225,6 +277,7 @@ void testMalformedIntegers() {
 int main() {
   try {
     testValidStages();
+    testTokenizerAndStopTokenIds();
     testMissingKeys();
     testInvalidVersionAndDtype();
     testInvalidIntervalsAndBounds();

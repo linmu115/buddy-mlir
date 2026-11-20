@@ -523,7 +523,7 @@ def derive_tiered_kv_cache(spec: dict) -> dict:
 def derive_shapes(hf: dict, spec: dict) -> dict:
     num_attention_heads = hf["num_attention_heads"]
     hidden_size = hf["hidden_size"]
-    head_dim = hf.get("head_dim", hidden_size // num_attention_heads)
+    head_dim = hf.get("head_dim") or (hidden_size // num_attention_heads)
     return {
         "head_num": hf["num_key_value_heads"],
         "hidden_size": head_dim,
@@ -654,13 +654,72 @@ def derive_decode_pack(hf: dict, spec: dict) -> dict:
     }
 
 
+TOKENIZER_BY_MODEL_FAMILY = {
+    "deepseek_r1": "deepseek_r1",
+    "qwen3": "qwen3",
+    "qwen3_moe": "qwen3",
+    "qwen3_vl": "qwen3",
+    "qwen3_vl_moe": "qwen3",
+}
+
+
+def _normalize_token_id(value, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(
+            f"{field} must be a non-negative integer, got {value!r}"
+        )
+    return int(value)
+
+
+def _normalize_eos_and_stops(
+    hf: dict, spec: dict
+) -> tuple[int, list[int] | None]:
+    raw_eos = hf.get("eos_token_id")
+    stop_token_ids: list[int] | None = None
+    if raw_eos is None:
+        eos_id = 0
+    elif isinstance(raw_eos, (list, tuple)):
+        if not raw_eos:
+            raise ValueError("eos_token_id list must not be empty")
+        normalized = [
+            _normalize_token_id(item, "eos_token_id") for item in raw_eos
+        ]
+        eos_id = normalized[0]
+        stop_token_ids = list(dict.fromkeys(normalized))
+    else:
+        eos_id = _normalize_token_id(raw_eos, "eos_token_id")
+
+    raw_spec_stops = spec.get("stop_token_ids")
+    if raw_spec_stops is not None:
+        if not isinstance(raw_spec_stops, (list, tuple)) or not raw_spec_stops:
+            raise ValueError(
+                "stop_token_ids must be a non-empty list of integers"
+            )
+        stop_token_ids = list(
+            dict.fromkeys(
+                _normalize_token_id(item, "stop_token_ids")
+                for item in raw_spec_stops
+            )
+        )
+    return eos_id, stop_token_ids
+
+
+def _normalize_tokenizer(spec: dict) -> str:
+    raw = spec.get("tokenizer") or spec.get("model_family", "unknown")
+    return TOKENIZER_BY_MODEL_FAMILY.get(raw, raw)
+
+
 def derive_tokens(hf: dict, spec: dict) -> dict:
-    return {
-        "eos_id": hf.get("eos_token_id", 0),
+    eos_id, stop_token_ids = _normalize_eos_and_stops(hf, spec)
+    tokens = {
+        "eos_id": eos_id,
         "rope_theta": hf.get("rope_theta", 10000.0),
-        "tokenizer": spec.get("model_family", "unknown"),
+        "tokenizer": _normalize_tokenizer(spec),
         "vocab_file": spec.get("vocab_file", "vocab.txt"),
     }
+    if stop_token_ids is not None:
+        tokens["stop_token_ids"] = stop_token_ids
+    return tokens
 
 
 # ──────────────────────────────────────────────────────────────────────────────
