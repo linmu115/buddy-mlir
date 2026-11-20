@@ -607,6 +607,22 @@ def derive_memory_options(spec: dict, tiered: bool, prefill_chunk: int) -> dict:
     return options
 
 
+def derive_arena_prefault_mb(spec: dict, arena: bool) -> int | None:
+    """Opt-in "arena_prefault_mb": MiB of arena pages faulted in at load time
+    (BuddyArena.c BUDDY_ARENA_DEFAULT_PREFAULT_MB). Preserved in config.json
+    only when present in the spec so existing configs without it stay unchanged."""
+    raw = spec.get("arena_prefault_mb")
+    if raw is None:
+        return None
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+        raise ValueError(
+            f"arena_prefault_mb must be a non-negative integer, got {raw!r}"
+        )
+    if raw > 0 and not arena:
+        raise ValueError("arena_prefault_mb needs arena true")
+    return int(raw)
+
+
 def derive_thread_pool(spec: dict) -> bool:
     """Opt-in "thread_pool": the model library runs its parallel loops on a
     pinned pool of spinning threads (runtime/threadpool/BuddyThreadPool.c,
@@ -755,6 +771,7 @@ def gen_config(spec: dict, hf_config_path: str | None = None) -> dict:
     memory_options = derive_memory_options(
         spec, tiered_kv_cache["enabled"], prefill_chunk
     )
+    arena_prefault_mb = derive_arena_prefault_mb(spec, memory_options["arena"])
     if decode_pack["enabled"] and variant not in ("f32", "f16", "bf16"):
         raise RuntimeError(
             f"decode_pack_vector_size is only supported for f32/f16/bf16 "
@@ -816,6 +833,11 @@ def gen_config(spec: dict, hf_config_path: str | None = None) -> dict:
         "tiered_kv_cache": tiered_kv_cache,
         "decode_pack": decode_pack,
         "arena": memory_options["arena"],
+        **(
+            {"arena_prefault_mb": arena_prefault_mb}
+            if arena_prefault_mb is not None
+            else {}
+        ),
         "hugepages": memory_options["hugepages"],
         "thread_pool": derive_thread_pool(spec),
         "prefill_ime": derive_prefill_ime(spec, variant, prefill_chunk),
