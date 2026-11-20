@@ -343,35 +343,48 @@ class TestMoeStageExport(unittest.TestCase):
             self.assertNotIn("model-text-1.safetensors", opened_shards)
             self.assertIn("model-text-0.safetensors", opened_shards)
 
-            # End-to-end export_stage [0, 2) on all 3 formats: identical SHA-256.
-            hashes = {}
-            for fmt_name, model_dir in (
-                ("format1_merged", f1_dir),
-                ("format2_hub_split", f2_dir),
-                ("format3_vl_moe", f3_dir),
-            ):
-                out_dir = root / f"export_{fmt_name}_0_2"
-                torch._dynamo.reset()
-                ips.export_stage(
-                    _make_stage_config(model_dir), 0, 2, out_dir, load_mode="lazy"
+            # End-to-end export_stage [0, 2) on all 3 formats when buddy_mlir
+            # Python bindings are available: verify identical weight SHA-256.
+            try:
+                import buddy_mlir.execution_engine  # noqa: F401
+
+                has_buddy_mlir = True
+            except ImportError:
+                has_buddy_mlir = False
+
+            if has_buddy_mlir:
+                hashes = {}
+                for fmt_name, model_dir in (
+                    ("format1_merged", f1_dir),
+                    ("format2_hub_split", f2_dir),
+                    ("format3_vl_moe", f3_dir),
+                ):
+                    out_dir = root / f"export_{fmt_name}_0_2"
+                    torch._dynamo.reset()
+                    ips.export_stage(
+                        _make_stage_config(model_dir),
+                        0,
+                        2,
+                        out_dir,
+                        load_mode="lazy",
+                    )
+                    header = out_dir / "stage-config.inc"
+                    vps.verify_stage(
+                        json.loads((out_dir / "config.json").read_text()),
+                        out_dir,
+                        header,
+                    )
+                    self.assertTrue(header.is_file())
+                    hashes[fmt_name] = (
+                        _sha256(out_dir / "arg0-w4g32-f32.data"),
+                        _sha256(out_dir / "arg0-w4g32-q4.data"),
+                    )
+                self.assertEqual(
+                    hashes["format1_merged"], hashes["format2_hub_split"]
                 )
-                header = out_dir / "stage-config.inc"
-                vps.verify_stage(
-                    json.loads((out_dir / "config.json").read_text()),
-                    out_dir,
-                    header,
+                self.assertEqual(
+                    hashes["format1_merged"], hashes["format3_vl_moe"]
                 )
-                self.assertTrue(header.is_file())
-                hashes[fmt_name] = (
-                    _sha256(out_dir / "arg0-w4g32-f32.data"),
-                    _sha256(out_dir / "arg0-w4g32-q4.data"),
-                )
-            self.assertEqual(
-                hashes["format1_merged"], hashes["format2_hub_split"]
-            )
-            self.assertEqual(
-                hashes["format1_merged"], hashes["format3_vl_moe"]
-            )
 
     def test_square_expert_2i_equals_h_disambiguation_and_errors(self):
         # 2 * moe_intermediate_size == hidden_size (2 * 128 == 256):

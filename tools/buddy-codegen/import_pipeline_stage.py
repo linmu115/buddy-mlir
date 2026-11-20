@@ -29,19 +29,6 @@ from pathlib import Path
 import numpy
 import torch
 from gen_config import text_decoder_config, w4g32_stage_param_counts
-from import_model import (
-    apply_fusion,
-    apply_k3_w4,
-    apply_pre_transforms,
-    compile_chunk_graphs,
-    compile_graphs,
-    create_drivers,
-    export_mlir,
-    export_plain_weights_direct,
-    load_model,
-    load_qwen3_moe,
-    timed_import_step,
-)
 from safetensors import safe_open
 from transformers import AutoConfig, AutoModelForCausalLM
 
@@ -308,16 +295,56 @@ def _guard_full_vl_moe_square_transpose(model_path, start, end):
             )
 
 
+def _load_qwen3_moe_full(model_path, target_dtype):
+    """Load a full Qwen3-MoE or Qwen3-VL-MoE checkpoint into Qwen3MoeForCausalLM
+    without requiring MLIR Python bindings (mirrors import_model.load_qwen3_moe)."""
+    from buddy.compiler.moe import use_buddy_moe_experts
+    from transformers import (
+        Qwen3MoeConfig,
+        Qwen3MoeForCausalLM,
+        Qwen3VLMoeForConditionalGeneration,
+    )
+    from transformers.models.qwen3_moe.modeling_qwen3_moe import (
+        Qwen3MoeRotaryEmbedding,
+    )
+
+    hf = AutoConfig.from_pretrained(model_path).to_dict()
+    text = text_decoder_config(hf)
+    if text is hf:
+        model = Qwen3MoeForCausalLM.from_pretrained(
+            model_path, dtype=target_dtype
+        )
+    else:
+        vl = Qwen3VLMoeForConditionalGeneration.from_pretrained(
+            model_path, dtype=target_dtype
+        )
+        cfg = Qwen3MoeConfig(**text)
+        with torch.device("meta"):
+            model = Qwen3MoeForCausalLM(cfg)
+        state = {
+            "model." + k: v
+            for k, v in vl.model.language_model.state_dict().items()
+        }
+        state["lm_head.weight"] = vl.lm_head.weight
+        model.load_state_dict(state, strict=True, assign=True)
+        model.model.rotary_emb = Qwen3MoeRotaryEmbedding(config=cfg)
+        del vl
+    model = model.to(target_dtype).eval()
+    use_buddy_moe_experts(model)
+    model.config.use_cache = False
+    return model
+
+
 def load_stage_full(config, start, end):
     """Legacy loader: load the full checkpoint, then crop to [start, end)."""
     model_path = resolve_model_path(config)
+    target_dtype = stage_dtype(config)
     if config.get("architecture") == "Qwen3MoeForCausalLM":
         _guard_full_vl_moe_square_transpose(model_path, start, end)
-        model = load_qwen3_moe(
-            model_path, config["precision"]["activation_type"]
-        )
-        model.config.use_cache = False
+        model = _load_qwen3_moe_full(model_path, target_dtype)
     else:
+        from import_model import load_model
+
         resolved_cfg = dict(config)
         resolved_cfg["hf_model_path"] = model_path
         model = load_model(resolved_cfg)
@@ -735,6 +762,18 @@ def export_stage(config, start, end, out, load_mode="lazy"):
         )
     if load_mode not in ("lazy", "full"):
         raise ValueError(f"unsupported load mode: {load_mode}")
+
+    from import_model import (
+        apply_fusion,
+        apply_k3_w4,
+        apply_pre_transforms,
+        compile_chunk_graphs,
+        compile_graphs,
+        create_drivers,
+        export_mlir,
+        export_plain_weights_direct,
+        timed_import_step,
+    )
 
     with timed_import_step("load_stage"):
         if load_mode == "lazy":

@@ -93,7 +93,7 @@ set_tests_properties(buddy-pipeline-moe-stage-export PROPERTIES
   TIMEOUT 180
   SKIP_RETURN_CODE 77
   PASS_REGULAR_EXPRESSION "MoE stage export tests passed"
-  ENVIRONMENT "PYTHONPATH=${_BUDDY_PIPELINE_PY_PATH}"
+  ENVIRONMENT_MODIFICATION "PYTHONPATH=path_list_prepend:${_BUDDY_PIPELINE_PY_PATH}"
   LABELS "pipeline;pipeline-unit"
 )
 
