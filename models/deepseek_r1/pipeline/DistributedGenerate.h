@@ -23,6 +23,10 @@
 #ifndef BUDDY_MODELS_DEEPSEEK_R1_PIPELINE_DISTRIBUTED_GENERATE_H
 #define BUDDY_MODELS_DEEPSEEK_R1_PIPELINE_DISTRIBUTED_GENERATE_H
 
+#include "PromptFramePlan.h"
+#include "buddy/runtime/pipeline/mpi/AsyncMPI.h"
+#include <optional>
+
 #include "buddy/LLM/TextContainer.h"
 #include "buddy/runtime/llm/KVCacheManager.h"
 #include "buddy/runtime/llm/Sampler.h"
@@ -108,6 +112,7 @@ struct DistributedGenerateOptions {
   /// Test-only hook: when non-empty, appends stage prefill/decode calls to
   /// "<traceStagePrefix>.rank<rank>.log".
   std::string traceStagePrefix;
+  Transport transport = Transport::Blocking;
   WireDtype wireDtype = WireDtype::Native;
 };
 
@@ -425,7 +430,7 @@ inline void checkAllStages(MPI_Comm comm, int rank, int ranks,
         std::to_string(expectedStart) + " > totalLayers=" +
         std::to_string(refTotalLayers));
   }
-  if (opts.transport == Transport::Async)
+  if (opts.transport == Transport::Async && !config.prefillChunk)
     throw std::runtime_error("pp_transport=async is not implemented");
 }
 
@@ -444,49 +449,14 @@ inline void traceStageCall(const std::string &prefix, int rank,
 }
 } // namespace detail
 
-inline void generateDistributed(const DistributedGenerateOptions &opts,
-                                Stage &stage, MPI_Comm comm, int rank,
-                                int ranks) {
+inline void generateTokenized(const DistributedGenerateOptions &opts, Stage &stage,
+                              MPI_Comm comm, int rank, int ranks, int promptRows,
+                              int resolvedNewTokens, std::vector<int64_t> &tokenInput,
+                              AsyncActivation *async) {
   const auto &config = stage.configuration();
-  const bool first = (rank == 0);
-  const bool last = (rank == ranks - 1);
-
-  if (opts.maxTokens < 0)
-    throw std::runtime_error("field maxTokens must be non-negative (got " +
-                             std::to_string(opts.maxTokens) + ")");
-  if (opts.testEosAtStep < 0)
-    throw std::runtime_error("field testEosAtStep must be non-negative (got " +
-                             std::to_string(opts.testEosAtStep) + ")");
-
+  const bool first = rank == 0, last = rank == ranks - 1;
   const int version = resolveWireSpec(config.dtype, opts.wireDtype).version;
   BlockingActivation activation(config, comm, opts.wireDtype);
-
-  int promptRows = 0;
-  int resolvedNewTokens = 0;
-  std::vector<int64_t> tokenInput;
-  if (first) {
-    promptRows = tokenizePrompt(opts.prompt, opts.vocabPath, config.context,
-                                opts.tokenizer, tokenInput);
-
-    resolvedNewTokens = resolveGeneratedTokenLimit(
-        opts.maxTokens, opts.tokenLimitMode, opts.allowZeroTokenLimit,
-        promptRows, config.context);
-  }
-
-  std::array<int, 2> broadcastMeta{promptRows, resolvedNewTokens};
-  mpiCheck(MPI_Bcast(broadcastMeta.data(), 2, MPI_INT, 0, comm));
-  promptRows = broadcastMeta[0];
-  resolvedNewTokens = broadcastMeta[1];
-
-  if (promptRows <= 0 || promptRows > config.context)
-    throw std::runtime_error("broadcast promptRows out of context range (" +
-                             std::to_string(promptRows) + ")");
-  const int maxAllowed = config.context - promptRows + 1;
-  if (resolvedNewTokens <= 0 || resolvedNewTokens > maxAllowed)
-    throw std::runtime_error("generation length (" +
-                             std::to_string(resolvedNewTokens) +
-                             ") exceeds remaining context limit (" +
-                             std::to_string(maxAllowed) + ")");
 
   std::vector<float> logits;
   std::ofstream raw;
@@ -544,8 +514,7 @@ inline void generateDistributed(const DistributedGenerateOptions &opts,
   if (config.prefillChunk > 0) {
     // Chunked prefill + decode (matches ModelSession::_emit_chunked_prefill).
     const int C = config.prefillChunk;
-    const int n0 = promptRows;
-    const int n = (n0 < C) ? (n0 - 1) : n0;
+    const PromptFramePlan plan(promptRows, C, config.context, version);
     const size_t hiddenElems =
         static_cast<size_t>(C) * static_cast<size_t>(config.activationWidth);
     std::vector<float> hiddenF32;
@@ -561,78 +530,50 @@ inline void generateDistributed(const DistributedGenerateOptions &opts,
       }
     }
 
-    int frameStep = 0;
     const void *prefillFinalOut = nullptr;
-    std::vector<int64_t> chunkTokens;
-    if (first && n > 0)
-      chunkTokens.resize(static_cast<size_t>(C));
+    std::vector<int64_t> chunkTokens(first && plan.prefillTokens() ? C : 0);
+    if (!first && async)
+      for (int i = 0; i < std::min(2, plan.size()); ++i)
+        async->postReceive(plan[i].header, rank - 1);
 
-    int start = 0;
-    while (n > 0) {
-      if (start + C > n)
-        start = std::max(0, n - C);
-      const bool isLastChunk = (start + C >= n);
-      const bool needLogits = (n == n0 && isLastChunk);
-      const ActivationHeader expected =
-          makeChunkPrefillHeader(frameStep, start, C, config.context, version);
-      ActivationHeader header = expected;
-      void *input = nullptr;
-      if (first) {
-        for (int i = 0; i < C; ++i)
-          chunkTokens[static_cast<size_t>(i)] =
-              tokenInput[static_cast<size_t>(std::min(start + i, n - 1))];
+    for (int i = 0; i < plan.size(); ++i) {
+      const auto frame = plan[i];
+      const auto &header = frame.header;
+      void *input;
+      if (!first) {
+        if (async)
+          input = async->finishReceive(header, rank - 1);
+        else {
+          activation.receive(hiddenPtr, hiddenElems, rank - 1, header);
+          input = hiddenPtr;
+        }
+      } else if (frame.prefill) {
+        for (int r = 0; r < C; ++r)
+          chunkTokens[r] = tokenInput[std::min(header.pos + r, plan.prefillTokens() - 1)];
         input = chunkTokens.data();
       } else {
-        header =
-            activation.receive(hiddenPtr, hiddenElems, rank - 1, expected);
-        input = hiddenPtr;
+        input = &tokenInput[header.pos];
       }
 
-      if (!opts.traceStagePrefix.empty())
-        detail::traceStageCall(opts.traceStagePrefix, rank, "prefill",
-                               header.step, header.pos);
-
-      const void *output = stage.prefillChunk(input, header.pos, needLogits);
+      detail::traceStageCall(opts.traceStagePrefix, rank,
+                             frame.prefill ? "prefill" : "decode",
+                             header.step, header.pos);
+      const void *output = frame.prefill
+                               ? stage.prefillChunk(input, header.pos, frame.needLogits)
+                               : stage.decodeData(input, header.pos);
       if (!last) {
-        activation.send(header, output, rank + 1);
-      } else if (needLogits) {
+        if (async)
+          async->postSend(header, output, rank + 1);
+        else
+          activation.send(header, output, rank + 1);
+      } else if (frame.needLogits) {
         prefillFinalOut = output;
       }
-
-      ++frameStep;
-      if (isLastChunk)
-        break;
-      start += C;
+      if (!first && async && i < plan.size() - 2)
+        async->postReceive(plan[i + 2].header, rank - 1);
     }
 
-    if (n < n0) {
-      const ActivationHeader expected =
-          makeChunkDecodeHeader(frameStep, n, config.context, version);
-      ActivationHeader header = expected;
-      int64_t lastPromptToken =
-          first ? tokenInput[static_cast<size_t>(n0 - 1)] : 0;
-      void *input = nullptr;
-      if (first) {
-        input = &lastPromptToken;
-      } else {
-        header =
-            activation.receive(hiddenPtr, hiddenElems, rank - 1, expected);
-        input = hiddenPtr;
-      }
-
-      if (!opts.traceStagePrefix.empty())
-        detail::traceStageCall(opts.traceStagePrefix, rank, "decode",
-                               header.step, header.pos);
-
-      const void *output = stage.decodeData(input, header.pos);
-      if (!last) {
-        activation.send(header, output, rank + 1);
-      } else {
-        prefillFinalOut = output;
-      }
-      ++frameStep;
-    }
-
+    int frameStep = plan.size();
     int token = 0;
     int stop = 0;
     if (last) {
@@ -647,7 +588,7 @@ inline void generateDistributed(const DistributedGenerateOptions &opts,
     if (!stop) {
       int64_t nextToken = token;
       for (int genStep = 1; genStep < resolvedNewTokens; ++genStep) {
-        const int pos = n0 + genStep - 1;
+        const int pos = promptRows + (genStep - 1);
         const ActivationHeader expected =
             makeChunkDecodeHeader(frameStep, pos, config.context, version);
         ActivationHeader header = expected;
@@ -769,6 +710,64 @@ inline void generateDistributed(const DistributedGenerateOptions &opts,
         std::cout << (i ? "," : "") << generated[i];
       std::cout << "]}\n" << std::flush;
     }
+  }
+}
+
+inline void generateDistributed(const DistributedGenerateOptions &opts,
+                                Stage &stage, MPI_Comm comm, int rank,
+                                int ranks) {
+  const auto &config = stage.configuration();
+  const bool first = (rank == 0);
+
+  if (opts.maxTokens < 0)
+    throw std::runtime_error("field maxTokens must be non-negative (got " +
+                             std::to_string(opts.maxTokens) + ")");
+  if (opts.testEosAtStep < 0)
+    throw std::runtime_error("field testEosAtStep must be non-negative (got " +
+                             std::to_string(opts.testEosAtStep) + ")");
+
+  int promptRows = 0;
+  int resolvedNewTokens = 0;
+  std::vector<int64_t> tokenInput;
+  if (first) {
+    promptRows = tokenizePrompt(opts.prompt, opts.vocabPath, config.context,
+                                opts.tokenizer, tokenInput);
+
+    resolvedNewTokens = resolveGeneratedTokenLimit(
+        opts.maxTokens, opts.tokenLimitMode, opts.allowZeroTokenLimit,
+        promptRows, config.context);
+  }
+
+  std::array<int, 2> broadcastMeta{promptRows, resolvedNewTokens};
+  mpiCheck(MPI_Bcast(broadcastMeta.data(), 2, MPI_INT, 0, comm));
+  promptRows = broadcastMeta[0];
+  resolvedNewTokens = broadcastMeta[1];
+
+  if (promptRows <= 0 || promptRows > config.context)
+    throw std::runtime_error("broadcast promptRows out of context range (" +
+                             std::to_string(promptRows) + ")");
+  const int maxAllowed = config.context - promptRows + 1;
+  if (resolvedNewTokens <= 0 || resolvedNewTokens > maxAllowed)
+    throw std::runtime_error("generation length (" +
+                             std::to_string(resolvedNewTokens) +
+                             ") exceeds remaining context limit (" +
+                             std::to_string(maxAllowed) + ")");
+
+  std::optional<AsyncActivation> async;
+  if (ranks > 1 && opts.transport == Transport::Async)
+    async.emplace(config, comm, opts.wireDtype, !first, rank < ranks - 1,
+                  config.prefillChunk ? 2 : 1);
+  try {
+    generateTokenized(opts, stage, comm, rank, ranks, promptRows,
+                      resolvedNewTokens, tokenInput, async ? &*async : nullptr);
+    if (async)
+      async->drain();
+  } catch (const std::exception &e) {
+    if (!async)
+      throw;
+    std::cerr << "rank " << rank << " pipeline error: " << e.what() << std::endl;
+    MPI_Abort(comm, 1);
+    std::abort();
   }
 }
 

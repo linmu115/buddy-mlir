@@ -317,11 +317,14 @@ void PipelineRunner::run(const RunConfig &cfg) {
                              checkOpts);
 
     pipeline::DistributedGenerateOptions genOpts;
+    genOpts.transport = spec.transport;
     genOpts.wireDtype = spec.wireDtype;
     if (rank == 0) {
       const auto wire =
           resolveWireSpec(stage->configuration().dtype, spec.wireDtype);
-      std::cerr << "pipeline transport=blocking requested_wire="
+      std::cerr << "pipeline transport="
+                << (spec.transport == pipeline::Transport::Async ? "async" : "blocking")
+                << " requested_wire="
                 << (spec.wireDtype == pipeline::WireDtype::F16 ? "f16"
                                                                : "native")
                 << " effective_wire="
