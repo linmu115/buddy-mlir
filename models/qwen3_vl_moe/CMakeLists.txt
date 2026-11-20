@@ -39,3 +39,10 @@ buddy_add_model(
   COMPILE_JOBS "${BUDDY_QWEN3_VL_MOE_COMPILE_JOBS}"
   ASSET_FILES "${CMAKE_SOURCE_DIR}/examples/BuddyQwen3/vocab.txt"
 )
+
+include(${CMAKE_SOURCE_DIR}/tools/buddy-codegen/cmake/buddy_pipeline.cmake)
+buddy_add_pipeline_stages(
+  NAME qwen3_vl_moe
+  VAR_PREFIX QWEN3_VL_MOE
+  FALLBACK_VOCAB "${CMAKE_SOURCE_DIR}/examples/BuddyQwen3/vocab.txt"
+)
