@@ -125,6 +125,7 @@ set(_BUDDY_PIPELINE_CHAIN_TESTS
   buddy-pipeline-stage-chain-model-name-mismatch
   buddy-pipeline-stage-chain-field-mismatch
   buddy-pipeline-stage-chain-token-limit
+  buddy-pipeline-stage-chain-tokenizer-stop
 )
 
 if(_BUDDY_PIPELINE_HAVE_MPI)
@@ -348,6 +349,18 @@ if(_BUDDY_PIPELINE_HAVE_MPI)
   _add_stage_chain_test(buddy-pipeline-stage-chain-model-name-mismatch 2 model-name-mismatch)
   _add_stage_chain_test(buddy-pipeline-stage-chain-field-mismatch 2 field-mismatch)
   _add_stage_chain_test(buddy-pipeline-stage-chain-token-limit 1 token-limit)
+  add_test(NAME buddy-pipeline-stage-chain-tokenizer-stop
+    COMMAND "${MPIEXEC_EXECUTABLE}" "${_BUDDY_PIPELINE_MPI_NUMPROC_FLAG}"
+      1 "$<TARGET_FILE:buddy-pipeline-stage-chain-test>" tokenizer-stop
+      "${CMAKE_SOURCE_DIR}/examples/BuddyQwen3/vocab.txt"
+      "${CMAKE_SOURCE_DIR}/examples/BuddyDeepSeekR1/vocab.txt"
+      "${CMAKE_CURRENT_BINARY_DIR}/tokenizer-stop-logits.f32"
+  )
+  set_tests_properties(buddy-pipeline-stage-chain-tokenizer-stop PROPERTIES
+    TIMEOUT 60
+    PASS_REGULAR_EXPRESSION "PASS stage-chain tokenizer-stop"
+    LABELS "pipeline;pipeline-unit;pipeline-mpi"
+  )
 else()
   message(STATUS
     "[pipeline-tests] MPI not found; MPI unit tests will be skipped in CTest.")

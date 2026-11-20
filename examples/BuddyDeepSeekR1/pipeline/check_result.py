@@ -15,7 +15,7 @@
 #
 # ===----------------------------------------------------------------------===//
 #
-"""Check generated token IDs and optionally the sampled rows of FP16 logits."""
+"""Check generated token IDs and optionally the sampled rows of FP16/FP32 logits."""
 
 import argparse
 import json
@@ -30,6 +30,12 @@ def main():
         "--logits", nargs=2, type=Path, metavar=("REF", "ACTUAL")
     )
     parser.add_argument("--vocab-size", type=int)
+    parser.add_argument(
+        "--dtype",
+        choices=("f16", "f32"),
+        default="f16",
+        help="Element dtype of dumped logits (default: f16)",
+    )
     args = parser.parse_args()
 
     expected = json.loads(args.reference.read_text())["token_ids"]
@@ -46,24 +52,31 @@ def main():
     if args.logits:
         if not args.vocab_size or args.vocab_size < 1:
             parser.error("--logits needs a positive --vocab-size")
+        if args.dtype == "f16":
+            elem_bytes, fmt, hex_width, label = 2, "H", 4, "FP16"
+        else:
+            elem_bytes, fmt, hex_width, label = 4, "I", 8, "FP32"
         total = len(expected) * args.vocab_size
         reference, actual = (path.read_bytes() for path in args.logits)
-        if len(reference) != 2 * total or len(actual) != 2 * total:
-            raise SystemExit(f"expected {2 * total} logit bytes in each file")
+        expected_bytes = elem_bytes * total
+        if len(reference) != expected_bytes or len(actual) != expected_bytes:
+            raise SystemExit(
+                f"expected {expected_bytes} logit bytes in each file"
+            )
         if reference != actual:
             for i, (left, right) in enumerate(
                 zip(
-                    memoryview(reference).cast("H"),
-                    memoryview(actual).cast("H"),
+                    memoryview(reference).cast(fmt),
+                    memoryview(actual).cast(fmt),
                 )
             ):
                 if left != right:
                     step, token_id = divmod(i, args.vocab_size)
                     raise SystemExit(
                         f"logit differs at step {step + 1}, ID {token_id}: "
-                        f"0x{left:04x} vs 0x{right:04x}"
+                        f"0x{left:0{hex_width}x} vs 0x{right:0{hex_width}x}"
                     )
-        print(f"{total:,} sampled FP16 logit elements match bit for bit")
+        print(f"{total:,} sampled {label} logit elements match bit for bit")
 
 
 if __name__ == "__main__":

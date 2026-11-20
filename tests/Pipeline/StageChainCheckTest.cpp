@@ -19,9 +19,12 @@
 #include <mpi.h>
 
 #include <cstdint>
+#include <cstring>
+#include <fstream>
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -362,6 +365,184 @@ void runTokenLimit(int rank, int ranks) {
     std::cout << "PASS stage-chain token-limit\n";
 }
 
+class FakeChunkedF32Stage final : public Stage {
+public:
+  FakeChunkedF32Stage(StageConfig cfg, std::vector<int> stepWinningTokens)
+      : cfg(cfg), winners(std::move(stepWinningTokens)),
+        logits(static_cast<size_t>(cfg.vocabSize), -1.0f) {}
+
+  const StageConfig &configuration() const override { return cfg; }
+  const uint16_t *prefill(void *) override {
+    throw std::logic_error("unexpected f16 prefill");
+  }
+  const uint16_t *decode(void *, int) override {
+    throw std::logic_error("unexpected f16 decode");
+  }
+
+  const void *prefillChunk(void *, int, bool computeLogits) override {
+    ++prefillCalls;
+    if (computeLogits)
+      return emitLogitsForCurrentStep();
+    return logits.data();
+  }
+
+  const void *decodeData(void *, int) override {
+    ++decodeCalls;
+    return emitLogitsForCurrentStep();
+  }
+
+  int prefillCalls = 0;
+  int decodeCalls = 0;
+  int emittedSteps = 0;
+  std::vector<float> dumpedExpected;
+
+private:
+  const float *emitLogitsForCurrentStep() {
+    std::fill(logits.begin(), logits.end(), -1.25f);
+    const int winner = winners.at(static_cast<size_t>(emittedSteps));
+    logits[static_cast<size_t>(winner)] = 7.5f + static_cast<float>(emittedSteps);
+    dumpedExpected.insert(dumpedExpected.end(), logits.begin(), logits.end());
+    ++emittedSteps;
+    return logits.data();
+  }
+
+  StageConfig cfg;
+  std::vector<int> winners;
+  std::vector<float> logits;
+};
+
+void runTokenizerStop(int rank, int ranks, const std::string &qwen3Vocab,
+                      const std::string &r1Vocab,
+                      const std::string &dumpPath) {
+  if (ranks != 1)
+    throw std::runtime_error("tokenizer-stop requires 1 rank");
+  using buddy::runtime::pipeline::DistributedGenerateOptions;
+  using buddy::runtime::pipeline::generateDistributed;
+  using buddy::runtime::pipeline::isStopToken;
+  using buddy::runtime::pipeline::tokenizePrompt;
+  using buddy::runtime::pipeline::TokenizerKind;
+
+  // 1. Qwen3 prompt tokenization must match whole-model Text::tokenizeQwen3
+  //    bit-for-bit across normal, leading-space, and UTF-8 prompts.
+  constexpr int kCtx = 64;
+  for (const std::string &prompt :
+       {std::string("Hello"), std::string(" Hello leading space"),
+        std::string("你好 world")}) {
+    std::vector<int64_t> ppTokens;
+    const int ppRows = tokenizePrompt(prompt, qwen3Vocab, kCtx,
+                                      TokenizerKind::Qwen3, ppTokens);
+
+    buddy::Text<size_t, 2> wholeText(prompt);
+    wholeText.tokenizeQwen3(qwen3Vocab, kCtx);
+    if (static_cast<size_t>(ppRows) != wholeText.getTokenCnt())
+      throw std::runtime_error("Qwen3 prompt token count mismatch for '" +
+                               prompt + "'");
+    if (ppTokens.size() != static_cast<size_t>(kCtx))
+      throw std::runtime_error("Qwen3 tokenInput size mismatch");
+    for (int i = 0; i < kCtx; ++i) {
+      if (ppTokens[static_cast<size_t>(i)] !=
+          static_cast<int64_t>(wholeText.getData()[i]))
+        throw std::runtime_error("Qwen3 token ID mismatch at index " +
+                                 std::to_string(i));
+    }
+  }
+
+  // Over-context prompt must be rejected cleanly rather than truncated.
+  {
+    std::vector<int64_t> ignored;
+    bool threw = false;
+    try {
+      (void)tokenizePrompt("Hello world from Qwen3", qwen3Vocab, 8,
+                           TokenizerKind::Qwen3, ignored);
+    } catch (const std::runtime_error &err) {
+      threw = std::string(err.what()).find("exceeds model context") !=
+              std::string::npos;
+    }
+    if (!threw)
+      throw std::runtime_error(
+          "Qwen3 tokenizePrompt did not reject over-context prompt");
+  }
+
+  // DeepSeek-R1 default behavior preserved: leading space still rejected,
+  // regular prompt works.
+  {
+    std::vector<int64_t> ignored;
+    bool threw = false;
+    try {
+      (void)tokenizePrompt(" Hello", r1Vocab, kCtx, TokenizerKind::DeepSeekR1,
+                           ignored);
+    } catch (const std::runtime_error &err) {
+      threw = std::string(err.what()).find("non-space") != std::string::npos;
+    }
+    if (!threw)
+      throw std::runtime_error(
+          "DeepSeekR1 tokenizePrompt did not reject leading space");
+    const int r1Rows =
+        tokenizePrompt("Hello", r1Vocab, kCtx, TokenizerKind::DeepSeekR1,
+                       ignored);
+    if (r1Rows <= 0)
+      throw std::runtime_error("DeepSeekR1 tokenizePrompt produced 0 tokens");
+  }
+
+  // 2. Stop token helper checks.
+  if (!isStopToken(151645, 151645, {}))
+    throw std::runtime_error("isStopToken failed for eosId");
+  if (isStopToken(151643, 151645, {}))
+    throw std::runtime_error("isStopToken false positive for empty extras");
+  if (!isStopToken(151643, 151645, {151645, 151643}))
+    throw std::runtime_error("isStopToken failed for secondary stop token");
+
+  // 3. End-to-end DistributedGenerate with Qwen3 tokenizer, F32 chunked stage,
+  //    secondary stop token (151643 != eosId=151645), and FP32 logits dump.
+  constexpr int kVocab = 151936;
+  StageConfig cfg =
+      makeStageConfig(/*startLayer=*/0, /*endLayer=*/4, /*totalLayers=*/4,
+                      /*context=*/32, /*activationWidth=*/16,
+                      /*vocabSize=*/kVocab, /*eosId=*/151645,
+                      ActivationType::F32, /*prefillChunk=*/4);
+  FakeChunkedF32Stage stage(cfg, {42, 151643, 99});
+
+  DistributedGenerateOptions opts;
+  opts.prompt = "Hello";
+  opts.vocabPath = qwen3Vocab;
+  opts.tokenizer = TokenizerKind::Qwen3;
+  opts.stopTokenIds = {151645, 151643};
+  opts.tokenLimitMode =
+      buddy::runtime::pipeline::TokenLimitMode::TotalSequenceLength;
+  opts.maxTokens = 20;
+  opts.samplerConfig.temperature = 0.0f;
+  opts.logitsDumpPath = dumpPath;
+
+  generateDistributed(opts, stage, MPI_COMM_WORLD, rank, ranks);
+
+  // "Hello" tokenizes to 9 Qwen3 tokens (> chunk 4): prefill emits step 0 (42),
+  // decode step 1 emits 151643 (secondary stop token) and must stop before
+  // step 2 (99).
+  if (stage.emittedSteps != 2)
+    throw std::runtime_error("expected early stop at 2 emitted steps, got " +
+                             std::to_string(stage.emittedSteps));
+
+  std::ifstream in(dumpPath, std::ios::binary | std::ios::ate);
+  if (!in)
+    throw std::runtime_error("cannot open dumped f32 logits: " + dumpPath);
+  const std::streamoff size = in.tellg();
+  const std::streamoff expectedSize =
+      static_cast<std::streamoff>(stage.dumpedExpected.size() * sizeof(float));
+  if (size != expectedSize)
+    throw std::runtime_error("dumped f32 logits size mismatch: got " +
+                             std::to_string(size) + ", expected " +
+                             std::to_string(expectedSize));
+  std::vector<float> actual(stage.dumpedExpected.size());
+  in.seekg(0);
+  if (!in.read(reinterpret_cast<char *>(actual.data()), expectedSize))
+    throw std::runtime_error("failed reading dumped f32 logits");
+  if (std::memcmp(actual.data(), stage.dumpedExpected.data(),
+                  static_cast<size_t>(expectedSize)) != 0)
+    throw std::runtime_error("dumped f32 logits did not match bit-for-bit");
+
+  std::cout << "PASS stage-chain tokenizer-stop\n";
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -394,7 +575,12 @@ int main(int argc, char **argv) {
       runFieldMismatch(rank, ranks);
     else if (mode == "token-limit")
       runTokenLimit(rank, ranks);
-    else
+    else if (mode == "tokenizer-stop") {
+      if (argc < 5)
+        throw std::runtime_error(
+            "tokenizer-stop requires QWEN3_VOCAB R1_VOCAB DUMP_PATH");
+      runTokenizerStop(rank, ranks, argv[2], argv[3], argv[4]);
+    } else
       throw std::runtime_error("unknown mode: " + mode);
   } catch (const std::exception &err) {
     std::cerr << "rank " << rank

@@ -24,6 +24,7 @@
 
 #include <dlfcn.h>
 
+#include <algorithm>
 #include <charconv>
 #include <chrono>
 #include <cstdlib>
@@ -249,6 +250,21 @@ std::string optionalEnvString(const char *name) {
   return std::string(raw);
 }
 
+pipeline::TokenizerKind resolveTokenizerKind(const std::string &name) {
+  if (name.empty() || name == "deepseek_r1")
+    return pipeline::TokenizerKind::DeepSeekR1;
+  if (name == "qwen3")
+    return pipeline::TokenizerKind::Qwen3;
+  throw std::runtime_error("unsupported stage tokenizer '" + name +
+                           "' (expected 'deepseek_r1' or 'qwen3')");
+}
+
+void appendUniqueStopToken(std::vector<int> &stopTokenIds, int tokenId) {
+  if (std::find(stopTokenIds.begin(), stopTokenIds.end(), tokenId) ==
+      stopTokenIds.end())
+    stopTokenIds.push_back(tokenId);
+}
+
 [[noreturn]] void abortPipelineJob(MPI_Comm comm, int rank,
                                    const std::string &raxPath,
                                    const std::string &modelName,
@@ -301,6 +317,14 @@ void PipelineRunner::run(const RunConfig &cfg) {
     pipeline::DistributedGenerateOptions genOpts;
     genOpts.prompt = cfg.prompt;
     genOpts.vocabPath = m.vocabPath;
+    genOpts.tokenizer = resolveTokenizerKind(spec.tokenizer);
+    genOpts.stopTokenIds = spec.stopTokenIds;
+    if (genOpts.tokenizer == pipeline::TokenizerKind::Qwen3) {
+      // Match whole-model Qwen3VLMoeRunner stop tokens: <|im_end|> and
+      // <|endoftext|>.
+      appendUniqueStopToken(genOpts.stopTokenIds, 151645);
+      appendUniqueStopToken(genOpts.stopTokenIds, 151643);
+    }
     genOpts.tokenLimitMode = pipeline::TokenLimitMode::TotalSequenceLength;
     genOpts.maxTokens = cfg.maxNewTokens;
     genOpts.allowZeroTokenLimit = true;

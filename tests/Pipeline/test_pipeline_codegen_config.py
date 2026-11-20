@@ -18,6 +18,8 @@
 
 import copy
 import json
+import struct
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -235,6 +237,95 @@ class TestVerifyStageDefensiveChecks(unittest.TestCase):
                         verify_pipeline_stage.verify_stage(
                             bad_cfg, Path(td), None
                         )
+
+
+class TestCheckResultLogitsDtype(unittest.TestCase):
+    CHECK_SCRIPT = (
+        REPO_ROOT / "examples" / "BuddyDeepSeekR1" / "pipeline" / "check_result.py"
+    )
+
+    def _run_check(self, *extra_args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, str(self.CHECK_SCRIPT), *extra_args],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def test_f32_bit_exact_match_and_mismatch(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            ref_json = root / "ref.json"
+            act_json = root / "act.json"
+            payload = json.dumps({"prompt_tokens": 9, "token_ids": [10, 20]})
+            ref_json.write_text(payload, encoding="utf-8")
+            act_json.write_text(payload, encoding="utf-8")
+
+            vals = [0.25, -1.5, 3.0, 0.0, -0.0, 1.25]
+            raw = struct.pack("<6f", *vals)
+            ref_f32 = root / "ref.f32"
+            act_f32 = root / "act.f32"
+            ref_f32.write_bytes(raw)
+            act_f32.write_bytes(raw)
+
+            ok = self._run_check(
+                str(ref_json),
+                str(act_json),
+                "--logits",
+                str(ref_f32),
+                str(act_f32),
+                "--vocab-size",
+                "3",
+                "--dtype",
+                "f32",
+            )
+            self.assertEqual(ok.returncode, 0, ok.stderr)
+            self.assertIn("6 sampled FP32 logit elements match bit for bit", ok.stdout)
+
+            # Flip 1 bit (-0.0 -> +0.0 at step 2, ID 1) — must fail bit-exact check.
+            bad_vals = [0.25, -1.5, 3.0, 0.0, 0.0, 1.25]
+            act_f32.write_bytes(struct.pack("<6f", *bad_vals))
+            bad = self._run_check(
+                str(ref_json),
+                str(act_json),
+                "--logits",
+                str(ref_f32),
+                str(act_f32),
+                "--vocab-size",
+                "3",
+                "--dtype",
+                "f32",
+            )
+            self.assertNotEqual(bad.returncode, 0)
+            self.assertIn("step 2, ID 1", bad.stderr)
+            self.assertIn("0x80000000 vs 0x00000000", bad.stderr)
+
+    def test_f16_default_backward_compatible(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            ref_json = root / "ref.json"
+            act_json = root / "act.json"
+            payload = json.dumps({"token_ids": [5]})
+            ref_json.write_text(payload, encoding="utf-8")
+            act_json.write_text(payload, encoding="utf-8")
+
+            raw = struct.pack("<3H", 0x3C00, 0xBC00, 0x0000)
+            ref_f16 = root / "ref.f16"
+            act_f16 = root / "act.f16"
+            ref_f16.write_bytes(raw)
+            act_f16.write_bytes(raw)
+
+            ok = self._run_check(
+                str(ref_json),
+                str(act_json),
+                "--logits",
+                str(ref_f16),
+                str(act_f16),
+                "--vocab-size",
+                "3",
+            )
+            self.assertEqual(ok.returncode, 0, ok.stderr)
+            self.assertIn("3 sampled FP16 logit elements match bit for bit", ok.stdout)
 
 
 if __name__ == "__main__":

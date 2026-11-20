@@ -73,9 +73,17 @@ enum class TokenLimitMode {
   NewTokens,
 };
 
+enum class TokenizerKind {
+  DeepSeekR1,
+  Qwen3,
+};
+
 struct DistributedGenerateOptions {
   std::string prompt;
   std::string vocabPath;
+  TokenizerKind tokenizer = TokenizerKind::DeepSeekR1;
+  /// Optional additional stop token IDs beyond `config.eosId`.
+  std::vector<int> stopTokenIds;
   /// Semantics applied to `maxTokens` when rank 0 resolves the generated-token
   /// count before broadcasting to all ranks.
   TokenLimitMode tokenLimitMode = TokenLimitMode::TotalSequenceLength;
@@ -88,7 +96,8 @@ struct DistributedGenerateOptions {
   int maxTokens = 0;
   bool allowZeroTokenLimit = true;
   buddy::SamplerConfig samplerConfig{};
-  /// Optional output file for sampled-row FP16 logits (empty or "-" disables).
+  /// Optional output file for sampled-row logits (FP16 or FP32 matching stage
+  /// dtype; empty or "-" disables).
   std::string logitsDumpPath;
   bool streamJsonl = false;
   /// Test-only hook: 1-based step index whose sampled token is treated as EOS.
@@ -98,6 +107,56 @@ struct DistributedGenerateOptions {
   /// "<traceStagePrefix>.rank<rank>.log".
   std::string traceStagePrefix;
 };
+
+inline bool isStopToken(int token, int eosId,
+                        const std::vector<int> &stopTokenIds) {
+  return token == eosId ||
+         std::find(stopTokenIds.begin(), stopTokenIds.end(), token) !=
+             stopTokenIds.end();
+}
+
+inline int tokenizePrompt(const std::string &prompt,
+                          const std::string &vocabPath, int context,
+                          TokenizerKind tokenizer,
+                          std::vector<int64_t> &tokenInput) {
+  if (context <= 0)
+    throw std::runtime_error("field context must be positive (got " +
+                             std::to_string(context) + ")");
+  if (vocabPath.empty())
+    throw std::runtime_error("field vocab_uri missing on first stage");
+
+  buddy::Text<size_t, 2> text(prompt);
+  if (tokenizer == TokenizerKind::Qwen3) {
+    if (prompt.empty())
+      throw std::runtime_error("field prompt must be non-empty");
+    // Match whole-model Qwen3VLMoeRunner (Text::tokenizeQwen3). Pass at least
+    // 2*prompt.size()+8 so prompts exceeding `context` are rejected cleanly
+    // instead of being silently truncated before the 5-token assistant suffix.
+    text.tokenizeQwen3(vocabPath,
+                       std::max<size_t>(static_cast<size_t>(context),
+                                        2 * prompt.size() + 8));
+  } else {
+    if (prompt.empty() || prompt.front() == ' ')
+      throw std::runtime_error(
+          "field prompt must be non-empty and start with a non-space character");
+    // Space is mapped to a two-byte character. Allow the chat markers too
+    // so the tokenizer can report a too-long prompt before the model runs.
+    text.tokenizeDeepSeekR1(vocabPath,
+                            std::max<size_t>(static_cast<size_t>(context),
+                                             2 * prompt.size() + 6));
+  }
+
+  if (text.getTokenCnt() == 0)
+    throw std::runtime_error("field prompt produced zero tokens");
+  if (text.getTokenCnt() > static_cast<size_t>(context))
+    throw std::runtime_error("tokenized prompt (" +
+                             std::to_string(text.getTokenCnt()) +
+                             ") exceeds model context (" +
+                             std::to_string(context) + ")");
+  const int promptRows = static_cast<int>(text.getTokenCnt());
+  tokenInput.assign(text.getData(), text.getData() + context);
+  return promptRows;
+}
 
 /// Convert the user-facing token limit into the internal generated-token count
 /// (including the first token sampled from prefill) on rank 0 before broadcast.
@@ -372,27 +431,8 @@ inline void generateDistributed(const DistributedGenerateOptions &opts,
   int resolvedNewTokens = 0;
   std::vector<int64_t> tokenInput;
   if (first) {
-    if (opts.vocabPath.empty())
-      throw std::runtime_error("field vocab_uri missing on first stage");
-    if (opts.prompt.empty() || opts.prompt.front() == ' ')
-      throw std::runtime_error(
-          "field prompt must be non-empty and start with a non-space character");
-    buddy::Text<size_t, 2> text(opts.prompt);
-    // Space is mapped to a two-byte character. Allow the chat markers too
-    // so the tokenizer can report a too-long prompt before the model runs.
-    text.tokenizeDeepSeekR1(
-        opts.vocabPath,
-        std::max<size_t>(static_cast<size_t>(config.context),
-                         2 * opts.prompt.size() + 6));
-    if (text.getTokenCnt() == 0)
-      throw std::runtime_error("field prompt produced zero tokens");
-    if (text.getTokenCnt() > static_cast<size_t>(config.context))
-      throw std::runtime_error("tokenized prompt (" +
-                               std::to_string(text.getTokenCnt()) +
-                               ") exceeds model context (" +
-                               std::to_string(config.context) + ")");
-    promptRows = static_cast<int>(text.getTokenCnt());
-    tokenInput.assign(text.getData(), text.getData() + config.context);
+    promptRows = tokenizePrompt(opts.prompt, opts.vocabPath, config.context,
+                                opts.tokenizer, tokenInput);
 
     resolvedNewTokens = resolveGeneratedTokenLimit(
         opts.maxTokens, opts.tokenLimitMode, opts.allowZeroTokenLimit,
@@ -451,7 +491,7 @@ inline void generateDistributed(const DistributedGenerateOptions &opts,
     }
     token = sampler.sample(logits.data(), logits.size(), generated);
     generated.push_back(token);
-    stop = (token == config.eosId ||
+    stop = (isStopToken(token, config.eosId, opts.stopTokenIds) ||
             (opts.testEosAtStep > 0 && genStep + 1 == opts.testEosAtStep))
                ? 1
                : 0;
