@@ -1,0 +1,263 @@
+//===----------------------------------------------------------------------===//
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+//===----------------------------------------------------------------------===//
+
+#ifndef BUDDY_RUNTIME_PIPELINE_MPI_ACTIVATION_PROTOCOL_H
+#define BUDDY_RUNTIME_PIPELINE_MPI_ACTIVATION_PROTOCOL_H
+
+#include "buddy/runtime/pipeline/Stage.h"
+#include <mpi.h>
+
+#include <array>
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <cstdlib>
+#include <iostream>
+#include <limits>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <thread>
+
+inline constexpr int32_t kActivationProtocolVersion = 1;
+inline constexpr int kActivationHeaderCount = 4;
+inline constexpr int kActivationTag = 0;
+inline constexpr int kTokenTag = 1;
+inline constexpr int kHeaderTag = 2;
+
+inline std::string mpiErrorString(int status) {
+  char message[MPI_MAX_ERROR_STRING];
+  int length = 0;
+  MPI_Error_string(status, message, &length);
+  return std::string(message, length);
+}
+
+inline void mpiCheck(int status) {
+  if (status == MPI_SUCCESS)
+    return;
+  throw std::runtime_error(mpiErrorString(status));
+}
+
+struct ActivationHeader {
+  int32_t version = kActivationProtocolVersion;
+  int32_t step = 0;
+  int32_t pos = -1;
+  int32_t rows = 0;
+
+  bool operator==(const ActivationHeader &other) const {
+    return version == other.version && step == other.step && pos == other.pos &&
+           rows == other.rows;
+  }
+
+  bool operator!=(const ActivationHeader &other) const {
+    return !(*this == other);
+  }
+};
+
+inline std::string formatActivationHeader(const ActivationHeader &header) {
+  std::ostringstream os;
+  os << "{version=" << header.version << ", step=" << header.step
+     << ", pos=" << header.pos << ", rows=" << header.rows << "}";
+  return os.str();
+}
+
+inline ActivationHeader makeActivationHeader(int step, int promptRows,
+                                             int context) {
+  if (context <= 0)
+    throw std::invalid_argument("activation context must be positive");
+  if (step < 0)
+    throw std::invalid_argument("activation step must be non-negative");
+  if (step == 0)
+    return ActivationHeader{kActivationProtocolVersion, 0, -1, context};
+  const int64_t pos64 = static_cast<int64_t>(promptRows) + step - 1;
+  if (pos64 < 0 || pos64 >= static_cast<int64_t>(context))
+    throw std::invalid_argument("decode pos out of context range");
+  return ActivationHeader{kActivationProtocolVersion,
+                          static_cast<int32_t>(step),
+                          static_cast<int32_t>(pos64), 1};
+}
+
+inline ActivationHeader makeChunkPrefillHeader(int step, int pos,
+                                               int prefillChunk, int context) {
+  if (context <= 0)
+    throw std::invalid_argument("activation context must be positive");
+  if (prefillChunk <= 0 || prefillChunk > context)
+    throw std::invalid_argument(
+        "activation prefillChunk must satisfy 0 < prefillChunk <= context");
+  if (step < 0)
+    throw std::invalid_argument("activation step must be non-negative");
+  if (pos < 0 || pos >= context)
+    throw std::invalid_argument("prefill chunk pos out of context range");
+  return ActivationHeader{kActivationProtocolVersion,
+                          static_cast<int32_t>(step),
+                          static_cast<int32_t>(pos),
+                          static_cast<int32_t>(prefillChunk)};
+}
+
+inline ActivationHeader makeChunkDecodeHeader(int step, int pos, int context) {
+  if (context <= 0)
+    throw std::invalid_argument("activation context must be positive");
+  if (step < 0)
+    throw std::invalid_argument("activation step must be non-negative");
+  if (pos < 0 || pos >= context)
+    throw std::invalid_argument("decode pos out of context range");
+  return ActivationHeader{kActivationProtocolVersion,
+                          static_cast<int32_t>(step),
+                          static_cast<int32_t>(pos), 1};
+}
+
+class ActivationProtocol {
+protected:
+  ActivationProtocol(const StageConfig &config, MPI_Comm comm)
+      : width(config.activationWidth), context(config.context),
+        prefillChunk(config.prefillChunk),
+        comm(comm) {
+    if (width <= 0 || context <= 0)
+      throw std::invalid_argument("invalid activation width or context");
+    if (prefillChunk < 0 || prefillChunk > context)
+      throw std::invalid_argument("invalid activation prefillChunk");
+    if (config.dtype != ActivationType::F16 &&
+        config.dtype != ActivationType::F32)
+      throw std::invalid_argument("unsupported activation dtype");
+    mpiCheck(MPI_Comm_rank(comm, &rank));
+    checkedElementCount(1);
+  }
+
+  int validateReceived(const ActivationHeader &received,
+                       const ActivationHeader &expected, size_t capacityElements,
+                       int peer, int source) const {
+    std::string reason;
+    if (received.version != kActivationProtocolVersion)
+      abortProtocol(peer, source, expected, &received,
+                    "header version mismatch");
+    if (received.step != expected.step)
+      abortProtocol(peer, source, expected, &received, "header step mismatch");
+    if (!validateHeaderInvariants(received, reason))
+      abortProtocol(peer, source, expected, &received,
+                    "header phase/pos/rows invalid: " + reason);
+    if (received.pos != expected.pos)
+      abortProtocol(peer, source, expected, &received, "header pos mismatch");
+    if (received.rows != expected.rows)
+      abortProtocol(peer, source, expected, &received, "header rows mismatch");
+
+    int expectedElements = 0;
+    if (!computeElementCount(received.rows, expectedElements))
+      abortProtocol(peer, source, expected, &received,
+                    "expected payload element count overflows MPI count");
+    if (static_cast<size_t>(expectedElements) > capacityElements)
+      abortProtocol(peer, source, expected, &received,
+                    "expected payload element count (" +
+                        std::to_string(expectedElements) +
+                        ") exceeds buffer capacity (" +
+                        std::to_string(capacityElements) + ")");
+    return expectedElements;
+  }
+
+  bool validateHeaderInvariants(const ActivationHeader &header,
+                                std::string &reason) const {
+    if (header.version != kActivationProtocolVersion) {
+      reason = "version must be " + std::to_string(kActivationProtocolVersion);
+      return false;
+    }
+    if (header.step < 0) {
+      reason = "step must be non-negative";
+      return false;
+    }
+    if (prefillChunk > 0) {
+      if (header.pos < 0 || header.pos >= context) {
+        reason = "chunked pos must satisfy 0 <= pos < " +
+                 std::to_string(context);
+        return false;
+      }
+      if (header.rows != prefillChunk && header.rows != 1) {
+        reason = "chunked rows must be 1 or prefillChunk (" +
+                 std::to_string(prefillChunk) + ")";
+        return false;
+      }
+      return true;
+    }
+    if (header.step == 0) {
+      if (header.pos != -1) {
+        reason = "prefill pos must be -1";
+        return false;
+      }
+      if (header.rows != context) {
+        reason = "prefill rows must equal context (" + std::to_string(context) +
+                 ")";
+        return false;
+      }
+      return true;
+    }
+    if (header.pos < 0 || header.pos >= context) {
+      reason = "decode pos must satisfy 0 <= pos < " + std::to_string(context);
+      return false;
+    }
+    if (header.rows != 1) {
+      reason = "decode rows must be 1";
+      return false;
+    }
+    return true;
+  }
+
+  bool computeElementCount(int32_t rows, int &outElements) const {
+    if (width <= 0 || rows <= 0)
+      return false;
+    const int64_t elements =
+        static_cast<int64_t>(rows) * static_cast<int64_t>(width);
+    if (elements <= 0 || elements > std::numeric_limits<int>::max())
+      return false;
+    outElements = static_cast<int>(elements);
+    return true;
+  }
+
+  int checkedElementCount(int32_t rows) const {
+    int elements = 0;
+    if (!computeElementCount(rows, elements))
+      throw std::runtime_error("activation shape exceeds MPI element count");
+    return elements;
+  }
+
+  [[noreturn]] void abortProtocol(int expectedPeer, int actualSource,
+                                  const ActivationHeader &expected,
+                                  const ActivationHeader *received,
+                                  const std::string &detail) const {
+    std::ostringstream os;
+    os << "rank " << rank << " protocol error (source=" << actualSource
+       << ", expected_source=" << expectedPeer << "): " << detail
+       << "; expected=" << formatActivationHeader(expected) << "; received=";
+    if (received)
+      os << formatActivationHeader(*received);
+    else
+      os << "<unavailable>";
+    const std::string message = os.str() + '\n';
+    std::cerr.write(message.data(),
+                    static_cast<std::streamsize>(message.size()));
+    std::cerr.flush();
+    // Give the MPI launcher a moment to drain the redirected stderr pipe;
+    // otherwise MPI_Abort can race the diagnostic and drop it.
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    MPI_Abort(comm, 1);
+    std::_Exit(1);
+  }
+
+  int width;
+  int context;
+  int prefillChunk;
+  MPI_Comm comm;
+  int rank = 0;
+};
+
+#endif

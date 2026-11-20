@@ -288,7 +288,8 @@ int runBadInjection(const std::string &mode, const std::string &counterFile,
   int badStep = 1;
   if (mode == "bad-duplicate-step")
     badStep = 2;
-  else if (mode == "bad-short-prefill")
+  else if (mode == "bad-short-prefill" || mode == "bad-short-header" ||
+           mode == "bad-long-header")
     badStep = 0;
 
   for (int step = 0; step <= badStep; ++step) {
@@ -301,6 +302,11 @@ int runBadInjection(const std::string &mode, const std::string &counterFile,
         int token = -1;
         mpiCheck(MPI_Recv(&token, 1, MPI_INT, 1, kTokenTag, MPI_COMM_WORLD,
                           MPI_STATUS_IGNORE));
+      } else if (mode == "bad-short-header" || mode == "bad-long-header") {
+        const int32_t raw[] = {1, 0, -1, kContext, 0};
+        mpiCheck(MPI_Send(raw, mode == "bad-short-header" ? 3 : 5,
+                          MPI_INT32_T, 1, kHeaderTag, MPI_COMM_WORLD));
+        MPI_Barrier(MPI_COMM_WORLD); // Receiver must abort on the header alone.
       } else if (mode == "bad-duplicate-step") {
         auto payload = fillPayload(1, 1);
         const std::array<int32_t, 4> dupHeader = {kActivationProtocolVersion, 1,

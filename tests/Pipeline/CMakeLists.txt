@@ -104,6 +104,8 @@ set_tests_properties(buddy-pipeline-moe-stage-export PROPERTIES
 # Layer 1B & 1C: MPI protocol & stage-chain unit tests (skipped if no MPI)
 # ------------------------------------------------------------------------------
 set(_BUDDY_PIPELINE_PROTOCOL_TESTS
+  buddy-pipeline-protocol-bad-short-header
+  buddy-pipeline-protocol-bad-long-header
   buddy-pipeline-protocol-normal
   buddy-pipeline-protocol-forward3
   buddy-pipeline-protocol-bad-duplicate-step
@@ -148,6 +150,17 @@ if(_BUDDY_PIPELINE_HAVE_MPI)
   set(_BUDDY_PIPELINE_PROTOCOL_WORK_DIR
     "${CMAKE_CURRENT_BINARY_DIR}/protocol-work")
 
+  foreach(mode IN ITEMS bad-short-header bad-long-header)
+    add_test(NAME buddy-pipeline-protocol-${mode}
+      COMMAND "${Python3_EXECUTABLE}" "${_BUDDY_PIPELINE_PROTOCOL_RUNNER}"
+        --mpiexec "${MPIEXEC_EXECUTABLE}"
+        "--numproc-flag=${_BUDDY_PIPELINE_MPI_NUMPROC_FLAG}"
+        --ranks 2 --binary "$<TARGET_FILE:buddy-pipeline-protocol-test>"
+        --mode "${mode}" --timeout 60 --expect-fail
+        --expect-output "header element count mismatch"
+        --counter-file "${_BUDDY_PIPELINE_PROTOCOL_WORK_DIR}/${mode}.counter"
+        --expect-compute-calls 0 --expect-prefill-calls 0 --expect-decode-calls 0)
+  endforeach()
   add_test(NAME buddy-pipeline-protocol-normal
     COMMAND "${Python3_EXECUTABLE}" "${_BUDDY_PIPELINE_PROTOCOL_RUNNER}"
       --mpiexec "${MPIEXEC_EXECUTABLE}"
