@@ -46,7 +46,34 @@ def check_signature(directory, phase, inputs, outputs, suffix="-f16"):
     )
 
 
+def _require_valid_tokens(config):
+    tokens = config.get("tokens")
+    if not isinstance(tokens, dict) or "eos_id" not in tokens:
+        raise ValueError("stage config is missing tokens.eos_id")
+    eos_id = tokens["eos_id"]
+    if isinstance(eos_id, bool) or not isinstance(eos_id, int) or eos_id < 0:
+        raise ValueError(
+            f"stage config tokens.eos_id must be a non-negative integer, "
+            f"got {eos_id!r}"
+        )
+    stop_ids = tokens.get("stop_token_ids")
+    if stop_ids is not None:
+        if not isinstance(stop_ids, list) or not stop_ids:
+            raise ValueError(
+                "stage config tokens.stop_token_ids must be a non-empty list "
+                "of non-negative integers"
+            )
+        for item in stop_ids:
+            if isinstance(item, bool) or not isinstance(item, int) or item < 0:
+                raise ValueError(
+                    "stage config tokens.stop_token_ids entries must be "
+                    f"non-negative integers, got {item!r}"
+                )
+    return eos_id
+
+
 def verify_w4g32_stage(config, directory, header):
+    eos_id = _require_valid_tokens(config)
     stage = config["pipeline_stage"]
     start = stage["start_layer"]
     end = stage["end_layer"]
@@ -124,7 +151,7 @@ def verify_w4g32_stage(config, directory, header):
             context,
             width,
             vocab,
-            config["tokens"]["eos_id"],
+            eos_id,
         ]
         signature = ", ".join(["PositionRef *, KVRef *, KVRef *"] * count)
         use_arena = "true" if config.get("arena") else "false"
@@ -159,6 +186,7 @@ def verify_stage(config, directory, header):
     if config.get("variant") == "w4g32":
         verify_w4g32_stage(config, directory, header)
         return
+    eos_id = _require_valid_tokens(config)
     stage = config["pipeline_stage"]
     start = stage["start_layer"]
     end = stage["end_layer"]
@@ -212,7 +240,7 @@ def verify_stage(config, directory, header):
             context,
             width,
             vocab,
-            config["tokens"]["eos_id"],
+            eos_id,
         ]
         signature = ", ".join(["PositionRef *, KVRef *, KVRef *"] * count)
         header.write_text(

@@ -406,15 +406,22 @@ def derive_thread_cores(spec: dict, kernels: str | None) -> list | None:
     return list(raw)
 
 
-def w4g32_param_counts(hf: dict, prefill_chunk: int, ime: bool) -> dict:
-    """w4g32 (graph/transform/k3_w4.py) buffer sizes, from the HF config of a
-    Qwen2 model: every Linear weight [K, N] becomes K * N * 9 / 16 bytes of
+def w4g32_stage_param_counts(
+    hf: dict,
+    start: int,
+    end: int,
+    total: int,
+    ime: bool,
+    *,
+    prefill_chunk: int | None = None,
+) -> dict:
+    """w4g32 (graph/transform/k3_w4.py) buffer sizes for layer interval
+    [start, end) of a Qwen2 or Qwen3-MoE model (whole model when start=0 and
+    end=total): every Linear weight [K, N] becomes K * N * 9 / 16 bytes of
     int4 tiles with their f16 scales; the embedding, the norms, the q / k / v
-    biases and the RoPE inv_freq stay f32. With `ime` ("prefill_ime"), the
-    weights of the layers other than the LM head (whose prefill computes one
-    row) get a second copy, in the IME layout, of the same size. Rejects the
-    models and the prefill_chunk (derive_prefill_chunk) the kernels do not
-    support."""
+    biases (Qwen2) or q/k norms and router (Qwen3-MoE), and the RoPE inv_freq
+    stay f32. With `ime` ("prefill_ime"), the dense layer weights other than
+    the LM head and MoE experts get a second copy, in the IME layout."""
     arch = (hf.get("architectures") or ["?"])[0]
     if arch not in ("Qwen2ForCausalLM", "Qwen3MoeForCausalLM"):
         raise ValueError(
@@ -424,24 +431,29 @@ def w4g32_param_counts(hf: dict, prefill_chunk: int, ime: bool) -> dict:
     moe = arch == "Qwen3MoeForCausalLM"
     if hf.get("tie_word_embeddings"):
         raise ValueError("w4g32 does not support tie_word_embeddings")
-    if not prefill_chunk:
-        raise ValueError("w4g32 needs prefill_chunk")
-    if prefill_chunk % W4G32_CHUNK_MULTIPLE:
+    if prefill_chunk is not None:
+        if not prefill_chunk:
+            raise ValueError("w4g32 needs prefill_chunk")
+        if prefill_chunk % W4G32_CHUNK_MULTIPLE:
+            raise ValueError(
+                f"w4g32 needs prefill_chunk to be a multiple of "
+                f"{W4G32_CHUNK_MULTIPLE}, got {prefill_chunk}"
+            )
+    if not 0 <= start < end <= total:
         raise ValueError(
-            f"w4g32 needs prefill_chunk to be a multiple of "
-            f"{W4G32_CHUNK_MULTIPLE}, got {prefill_chunk}"
+            f"invalid layer interval [{start}, {end}) for {total} layers"
         )
     h = hf["hidden_size"]
     heads = hf["num_attention_heads"]
-    d = hf.get("head_dim", h // heads)
+    d = hf.get("head_dim") or (h // heads)
     if d % W4G32_HEAD_DIM_MULTIPLE:
         raise ValueError(
             f"w4g32 needs a head_dim that is a multiple of "
             f"{W4G32_HEAD_DIM_MULTIPLE}, got {d}"
         )
-    kv = hf.get("num_key_value_heads", heads) * d
+    kv = (hf.get("num_key_value_heads") or heads) * d
     vocab = hf["vocab_size"]
-    layers = hf["num_hidden_layers"]
+    count = end - start
     linears = [
         (h, heads * d),  # q, k, v: one weight, one tile range each
         (h, kv),
@@ -458,7 +470,11 @@ def w4g32_param_counts(hf: dict, prefill_chunk: int, ime: bool) -> dict:
             raise ValueError("w4g32 needs norm_topk_prob")
         inter = hf["moe_intermediate_size"]
         # transformers 5 writes num_experts as num_local_experts
-        experts = hf.get("num_experts", hf.get("num_local_experts"))
+        experts = hf.get("num_experts")
+        if experts is None:
+            experts = hf.get("num_local_experts")
+        if not experts:
+            raise ValueError("w4g32 needs num_experts for Qwen3MoeForCausalLM")
         expert_linears = [(h, inter), (h, inter), (inter, h)]
         if h % 128:
             raise ValueError(f"w4g32 needs hidden_size % 128 == 0, got {h}")
@@ -478,14 +494,28 @@ def w4g32_param_counts(hf: dict, prefill_chunk: int, ime: bool) -> dict:
     # experts: the MoE kernel has no matrix-engine tiles)
     per_layer = sum(k * n for k, n in linears) * (2 if ime else 1)
     per_layer += experts * sum(k * n for k, n in expert_linears)
-    i8 = (layers * per_layer + h * vocab) * 9 // 16
+    lm_head = h * vocab if end == total else 0
+    i8 = (count * per_layer + lm_head) * 9 // 16
     f32_layer = 2 * h
     if moe:
         f32_layer += 2 * d + h * experts  # q_norm, k_norm, router
     else:
         f32_layer += heads * d + 2 * kv  # the q / k / v biases
-    f32 = vocab * h + layers * f32_layer + h + d // 2
+    f32 = (
+        (vocab * h if start == 0 else 0)
+        + count * f32_layer
+        + (h if end == total else 0)
+        + d // 2
+    )
     return {"f32_elements": f32, "i8_elements": i8}
+
+
+def w4g32_param_counts(hf: dict, prefill_chunk: int, ime: bool) -> dict:
+    """w4g32 (graph/transform/k3_w4.py) buffer sizes for a full model."""
+    layers = hf.get("num_hidden_layers", 1)
+    return w4g32_stage_param_counts(
+        hf, 0, layers, layers, ime, prefill_chunk=prefill_chunk
+    )
 
 
 def derive_tiered_kv_cache(spec: dict) -> dict:
