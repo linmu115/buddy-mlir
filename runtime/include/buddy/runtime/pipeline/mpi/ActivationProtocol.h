@@ -124,7 +124,7 @@ class ActivationProtocol {
 protected:
   ActivationProtocol(const StageConfig &config, MPI_Comm comm, int version)
       : width(config.activationWidth), context(config.context),
-        prefillChunk(config.prefillChunk), version(version), comm(comm) {
+        prefillChunk(config.prefillChunk), version(version), comm(comm), abortComm(comm) {
     if (width <= 0 || context <= 0)
       throw std::invalid_argument("invalid activation width or context");
     if (prefillChunk < 0 || prefillChunk > context)
@@ -243,7 +243,7 @@ protected:
     // Give the MPI launcher a moment to drain the redirected stderr pipe;
     // otherwise MPI_Abort can race the diagnostic and drop it.
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    MPI_Abort(comm, 1);
+    MPI_Abort(abortComm, 1);
     std::_Exit(1);
   }
 
@@ -252,6 +252,7 @@ protected:
   int prefillChunk;
   int version;
   MPI_Comm comm;
+  MPI_Comm abortComm;
   int rank = 0;
 };
 

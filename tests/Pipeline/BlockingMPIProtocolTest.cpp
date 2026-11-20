@@ -16,6 +16,9 @@
 
 #include "buddy/runtime/pipeline/mpi/BlockingMPI.h"
 
+#include "buddy/runtime/pipeline/mpi/AsyncMPI.h"
+
+#include <optional>
 #include <fcntl.h>
 #include <mpi.h>
 #include <unistd.h>
@@ -59,6 +62,49 @@ StageConfig makeTestConfig(ActivationType dtype = ActivationType::F16,
   return cfg;
 }
 
+bool asyncMode = false;
+MPI_Comm dataComm = MPI_COMM_WORLD;
+
+class TestTransport {
+  using WireDtype = buddy::runtime::pipeline::WireDtype;
+  std::optional<AsyncActivation> async;
+  BlockingActivation blocking;
+  StageConfig cfg;
+
+public:
+  TestTransport(const StageConfig &cfg, MPI_Comm comm,
+                WireDtype wire = WireDtype::Native)
+      : blocking(cfg, comm, wire), cfg(cfg) {
+    if (asyncMode) {
+      async.emplace(cfg, comm, wire, true, true, 2, true);
+      dataComm = async->communicator();
+    }
+  }
+  ~TestTransport() {
+    if (async && !std::uncaught_exceptions())
+      async->drain();
+    dataComm = MPI_COMM_WORLD;
+  }
+  void send(const ActivationHeader &h, const void *data, int peer) {
+    if (async)
+      async->postSend(h, data, peer);
+    else
+      blocking.send(h, data, peer);
+  }
+  ActivationHeader receive(void *data, size_t cap, int peer,
+                           const ActivationHeader &h) {
+    if (!async)
+      return blocking.receive(data, cap, peer, h);
+    size_t n = static_cast<size_t>(h.rows) * cfg.activationWidth;
+    if (n > cap)
+      throw std::runtime_error("test buffer too small");
+    async->postReceive(h, peer);
+    std::memcpy(data, async->finishReceive(h, peer),
+                n * (cfg.dtype == ActivationType::F32 ? 4 : 2));
+    return h;
+  }
+};
+
 uint32_t makePatternF32Bits(int step, size_t index) {
   // Include edge-case FP32 bit patterns (+0.0, -0.0, 1.0, subnormal, FLT_MAX,
   // -FLT_MAX, quiet NaN) to verify raw MPI_FLOAT bit preservation.
@@ -83,9 +129,9 @@ std::vector<float> fillPayloadF32(int step, int rows) {
 void sendRawFrameF32(int peer, const std::array<int32_t, 4> &wireHeader,
                      const float *payload, int payloadElements) {
   mpiCheck(MPI_Send(wireHeader.data(), 4, MPI_INT32_T, peer, kHeaderTag,
-                    MPI_COMM_WORLD));
+                    dataComm));
   mpiCheck(MPI_Send(payload, payloadElements, MPI_FLOAT, peer, kActivationTag,
-                    MPI_COMM_WORLD));
+                    dataComm));
 }
 
 uint16_t makePattern(int step, size_t index) {
@@ -154,9 +200,9 @@ void writeCounterFile(const std::string &path, int totalCalls, int prefillCalls,
 void sendRawFrame(int peer, const std::array<int32_t, 4> &wireHeader,
                   const uint16_t *payload, int payloadElements) {
   mpiCheck(MPI_Send(wireHeader.data(), 4, MPI_INT32_T, peer, kHeaderTag,
-                    MPI_COMM_WORLD));
+                    dataComm));
   mpiCheck(MPI_Send(payload, payloadElements, MPI_UINT16_T, peer,
-                    kActivationTag, MPI_COMM_WORLD));
+                    kActivationTag, dataComm));
 }
 
 int runNormal2Rank(int rank, int ranks,
@@ -167,7 +213,7 @@ int runNormal2Rank(int rank, int ranks,
     verifyMakeActivationHeaderErrors();
 
   const StageConfig cfg = makeTestConfig();
-  BlockingActivation activation(cfg, MPI_COMM_WORLD, requested);
+  TestTransport activation(cfg, MPI_COMM_WORLD, requested);
   std::vector<uint16_t> recvBuf(static_cast<size_t>(kContext) * kWidth, 0);
 
   int computeCalls = 0;
@@ -231,7 +277,7 @@ int runForward3Rank(int rank, int ranks) {
   if (ranks != 3)
     throw std::runtime_error("forward3 mode requires exactly 3 ranks");
   const StageConfig cfg = makeTestConfig();
-  BlockingActivation activation(cfg, MPI_COMM_WORLD);
+  TestTransport activation(cfg, MPI_COMM_WORLD);
   std::vector<uint16_t> recvBuf(static_cast<size_t>(kContext) * kWidth, 0);
 
   for (int step = 0; step < 3; ++step) {
@@ -277,7 +323,7 @@ int runBadInjection(const std::string &mode, const std::string &counterFile,
   if (ranks != 2)
     throw std::runtime_error(mode + " mode requires exactly 2 ranks");
   const StageConfig cfg = makeTestConfig();
-  BlockingActivation activation(cfg, MPI_COMM_WORLD);
+  TestTransport activation(cfg, MPI_COMM_WORLD);
   std::vector<uint16_t> recvBuf(static_cast<size_t>(kContext) * kWidth, 0);
 
   int totalCalls = 0;
@@ -306,7 +352,7 @@ int runBadInjection(const std::string &mode, const std::string &counterFile,
       } else if (mode == "bad-short-header" || mode == "bad-long-header") {
         const int32_t raw[] = {1, 0, -1, kContext, 0};
         mpiCheck(MPI_Send(raw, mode == "bad-short-header" ? 3 : 5, MPI_INT32_T,
-                          1, kHeaderTag, MPI_COMM_WORLD));
+                          1, kHeaderTag, dataComm));
         MPI_Barrier(MPI_COMM_WORLD); // Receiver must abort on the header alone.
       } else if (mode == "bad-duplicate-step") {
         auto payload = fillPayload(1, 1);
@@ -332,11 +378,12 @@ int runBadInjection(const std::string &mode, const std::string &counterFile,
         int token = -1;
         mpiCheck(MPI_Recv(&token, 1, MPI_INT, 1, kTokenTag, MPI_COMM_WORLD,
                           MPI_STATUS_IGNORE));
-      } else if (mode == "bad-short-payload") {
+      } else if (mode == "bad-short-payload" || mode == "bad-long-payload") {
         auto payload = fillPayload(1, 1);
         const std::array<int32_t, 4> validHeader = {kActivationProtocolVersion,
                                                     1, kPromptRows, 1};
-        sendRawFrame(1, validHeader, payload.data(), kWidth - 1);
+        payload.resize(mode == "bad-long-payload" ? kWidth + 1 : kWidth - 1);
+        sendRawFrame(1, validHeader, payload.data(), payload.size());
         int token = -1;
         mpiCheck(MPI_Recv(&token, 1, MPI_INT, 1, kTokenTag, MPI_COMM_WORLD,
                           MPI_STATUS_IGNORE));
@@ -376,7 +423,7 @@ int runNormal2RankF32(int rank, int ranks) {
   if (ranks != 2)
     throw std::runtime_error("normal-f32 mode requires exactly 2 ranks");
   const StageConfig cfg = makeTestConfig(ActivationType::F32, 0);
-  BlockingActivation activation(cfg, MPI_COMM_WORLD);
+  TestTransport activation(cfg, MPI_COMM_WORLD);
   std::vector<float> recvBuf(static_cast<size_t>(kContext) * kWidth, 0.0f);
 
   for (int step = 0; step < 3; ++step) {
@@ -423,7 +470,7 @@ int runChunked2RankF32(int rank, int ranks) {
     throw std::runtime_error("chunked-f32 mode requires exactly 2 ranks");
   constexpr int kChunk = 32;
   const StageConfig cfg = makeTestConfig(ActivationType::F32, kChunk);
-  BlockingActivation activation(cfg, MPI_COMM_WORLD);
+  TestTransport activation(cfg, MPI_COMM_WORLD);
   std::vector<float> recvBuf(static_cast<size_t>(kChunk) * kWidth, 0.0f);
 
   // Two prefill chunks (prompt len 40: [0..31], right-aligned [8..39]) + 2
@@ -479,7 +526,7 @@ int runBadInjectionF32(const std::string &mode, const std::string &counterFile,
       (mode == "bad-chunk-rows-f32" || mode == "bad-short-chunk-f32");
   const StageConfig cfg =
       makeTestConfig(ActivationType::F32, chunked ? kChunk : 0);
-  BlockingActivation activation(cfg, MPI_COMM_WORLD);
+  TestTransport activation(cfg, MPI_COMM_WORLD);
   const size_t cap =
       static_cast<size_t>(chunked ? kChunk : kContext) * kWidth;
   std::vector<float> recvBuf(cap, 0.0f);
@@ -554,9 +601,9 @@ int runWireRoundTrip(int rank, int ranks) {
     throw std::runtime_error("wire round trip requires two ranks");
   const auto cfg = makeTestConfig(ActivationType::F32);
   const auto h = makeActivationHeader(1, kPromptRows, kContext, 2);
+  TestTransport activation(cfg, MPI_COMM_WORLD,
+                           buddy::runtime::pipeline::WireDtype::F16);
   if (rank == 0) {
-    BlockingActivation activation(cfg, MPI_COMM_WORLD,
-                                  buddy::runtime::pipeline::WireDtype::F16);
     std::vector<float> data(kWidth, 1.00048828125f); // halfway rounds to 1
     activation.send(h, data.data(), 1);
     activation.receive(data.data(), data.size(), 1, h);
@@ -565,14 +612,14 @@ int runWireRoundTrip(int rank, int ranks) {
         throw std::runtime_error("unexpected decoded f32 value");
   } else {
     std::array<int32_t, 4> raw;
-    mpiCheck(MPI_Recv(raw.data(), 4, MPI_INT32_T, 0, kHeaderTag, MPI_COMM_WORLD,
+    mpiCheck(MPI_Recv(raw.data(), 4, MPI_INT32_T, 0, kHeaderTag, dataComm,
                       MPI_STATUS_IGNORE));
     if (raw != std::array<int32_t, 4>{2, 1, kPromptRows, 1})
       throw std::runtime_error("unexpected raw v2 header");
     std::vector<uint16_t> wire(kWidth);
     MPI_Status status;
     mpiCheck(MPI_Recv(wire.data(), kWidth, MPI_UINT16_T, 0, kActivationTag,
-                      MPI_COMM_WORLD, &status));
+                      dataComm, &status));
     int count = 0;
     mpiCheck(MPI_Get_count(&status, MPI_UINT16_T, &count));
     if (count != kWidth)
@@ -590,7 +637,7 @@ int runWireRoundTrip(int rank, int ranks) {
 int runBadV2(const std::string &mode, const std::string &counterFile,
              int rank) {
   const StageConfig cfg = makeTestConfig(ActivationType::F32);
-  BlockingActivation activation(cfg, MPI_COMM_WORLD,
+  TestTransport activation(cfg, MPI_COMM_WORLD,
                                 buddy::runtime::pipeline::WireDtype::F16);
   const ActivationHeader expected =
       makeActivationHeader(1, kPromptRows, kContext, 2);
@@ -603,7 +650,7 @@ int runBadV2(const std::string &mode, const std::string &counterFile,
     writeCounterFile(counterFile, 1, 0, 1, expected.step, expected.pos);
   } else if (mode == "bad-v2-version") {
     const int32_t raw[] = {1, 1, kPromptRows, 1};
-    mpiCheck(MPI_Send(raw, 4, MPI_INT32_T, 1, kHeaderTag, MPI_COMM_WORLD));
+    mpiCheck(MPI_Send(raw, 4, MPI_INT32_T, 1, kHeaderTag, dataComm));
   } else if (mode == "bad-v2-payload") {
     std::vector<uint16_t> shortPayload(kWidth - 1);
     sendRawFrame(1, {2, 1, kPromptRows, 1}, shortPayload.data(), kWidth - 1);
@@ -614,6 +661,63 @@ int runBadV2(const std::string &mode, const std::string &counterFile,
     activation.send(expected, data.data(), 1);
   }
   mpiCheck(MPI_Barrier(MPI_COMM_WORLD));
+  return 0;
+}
+
+// A synchronous send of the first component must match before the second
+// component is offered. This forces both arrival orders on separate tags.
+int runArrival(int rank, bool payloadFirst) {
+  auto cfg = makeTestConfig();
+  AsyncActivation a(cfg, MPI_COMM_WORLD, buddy::runtime::pipeline::WireDtype::Native,
+                    rank != 0, rank == 0, 1);
+  auto h = makeActivationHeader(0, kPromptRows, kContext);
+  auto data = fillPayload(0, h.rows);
+  if (rank == 0) {
+    std::array<int32_t, 4> raw{h.version, h.step, h.pos, h.rows};
+    auto payload = [&] {
+      mpiCheck(MPI_Ssend(data.data(), data.size(), MPI_UINT16_T, 1,
+                         kActivationTag, a.communicator()));
+    };
+    if (payloadFirst)
+      payload();
+    mpiCheck(MPI_Ssend(raw.data(), 4, MPI_INT32_T, 1, kHeaderTag, a.communicator()));
+    if (!payloadFirst)
+      payload();
+  } else {
+    a.postReceive(h, 0);
+    if (std::memcmp(data.data(), a.finishReceive(h, 0), data.size() * 2))
+      throw std::runtime_error("arrival test payload mismatch");
+  }
+  a.drain();
+  return 0;
+}
+
+int runWindow(int rank, int ranks) {
+  constexpr int frames = 7, rows = 32;
+  auto cfg = makeTestConfig(ActivationType::F16, rows);
+  AsyncActivation a(cfg, MPI_COMM_WORLD, buddy::runtime::pipeline::WireDtype::Native,
+                    rank > 0, rank + 1 < ranks, 2, true);
+  auto header = [&](int step) { return makeChunkPrefillHeader(step, step, rows, kContext); };
+  if (rank)
+    for (int i = 0; i < 2; ++i)
+      a.postReceive(header(i), rank - 1);
+  for (int i = 0; i < frames; ++i) {
+    auto expected = fillPayload(i, rows);
+    void *data = expected.data();
+    if (rank) {
+      if (rank == ranks - 1)
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+      data = a.finishReceive(header(i), rank - 1);
+      if (std::memcmp(data, expected.data(), expected.size() * 2))
+        throw std::runtime_error("window payload mismatch");
+    }
+    if (rank + 1 < ranks)
+      a.postSend(header(i), data, rank + 1);
+    std::memset(data, 0, expected.size() * 2);
+    if (rank && i + 2 < frames)
+      a.postReceive(header(i + 2), rank - 1);
+  }
+  a.drain();
   return 0;
 }
 
@@ -631,10 +735,17 @@ int main(int argc, char **argv) {
     if (argc < 2)
       throw std::runtime_error("usage: buddy-pipeline-protocol-test MODE "
                                "[COUNTER_FILE]");
-    const std::string mode = argv[1];
+    std::string mode = argv[1];
+    asyncMode = mode.rfind("async-", 0) == 0;
+    if (asyncMode)
+      mode.erase(0, 6);
     const std::string counterFile = argc >= 3 ? argv[2] : "";
     int rc = 0;
-    if (mode.rfind("bad-v2-", 0) == 0)
+    if (mode == "window")
+      rc = runWindow(rank, ranks);
+    else if (mode == "header-first" || mode == "payload-first")
+      rc = runArrival(rank, mode == "payload-first");
+    else if (mode.rfind("bad-v2-", 0) == 0)
       rc = runBadV2(mode, counterFile, rank);
     else if (mode == "wire-round-trip")
       rc = runWireRoundTrip(rank, ranks);
