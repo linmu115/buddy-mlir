@@ -53,6 +53,13 @@ set(_BUDDY_PIPELINE_ALL_DEPENDS)
 # ------------------------------------------------------------------------------
 # Layer 1A: StageManifest parser unit test (no MPI required)
 # ------------------------------------------------------------------------------
+add_executable(buddy-pipeline-activation-wire-test ActivationWireTest.cpp)
+target_compile_features(buddy-pipeline-activation-wire-test PRIVATE cxx_std_17)
+target_link_libraries(buddy-pipeline-activation-wire-test PRIVATE buddy_runtime_core)
+add_test(NAME buddy-pipeline-activation-wire COMMAND buddy-pipeline-activation-wire-test)
+set_tests_properties(buddy-pipeline-activation-wire PROPERTIES LABELS "pipeline;pipeline-unit")
+list(APPEND _BUDDY_PIPELINE_UNIT_DEPENDS buddy-pipeline-activation-wire-test)
+
 add_executable(buddy-pipeline-stage-manifest-test
   StageManifestTest.cpp
 )

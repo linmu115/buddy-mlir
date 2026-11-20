@@ -17,7 +17,7 @@
 #ifndef BUDDY_RUNTIME_PIPELINE_MPI_ACTIVATION_PROTOCOL_H
 #define BUDDY_RUNTIME_PIPELINE_MPI_ACTIVATION_PROTOCOL_H
 
-#include "buddy/runtime/pipeline/Stage.h"
+#include "buddy/runtime/pipeline/ActivationWire.h"
 #include <mpi.h>
 
 #include <array>
@@ -213,14 +213,7 @@ protected:
   }
 
   bool computeElementCount(int32_t rows, int &outElements) const {
-    if (width <= 0 || rows <= 0)
-      return false;
-    const int64_t elements =
-        static_cast<int64_t>(rows) * static_cast<int64_t>(width);
-    if (elements <= 0 || elements > std::numeric_limits<int>::max())
-      return false;
-    outElements = static_cast<int>(elements);
-    return true;
+    return buddy::runtime::pipeline::computeElementCount(rows, width, outElements);
   }
 
   int checkedElementCount(int32_t rows) const {
