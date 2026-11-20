@@ -56,6 +56,8 @@ inline const char *activationTypeName(ActivationType dtype) {
 struct StageCheckOptions {
   std::string modelName;
   bool requireModelName = false;
+  WireDtype wireDtype = WireDtype::Native;
+  Transport transport = Transport::Blocking;
 };
 
 enum class TokenLimitMode {
@@ -106,6 +108,7 @@ struct DistributedGenerateOptions {
   /// Test-only hook: when non-empty, appends stage prefill/decode calls to
   /// "<traceStagePrefix>.rank<rank>.log".
   std::string traceStagePrefix;
+  WireDtype wireDtype = WireDtype::Native;
 };
 
 inline bool isStopToken(int token, int eosId,
@@ -213,12 +216,20 @@ inline void checkAllStages(MPI_Comm comm, int rank, int ranks,
     throw std::runtime_error("invalid MPI rank/size (" + std::to_string(rank) +
                              "/" + std::to_string(ranks) + ")");
 
-  const std::array<int, 9> fields{
-      config.startLayer,      config.endLayer,
-      config.totalLayers,     config.context,
-      config.activationWidth, config.vocabSize,
-      config.eosId,           static_cast<int>(config.dtype),
-      config.prefillChunk};
+  const auto wire = resolveWireSpec(config.dtype, opts.wireDtype);
+  const std::array<int, 13> fields{config.startLayer,
+                                   config.endLayer,
+                                   config.totalLayers,
+                                   config.context,
+                                   config.activationWidth,
+                                   config.vocabSize,
+                                   config.eosId,
+                                   static_cast<int>(config.dtype),
+                                   config.prefillChunk,
+                                   static_cast<int>(opts.transport),
+                                   static_cast<int>(opts.wireDtype),
+                                   static_cast<int>(wire.dtype),
+                                   wire.version};
   constexpr int kFieldCount = static_cast<int>(fields.size());
   std::vector<int> all(static_cast<size_t>(ranks) * kFieldCount);
   mpiCheck(MPI_Allgather(fields.data(), kFieldCount, MPI_INT, all.data(),
@@ -353,6 +364,26 @@ inline void checkAllStages(MPI_Comm comm, int rank, int ranks,
                                std::to_string(refPrefillChunk) +
                                " (from rank 0)");
 
+    auto fieldValue = [](int field, int value) -> std::string {
+      if (field == 9)
+        return value == static_cast<int>(Transport::Blocking) ? "blocking"
+                                                              : "async";
+      if (field == 10)
+        return value == static_cast<int>(WireDtype::Native) ? "native" : "f16";
+      if (field == 11)
+        return activationTypeName(static_cast<ActivationType>(value));
+      return std::to_string(value);
+    };
+    constexpr const char *wireFields[] = {"pp_transport", "pp_wire_dtype",
+                                          "effective wire dtype",
+                                          "wire version"};
+    for (int i = 9; i < kFieldCount; ++i) {
+      if (stage[i] != all[i])
+        throw std::runtime_error(
+            std::string("field ") + wireFields[i - 9] + " mismatch: rank " +
+            std::to_string(r) + " has " + fieldValue(i, stage[i]) +
+            ", expected " + fieldValue(i, all[i]) + " (from rank 0)");
+    }
     if (endLayer <= startLayer)
       throw std::runtime_error("field startLayer/endLayer invalid on rank " +
                                std::to_string(r) + ": [" +
@@ -394,6 +425,8 @@ inline void checkAllStages(MPI_Comm comm, int rank, int ranks,
         std::to_string(expectedStart) + " > totalLayers=" +
         std::to_string(refTotalLayers));
   }
+  if (opts.transport == Transport::Async)
+    throw std::runtime_error("pp_transport=async is not implemented");
 }
 
 namespace detail {
@@ -425,7 +458,8 @@ inline void generateDistributed(const DistributedGenerateOptions &opts,
     throw std::runtime_error("field testEosAtStep must be non-negative (got " +
                              std::to_string(opts.testEosAtStep) + ")");
 
-  BlockingActivation activation(config, comm);
+  const int version = resolveWireSpec(config.dtype, opts.wireDtype).version;
+  BlockingActivation activation(config, comm, opts.wireDtype);
 
   int promptRows = 0;
   int resolvedNewTokens = 0;
@@ -540,7 +574,7 @@ inline void generateDistributed(const DistributedGenerateOptions &opts,
       const bool isLastChunk = (start + C >= n);
       const bool needLogits = (n == n0 && isLastChunk);
       const ActivationHeader expected =
-          makeChunkPrefillHeader(frameStep, start, C, config.context);
+          makeChunkPrefillHeader(frameStep, start, C, config.context, version);
       ActivationHeader header = expected;
       void *input = nullptr;
       if (first) {
@@ -573,7 +607,7 @@ inline void generateDistributed(const DistributedGenerateOptions &opts,
 
     if (n < n0) {
       const ActivationHeader expected =
-          makeChunkDecodeHeader(frameStep, n, config.context);
+          makeChunkDecodeHeader(frameStep, n, config.context, version);
       ActivationHeader header = expected;
       int64_t lastPromptToken =
           first ? tokenInput[static_cast<size_t>(n0 - 1)] : 0;
@@ -615,7 +649,7 @@ inline void generateDistributed(const DistributedGenerateOptions &opts,
       for (int genStep = 1; genStep < resolvedNewTokens; ++genStep) {
         const int pos = n0 + genStep - 1;
         const ActivationHeader expected =
-            makeChunkDecodeHeader(frameStep, pos, config.context);
+            makeChunkDecodeHeader(frameStep, pos, config.context, version);
         ActivationHeader header = expected;
         void *input = nullptr;
         if (first) {
@@ -671,7 +705,7 @@ inline void generateDistributed(const DistributedGenerateOptions &opts,
 
     for (int step = 0; step < resolvedNewTokens; ++step) {
       const ActivationHeader expected =
-          makeActivationHeader(step, promptRows, config.context);
+          makeActivationHeader(step, promptRows, config.context, version);
       ActivationHeader header = expected;
       void *input = tokenInput.data();
       if (!first) {

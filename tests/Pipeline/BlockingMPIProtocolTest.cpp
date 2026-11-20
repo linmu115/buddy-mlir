@@ -159,14 +159,15 @@ void sendRawFrame(int peer, const std::array<int32_t, 4> &wireHeader,
                     kActivationTag, MPI_COMM_WORLD));
 }
 
-int runNormal2Rank(int rank, int ranks) {
+int runNormal2Rank(int rank, int ranks,
+                   buddy::runtime::pipeline::WireDtype requested) {
   if (ranks != 2)
     throw std::runtime_error("normal mode requires exactly 2 ranks");
   if (rank == 0)
     verifyMakeActivationHeaderErrors();
 
   const StageConfig cfg = makeTestConfig();
-  BlockingActivation activation(cfg, MPI_COMM_WORLD);
+  BlockingActivation activation(cfg, MPI_COMM_WORLD, requested);
   std::vector<uint16_t> recvBuf(static_cast<size_t>(kContext) * kWidth, 0);
 
   int computeCalls = 0;
@@ -304,8 +305,8 @@ int runBadInjection(const std::string &mode, const std::string &counterFile,
                           MPI_STATUS_IGNORE));
       } else if (mode == "bad-short-header" || mode == "bad-long-header") {
         const int32_t raw[] = {1, 0, -1, kContext, 0};
-        mpiCheck(MPI_Send(raw, mode == "bad-short-header" ? 3 : 5,
-                          MPI_INT32_T, 1, kHeaderTag, MPI_COMM_WORLD));
+        mpiCheck(MPI_Send(raw, mode == "bad-short-header" ? 3 : 5, MPI_INT32_T,
+                          1, kHeaderTag, MPI_COMM_WORLD));
         MPI_Barrier(MPI_COMM_WORLD); // Receiver must abort on the header alone.
       } else if (mode == "bad-duplicate-step") {
         auto payload = fillPayload(1, 1);
@@ -546,6 +547,76 @@ int runBadInjectionF32(const std::string &mode, const std::string &counterFile,
   return 0;
 }
 
+// Check the rounded value at the stage ABI as well as the actual MPI datatype,
+// count and version at the peer. Exercise both directions of the v2 adapter.
+int runWireRoundTrip(int rank, int ranks) {
+  if (ranks != 2)
+    throw std::runtime_error("wire round trip requires two ranks");
+  const auto cfg = makeTestConfig(ActivationType::F32);
+  const auto h = makeActivationHeader(1, kPromptRows, kContext, 2);
+  if (rank == 0) {
+    BlockingActivation activation(cfg, MPI_COMM_WORLD,
+                                  buddy::runtime::pipeline::WireDtype::F16);
+    std::vector<float> data(kWidth, 1.00048828125f); // halfway rounds to 1
+    activation.send(h, data.data(), 1);
+    activation.receive(data.data(), data.size(), 1, h);
+    for (float f : data)
+      if (f != -2.0f)
+        throw std::runtime_error("unexpected decoded f32 value");
+  } else {
+    std::array<int32_t, 4> raw;
+    mpiCheck(MPI_Recv(raw.data(), 4, MPI_INT32_T, 0, kHeaderTag, MPI_COMM_WORLD,
+                      MPI_STATUS_IGNORE));
+    if (raw != std::array<int32_t, 4>{2, 1, kPromptRows, 1})
+      throw std::runtime_error("unexpected raw v2 header");
+    std::vector<uint16_t> wire(kWidth);
+    MPI_Status status;
+    mpiCheck(MPI_Recv(wire.data(), kWidth, MPI_UINT16_T, 0, kActivationTag,
+                      MPI_COMM_WORLD, &status));
+    int count = 0;
+    mpiCheck(MPI_Get_count(&status, MPI_UINT16_T, &count));
+    if (count != kWidth)
+      throw std::runtime_error("unexpected raw v2 count");
+    for (auto &bits : wire) {
+      if (bits != 0x3c00)
+        throw std::runtime_error("unexpected raw binary16 bits");
+      bits = 0xc000;
+    }
+    sendRawFrame(0, raw, wire.data(), kWidth);
+  }
+  return 0;
+}
+
+int runBadV2(const std::string &mode, const std::string &counterFile,
+             int rank) {
+  const StageConfig cfg = makeTestConfig(ActivationType::F32);
+  BlockingActivation activation(cfg, MPI_COMM_WORLD,
+                                buddy::runtime::pipeline::WireDtype::F16);
+  const ActivationHeader expected =
+      makeActivationHeader(1, kPromptRows, kContext, 2);
+  std::vector<float> data(kWidth);
+  if (rank == 1)
+    writeCounterFile(counterFile, 0, 0, 0, -1, -1);
+  mpiCheck(MPI_Barrier(MPI_COMM_WORLD));
+  if (rank == 1) {
+    activation.receive(data.data(), data.size(), 0, expected);
+    writeCounterFile(counterFile, 1, 0, 1, expected.step, expected.pos);
+  } else if (mode == "bad-v2-version") {
+    const int32_t raw[] = {1, 1, kPromptRows, 1};
+    mpiCheck(MPI_Send(raw, 4, MPI_INT32_T, 1, kHeaderTag, MPI_COMM_WORLD));
+  } else if (mode == "bad-v2-payload") {
+    std::vector<uint16_t> shortPayload(kWidth - 1);
+    sendRawFrame(1, {2, 1, kPromptRows, 1}, shortPayload.data(), kWidth - 1);
+  } else {
+    data[17] = mode == "bad-v2-overflow"
+                   ? 65520.0f
+                   : std::numeric_limits<float>::infinity();
+    activation.send(expected, data.data(), 1);
+  }
+  mpiCheck(MPI_Barrier(MPI_COMM_WORLD));
+  return 0;
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -563,9 +634,16 @@ int main(int argc, char **argv) {
     const std::string mode = argv[1];
     const std::string counterFile = argc >= 3 ? argv[2] : "";
     int rc = 0;
-    if (mode == "normal")
-      rc = runNormal2Rank(rank, ranks);
-    else if (mode == "forward3")
+    if (mode.rfind("bad-v2-", 0) == 0)
+      rc = runBadV2(mode, counterFile, rank);
+    else if (mode == "wire-round-trip")
+      rc = runWireRoundTrip(rank, ranks);
+    else if (mode == "normal" || mode == "explicit-f16") {
+      using buddy::runtime::pipeline::WireDtype;
+      rc = runNormal2Rank(rank, ranks,
+                          mode == "explicit-f16" ? WireDtype::F16
+                                                 : WireDtype::Native);
+    } else if (mode == "forward3")
       rc = runForward3Rank(rank, ranks);
     else if (mode == "normal-f32")
       rc = runNormal2RankF32(rank, ranks);

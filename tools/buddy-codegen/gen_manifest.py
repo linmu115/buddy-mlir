@@ -55,6 +55,8 @@ def gen_manifest(
     runner_library: str | None = None,
     model_library: str | None = None,
     version: str = "0.1.0",
+    wire_dtype: str | None = None,
+    transport: str | None = None,
 ) -> str:
     """Generate the complete RHAL .mlir manifest text."""
     out = StringIO()
@@ -85,6 +87,14 @@ def gen_manifest(
     first_stage = last_stage = True
     stage_act_type = "f16"
     if stage is not None:
+        for key, value, allowed in (
+            ("pp_wire_dtype", wire_dtype, ("native", "f16")),
+            ("pp_transport", transport, ("blocking", "async")),
+        ):
+            if value is not None:
+                if value not in allowed:
+                    raise ValueError(f"{key} must be one of {allowed}")
+                stage_attrs[key] = value
         stage_attrs["pp_stage_version"] = "1"
         for field in (
             "start_layer", "end_layer", "total_layers",
@@ -350,6 +360,8 @@ def main():
         default="0.1.0",
         help="RAX module version string (usually the CLI release version).",
     )
+    parser.add_argument("--pp-wire-dtype", choices=("native", "f16"))
+    parser.add_argument("--pp-transport", choices=("blocking", "async"))
     args = parser.parse_args()
 
     with open(args.config) as f:
@@ -362,6 +374,8 @@ def main():
             runner_library=args.runner_library,
             model_library=args.model_library,
             version=args.version,
+            wire_dtype=args.pp_wire_dtype,
+            transport=args.pp_transport,
         )
     except (ValueError, RuntimeError, OSError) as e:
         print(f"error: {e}", file=sys.stderr)

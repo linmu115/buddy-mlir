@@ -19,11 +19,17 @@
 
 #include "buddy/runtime/pipeline/mpi/ActivationProtocol.h"
 
+#include <vector>
+
 class BlockingActivation : private ActivationProtocol {
+  using WireDtype = buddy::runtime::pipeline::WireDtype;
+  using WireSpec = buddy::runtime::pipeline::WireSpec;
+
 public:
-  BlockingActivation(const StageConfig &config, MPI_Comm comm)
-      : ActivationProtocol(config, comm),
-        type(config.dtype == ActivationType::F16 ? MPI_UINT16_T : MPI_FLOAT) {}
+  BlockingActivation(const StageConfig &config, MPI_Comm comm,
+                     WireDtype requested = WireDtype::Native)
+      : BlockingActivation(config, comm,
+                           resolveWireSpec(config.dtype, requested)) {}
 
   void send(const ActivationHeader &header, const void *data, int peer) const {
     if (!data)
@@ -33,6 +39,18 @@ public:
       throw std::invalid_argument("invalid activation header for send: " +
                                   reason);
     const int elements = checkedElementCount(header.rows);
+    checkedWireBytes(spec, elements);
+    if (spec.compressed()) {
+      try {
+        scratch.resize(elements);
+        buddy::runtime::pipeline::encodeInto(static_cast<const float *>(data),
+                                             elements, scratch.data(),
+                                             scratch.size());
+      } catch (const std::exception &e) {
+        abortProtocol(rank, rank, header, nullptr, e.what());
+      }
+      data = scratch.data();
+    }
     const std::array<int32_t, kActivationHeaderCount> wire = {
         header.version, header.step, header.pos, header.rows};
     mpiCheck(MPI_Send(wire.data(), kActivationHeaderCount, MPI_INT32_T, peer,
@@ -123,7 +141,17 @@ public:
                         ", expected " + std::to_string(expectedElements) + ")");
 
     MPI_Status payloadRecvStatus;
-    rc = MPI_Recv(data, expectedElements, type, peer, kActivationTag, comm,
+    void *wireData = data;
+    try {
+      checkedWireBytes(spec, expectedElements);
+      if (spec.compressed()) {
+        scratch.resize(expectedElements);
+        wireData = scratch.data();
+      }
+    } catch (const std::exception &e) {
+      abortProtocol(peer, source, expected, &received, e.what());
+    }
+    rc = MPI_Recv(wireData, expectedElements, type, peer, kActivationTag, comm,
                   &payloadRecvStatus);
     if (rc != MPI_SUCCESS)
       abortProtocol(peer, payloadProbeStatus.MPI_SOURCE, expected, &received,
@@ -141,10 +169,25 @@ public:
       abortProtocol(peer, payloadRecvStatus.MPI_SOURCE, expected, &received,
                     "payload receive element count mismatch");
 
+    if (spec.compressed()) {
+      try {
+        buddy::runtime::pipeline::decodeInto(scratch.data(), receivedElements,
+                                             static_cast<float *>(data),
+                                             capacityElements);
+      } catch (const std::exception &e) {
+        abortProtocol(peer, source, expected, &received, e.what());
+      }
+    }
     return received;
   }
 
 private:
+  BlockingActivation(const StageConfig &config, MPI_Comm comm, WireSpec spec)
+      : ActivationProtocol(config, comm, spec.version), spec(spec),
+        type(spec.dtype == ActivationType::F16 ? MPI_UINT16_T : MPI_FLOAT) {}
+
+  WireSpec spec;
+  mutable std::vector<uint16_t> scratch;
   MPI_Datatype type;
 };
 

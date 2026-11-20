@@ -311,10 +311,24 @@ void PipelineRunner::run(const RunConfig &cfg) {
     pipeline::StageCheckOptions checkOpts;
     checkOpts.modelName = m.modelName;
     checkOpts.requireModelName = true;
+    checkOpts.wireDtype = spec.wireDtype;
+    checkOpts.transport = spec.transport;
     pipeline::checkAllStages(comm, rank, size, stage->configuration(),
                              checkOpts);
 
     pipeline::DistributedGenerateOptions genOpts;
+    genOpts.wireDtype = spec.wireDtype;
+    if (rank == 0) {
+      const auto wire =
+          resolveWireSpec(stage->configuration().dtype, spec.wireDtype);
+      std::cerr << "pipeline transport=blocking requested_wire="
+                << (spec.wireDtype == pipeline::WireDtype::F16 ? "f16"
+                                                               : "native")
+                << " effective_wire="
+                << (size == 1 ? "none"
+                              : pipeline::activationTypeName(wire.dtype))
+                << " version=" << wire.version << '\n';
+    }
     genOpts.prompt = cfg.prompt;
     genOpts.vocabPath = m.vocabPath;
     genOpts.tokenizer = resolveTokenizerKind(spec.tokenizer);

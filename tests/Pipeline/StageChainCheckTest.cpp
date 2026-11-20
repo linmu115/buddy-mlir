@@ -214,6 +214,21 @@ void runFieldMismatch(int rank, int ranks) {
     throw std::runtime_error("field-mismatch requires 2 ranks");
   const auto opts = makeCheckOpts("deepseek_r1_f16", true);
 
+  const auto cfg = rank == 0 ? makeStageConfig(0, 14) : makeStageConfig(14, 28);
+  auto policy = opts;
+  using namespace buddy::runtime::pipeline;
+  if (rank == 1)
+    policy.wireDtype = WireDtype::F16;
+  expectFailure(rank, ranks, cfg, policy, "pp_wire_dtype mismatch: rank 1",
+                "wire");
+  policy.wireDtype = WireDtype::Native;
+  if (rank == 1)
+    policy.transport = Transport::Async;
+  expectFailure(rank, ranks, cfg, policy, "pp_transport mismatch: rank 1",
+                "transport");
+  policy.transport = Transport::Async;
+  expectFailure(rank, ranks, cfg, policy, "async is not implemented", "async");
+
   // totalLayers mismatch
   expectFailure(rank, ranks,
                 rank == 0 ? makeStageConfig(0, 14, 28)

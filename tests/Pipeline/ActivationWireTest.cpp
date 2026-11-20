@@ -25,7 +25,8 @@ static void require(bool ok) {
     throw std::runtime_error("activation wire test failed");
 }
 
-// Construct each positive half value mathematically, independently of the codec.
+// Construct each positive half value mathematically, independently of the
+// codec.
 static float reference(int h) {
   int exp = h >> 10;
   return exp ? std::ldexp(float(1024 + (h & 1023)), exp - 25)
@@ -38,8 +39,12 @@ static void checkEncode(float value, int expected) {
   require(wire == expected);
 }
 
-template<class E, class F> static void rejects(F f) {
-  try { f(); } catch (const E &) { return; }
+template <class E, class F> static void rejects(F f) {
+  try {
+    f();
+  } catch (const E &) {
+    return;
+  }
   throw std::runtime_error("missing expected codec error");
 }
 
@@ -57,7 +62,8 @@ int main() {
       const float below = std::nextafter(mid, 0.0f);
       checkEncode(sign ? -below : below, half);
       if (h == 0x7bff) {
-        rejects<std::overflow_error>([&] { checkEncode(sign ? -mid : mid, 0); });
+        rejects<std::overflow_error>(
+            [&] { checkEncode(sign ? -mid : mid, 0); });
         continue;
       }
       checkEncode(sign ? -mid : mid, (h + (h & 1)) | sign);
@@ -72,7 +78,8 @@ int main() {
   const auto compressed = resolveWireSpec(ActivationType::F32, WireDtype::F16);
   require(compressed.compressed() && checkedWireBytes(compressed, 3) == 6);
   require(!resolveWireSpec(ActivationType::F16, WireDtype::F16).compressed());
-  require(!resolveWireSpec(ActivationType::F32, WireDtype::Native).compressed());
+  require(
+      !resolveWireSpec(ActivationType::F32, WireDtype::Native).compressed());
   rejects<std::length_error>([&] { checkedWireBytes(compressed, SIZE_MAX); });
   int n;
   require(!computeElementCount(0, 1, n));

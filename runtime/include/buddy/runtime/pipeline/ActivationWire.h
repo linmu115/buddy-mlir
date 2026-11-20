@@ -25,6 +25,7 @@
 
 namespace buddy::runtime::pipeline {
 
+enum class Transport { Blocking, Async };
 enum class WireDtype { Native, F16 };
 
 struct WireSpec {
@@ -61,8 +62,8 @@ inline uint32_t roundShiftEven(uint32_t value, unsigned shift) {
   const uint32_t quotient = value >> shift;
   const uint32_t halfway = uint32_t{1} << (shift - 1);
   const uint32_t remainder = value & ((halfway << 1) - 1);
-  return quotient + (remainder > halfway ||
-                     (remainder == halfway && (quotient & 1)));
+  return quotient +
+         (remainder > halfway || (remainder == halfway && (quotient & 1)));
 }
 
 // Native transfers use the caller's original bytes directly. Only v2 needs
@@ -79,10 +80,12 @@ inline void encodeInto(const float *src, size_t count, uint16_t *dst,
     const uint32_t significand = (bits & 0x7fffff) | 0x800000;
     uint32_t magnitude = 0;
     if (exp == 128)
-      throw std::domain_error("non-finite activation at element " + std::to_string(i));
+      throw std::domain_error("non-finite activation at element " +
+                              std::to_string(i));
     if (exp >= -14) {
-      if (exp > 15 || (magnitude = ((exp + 14) << 10) +
-                                     roundShiftEven(significand, 13)) >= 0x7c00)
+      // The rounded significand includes its implicit leading 1.
+      magnitude = ((exp + 14) << 10) + roundShiftEven(significand, 13);
+      if (magnitude >= 0x7c00)
         throw std::overflow_error("activation overflows binary16 at element " +
                                   std::to_string(i));
     } else if (exp >= -25) {
@@ -101,7 +104,8 @@ inline void decodeInto(const uint16_t *src, size_t count, float *dst,
     int exp = (src[i] >> 10) & 31;
     uint32_t fraction = src[i] & 1023;
     if (exp == 31)
-      throw std::domain_error("non-finite wire activation at element " + std::to_string(i));
+      throw std::domain_error("non-finite wire activation at element " +
+                              std::to_string(i));
     if (exp == 0 && fraction != 0) {
       exp = 1;
       while (!(fraction & 1024)) {
@@ -110,8 +114,10 @@ inline void decodeInto(const uint16_t *src, size_t count, float *dst,
       }
       fraction &= 1023;
     }
-    const uint32_t bits = (src[i] & 0x7fff) == 0 ? sign :
-        sign | (uint32_t(exp + 112) << 23) | (fraction << 13);
+    const uint32_t bits =
+        (src[i] & 0x7fff) == 0
+            ? sign
+            : sign | (uint32_t(exp + 112) << 23) | (fraction << 13);
     std::memcpy(dst + i, &bits, sizeof(bits));
   }
 }

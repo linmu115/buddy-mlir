@@ -111,8 +111,14 @@ set_tests_properties(buddy-pipeline-moe-stage-export PROPERTIES
 # Layer 1B & 1C: MPI protocol & stage-chain unit tests (skipped if no MPI)
 # ------------------------------------------------------------------------------
 set(_BUDDY_PIPELINE_PROTOCOL_TESTS
+  buddy-pipeline-protocol-bad-v2-version
+  buddy-pipeline-protocol-bad-v2-payload
+  buddy-pipeline-protocol-bad-v2-overflow
+  buddy-pipeline-protocol-bad-v2-nonfinite
   buddy-pipeline-protocol-bad-short-header
   buddy-pipeline-protocol-bad-long-header
+  buddy-pipeline-protocol-wire-round-trip
+  buddy-pipeline-protocol-explicit-f16
   buddy-pipeline-protocol-normal
   buddy-pipeline-protocol-forward3
   buddy-pipeline-protocol-bad-duplicate-step
@@ -157,6 +163,27 @@ if(_BUDDY_PIPELINE_HAVE_MPI)
   set(_BUDDY_PIPELINE_PROTOCOL_WORK_DIR
     "${CMAKE_CURRENT_BINARY_DIR}/protocol-work")
 
+  foreach(mode IN ITEMS version payload overflow nonfinite)
+    if(mode STREQUAL "version")
+      set(detail "header version mismatch")
+    elseif(mode STREQUAL "payload")
+      set(detail "payload element count mismatch")
+    elseif(mode STREQUAL "overflow")
+      set(detail "activation overflows binary16 at element 17")
+    else()
+      set(detail "non-finite activation at element 17")
+    endif()
+    add_test(NAME buddy-pipeline-protocol-bad-v2-${mode}
+      COMMAND "${Python3_EXECUTABLE}" "${_BUDDY_PIPELINE_PROTOCOL_RUNNER}"
+        --mpiexec "${MPIEXEC_EXECUTABLE}"
+        "--numproc-flag=${_BUDDY_PIPELINE_MPI_NUMPROC_FLAG}"
+        --ranks 2 --binary "$<TARGET_FILE:buddy-pipeline-protocol-test>"
+        --mode "bad-v2-${mode}" --timeout 60 --expect-fail
+        --expect-output "${detail}"
+        --expect-output "expected={version=2, step=1, pos=5, rows=1}"
+        --counter-file "${_BUDDY_PIPELINE_PROTOCOL_WORK_DIR}/bad-v2-${mode}.counter"
+        --expect-compute-calls 0 --expect-prefill-calls 0 --expect-decode-calls 0)
+  endforeach()
   foreach(mode IN ITEMS bad-short-header bad-long-header)
     add_test(NAME buddy-pipeline-protocol-${mode}
       COMMAND "${Python3_EXECUTABLE}" "${_BUDDY_PIPELINE_PROTOCOL_RUNNER}"
@@ -168,6 +195,25 @@ if(_BUDDY_PIPELINE_HAVE_MPI)
         --counter-file "${_BUDDY_PIPELINE_PROTOCOL_WORK_DIR}/${mode}.counter"
         --expect-compute-calls 0 --expect-prefill-calls 0 --expect-decode-calls 0)
   endforeach()
+  add_test(NAME buddy-pipeline-protocol-wire-round-trip
+    COMMAND "${Python3_EXECUTABLE}" "${_BUDDY_PIPELINE_PROTOCOL_RUNNER}"
+      --mpiexec "${MPIEXEC_EXECUTABLE}"
+      "--numproc-flag=${_BUDDY_PIPELINE_MPI_NUMPROC_FLAG}"
+      --ranks 2
+      --binary "$<TARGET_FILE:buddy-pipeline-protocol-test>"
+      --mode wire-round-trip
+      --timeout 60
+  )
+  add_test(NAME buddy-pipeline-protocol-explicit-f16
+    COMMAND "${Python3_EXECUTABLE}" "${_BUDDY_PIPELINE_PROTOCOL_RUNNER}"
+      --mpiexec "${MPIEXEC_EXECUTABLE}"
+      "--numproc-flag=${_BUDDY_PIPELINE_MPI_NUMPROC_FLAG}"
+      --ranks 2
+      --binary "$<TARGET_FILE:buddy-pipeline-protocol-test>"
+      --mode explicit-f16
+      --timeout 60
+      --expect-output "PASS normal-2rank"
+  )
   add_test(NAME buddy-pipeline-protocol-normal
     COMMAND "${Python3_EXECUTABLE}" "${_BUDDY_PIPELINE_PROTOCOL_RUNNER}"
       --mpiexec "${MPIEXEC_EXECUTABLE}"

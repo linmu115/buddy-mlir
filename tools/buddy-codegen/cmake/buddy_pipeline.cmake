@@ -116,10 +116,24 @@ function(buddy_add_pipeline_stages)
   set(${_PP_VAR_RUNNER_LIB} "" CACHE FILEPATH
     "Optional pre-built target ${_PP_NAME}_pipeline_runner.so for IS_RVV_CROSSCOMPILE")
 
+  set(_PP_WIRE_ARGS)
+  foreach(_option IN ITEMS WIRE_DTYPE TRANSPORT)
+    set(_var "${_PP_VAR_PREFIX}_PIPELINE_${_option}")
+    set(${_var} "" CACHE STRING "Optional pipeline ${_option} manifest attribute")
+    if(NOT "${${_var}}" STREQUAL "")
+      string(TOLOWER "${_option}" _flag)
+      string(REPLACE "_" "-" _flag "${_flag}")
+      list(APPEND _PP_WIRE_ARGS "--pp-${_flag}" "${${_var}}")
+    endif()
+  endforeach()
   set(_PP_STAGE_DIRS "${${_PP_VAR_STAGE_DIRS}}")
   if(NOT _PP_STAGE_DIRS)
     return()
   endif()
+
+  # A policy change must regenerate existing manifests with Make as well as Ninja.
+  set(_PP_POLICY_STAMP "${CMAKE_CURRENT_BINARY_DIR}/${_PP_NAME}_pipeline_policy.txt")
+  file(GENERATE OUTPUT "${_PP_POLICY_STAMP}" CONTENT "${_PP_WIRE_ARGS}\n")
 
   set(_PP_EMBED_PAYLOAD "${${_PP_VAR_EMBED_PAYLOAD}}")
   set(_PP_OUTPUT_DIR "${${_PP_VAR_OUTPUT_DIR}}")
@@ -718,9 +732,11 @@ function(buddy_add_pipeline_stages)
         ${_PP_DEP_MANIFEST_ARGS}
         --runner-library "${_PP_RUNNER_NAME}"
         ${_PP_VERSION_ARGS}
+        ${_PP_WIRE_ARGS}
         -o "${_PP_MANIFEST}"
       DEPENDS
         "${_PP_GEN_MANIFEST_SCRIPT}"
+        "${_PP_POLICY_STAMP}"
         "${_PP_CONFIG}"
       COMMENT "[${_PP_NAME}_pipeline] stage${_PP_RANK}: generating RHAL manifest"
       VERBATIM

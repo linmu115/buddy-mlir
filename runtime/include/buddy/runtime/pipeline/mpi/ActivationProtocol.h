@@ -74,24 +74,25 @@ inline std::string formatActivationHeader(const ActivationHeader &header) {
   return os.str();
 }
 
-inline ActivationHeader makeActivationHeader(int step, int promptRows,
-                                             int context) {
+inline ActivationHeader
+makeActivationHeader(int step, int promptRows, int context,
+                     int version = kActivationProtocolVersion) {
   if (context <= 0)
     throw std::invalid_argument("activation context must be positive");
   if (step < 0)
     throw std::invalid_argument("activation step must be non-negative");
   if (step == 0)
-    return ActivationHeader{kActivationProtocolVersion, 0, -1, context};
+    return ActivationHeader{version, 0, -1, context};
   const int64_t pos64 = static_cast<int64_t>(promptRows) + step - 1;
   if (pos64 < 0 || pos64 >= static_cast<int64_t>(context))
     throw std::invalid_argument("decode pos out of context range");
-  return ActivationHeader{kActivationProtocolVersion,
-                          static_cast<int32_t>(step),
+  return ActivationHeader{version, static_cast<int32_t>(step),
                           static_cast<int32_t>(pos64), 1};
 }
 
-inline ActivationHeader makeChunkPrefillHeader(int step, int pos,
-                                               int prefillChunk, int context) {
+inline ActivationHeader
+makeChunkPrefillHeader(int step, int pos, int prefillChunk, int context,
+                       int version = kActivationProtocolVersion) {
   if (context <= 0)
     throw std::invalid_argument("activation context must be positive");
   if (prefillChunk <= 0 || prefillChunk > context)
@@ -101,30 +102,29 @@ inline ActivationHeader makeChunkPrefillHeader(int step, int pos,
     throw std::invalid_argument("activation step must be non-negative");
   if (pos < 0 || pos >= context)
     throw std::invalid_argument("prefill chunk pos out of context range");
-  return ActivationHeader{kActivationProtocolVersion,
-                          static_cast<int32_t>(step),
+  return ActivationHeader{version, static_cast<int32_t>(step),
                           static_cast<int32_t>(pos),
                           static_cast<int32_t>(prefillChunk)};
 }
 
-inline ActivationHeader makeChunkDecodeHeader(int step, int pos, int context) {
+inline ActivationHeader
+makeChunkDecodeHeader(int step, int pos, int context,
+                      int version = kActivationProtocolVersion) {
   if (context <= 0)
     throw std::invalid_argument("activation context must be positive");
   if (step < 0)
     throw std::invalid_argument("activation step must be non-negative");
   if (pos < 0 || pos >= context)
     throw std::invalid_argument("decode pos out of context range");
-  return ActivationHeader{kActivationProtocolVersion,
-                          static_cast<int32_t>(step),
+  return ActivationHeader{version, static_cast<int32_t>(step),
                           static_cast<int32_t>(pos), 1};
 }
 
 class ActivationProtocol {
 protected:
-  ActivationProtocol(const StageConfig &config, MPI_Comm comm)
+  ActivationProtocol(const StageConfig &config, MPI_Comm comm, int version)
       : width(config.activationWidth), context(config.context),
-        prefillChunk(config.prefillChunk),
-        comm(comm) {
+        prefillChunk(config.prefillChunk), version(version), comm(comm) {
     if (width <= 0 || context <= 0)
       throw std::invalid_argument("invalid activation width or context");
     if (prefillChunk < 0 || prefillChunk > context)
@@ -137,10 +137,10 @@ protected:
   }
 
   int validateReceived(const ActivationHeader &received,
-                       const ActivationHeader &expected, size_t capacityElements,
-                       int peer, int source) const {
+                       const ActivationHeader &expected,
+                       size_t capacityElements, int peer, int source) const {
     std::string reason;
-    if (received.version != kActivationProtocolVersion)
+    if (received.version != expected.version)
       abortProtocol(peer, source, expected, &received,
                     "header version mismatch");
     if (received.step != expected.step)
@@ -168,8 +168,8 @@ protected:
 
   bool validateHeaderInvariants(const ActivationHeader &header,
                                 std::string &reason) const {
-    if (header.version != kActivationProtocolVersion) {
-      reason = "version must be " + std::to_string(kActivationProtocolVersion);
+    if (header.version != version) {
+      reason = "version must be " + std::to_string(version);
       return false;
     }
     if (header.step < 0) {
@@ -178,8 +178,8 @@ protected:
     }
     if (prefillChunk > 0) {
       if (header.pos < 0 || header.pos >= context) {
-        reason = "chunked pos must satisfy 0 <= pos < " +
-                 std::to_string(context);
+        reason =
+            "chunked pos must satisfy 0 <= pos < " + std::to_string(context);
         return false;
       }
       if (header.rows != prefillChunk && header.rows != 1) {
@@ -195,8 +195,8 @@ protected:
         return false;
       }
       if (header.rows != context) {
-        reason = "prefill rows must equal context (" + std::to_string(context) +
-                 ")";
+        reason =
+            "prefill rows must equal context (" + std::to_string(context) + ")";
         return false;
       }
       return true;
@@ -213,7 +213,8 @@ protected:
   }
 
   bool computeElementCount(int32_t rows, int &outElements) const {
-    return buddy::runtime::pipeline::computeElementCount(rows, width, outElements);
+    return buddy::runtime::pipeline::computeElementCount(rows, width,
+                                                         outElements);
   }
 
   int checkedElementCount(int32_t rows) const {
@@ -249,6 +250,7 @@ protected:
   int width;
   int context;
   int prefillChunk;
+  int version;
   MPI_Comm comm;
   int rank = 0;
 };

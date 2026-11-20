@@ -76,6 +76,26 @@ void expectParseFailure(const Attrs &attrs,
   throw std::runtime_error(caseName + ": expected parseStageV1 to throw");
 }
 
+void testWirePolicy() {
+  using namespace buddy::runtime;
+  auto attrs = makeValidStageAttrs();
+  auto stage = parseStageV1(attrs);
+  if (stage.wireDtype != pipeline::WireDtype::Native ||
+      stage.transport != pipeline::Transport::Blocking)
+    throw std::runtime_error("incorrect default wire policy");
+  attrs["pp_wire_dtype"] = "f16";
+  attrs["pp_transport"] = "async";
+  stage = parseStageV1(attrs);
+  if (stage.wireDtype != pipeline::WireDtype::F16 ||
+      stage.transport != pipeline::Transport::Async)
+    throw std::runtime_error("incorrect explicit wire policy");
+  attrs["pp_wire_dtype"] = "bf16";
+  expectParseFailure(attrs, {"pp_wire_dtype"}, "invalid wire");
+  attrs["pp_wire_dtype"] = "native";
+  attrs["pp_transport"] = "";
+  expectParseFailure(attrs, {"pp_transport"}, "invalid transport");
+}
+
 void testValidStages() {
   struct ValidCase {
     const char *name;
@@ -276,6 +296,7 @@ void testMalformedIntegers() {
 
 int main() {
   try {
+    testWirePolicy();
     testValidStages();
     testTokenizerAndStopTokenIds();
     testMissingKeys();

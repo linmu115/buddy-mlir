@@ -17,6 +17,8 @@
 #ifndef BUDDY_RUNTIME_PIPELINE_STAGEMANIFEST_H
 #define BUDDY_RUNTIME_PIPELINE_STAGEMANIFEST_H
 
+#include "buddy/runtime/pipeline/ActivationWire.h"
+
 #include <charconv>
 #include <stdexcept>
 #include <string>
@@ -34,6 +36,8 @@ struct StageManifest {
   int prefillChunk = 0;
   std::string tokenizer = "deepseek_r1";
   std::vector<int> stopTokenIds;
+  pipeline::WireDtype wireDtype = pipeline::WireDtype::Native;
+  pipeline::Transport transport = pipeline::Transport::Blocking;
 };
 
 inline StageManifest
@@ -110,6 +114,18 @@ parseStageV1(const std::unordered_map<std::string, std::string> &moduleAttrs) {
     throw std::runtime_error("pp_activation_width must be positive");
   if (stage.prefillChunk < 0)
     throw std::runtime_error("pp_prefill_chunk must be non-negative");
+  if (auto it = moduleAttrs.find("pp_wire_dtype"); it != moduleAttrs.end()) {
+    if (it->second == "f16")
+      stage.wireDtype = pipeline::WireDtype::F16;
+    else if (it->second != "native")
+      throw std::runtime_error("pp_wire_dtype must be native or f16");
+  }
+  if (auto it = moduleAttrs.find("pp_transport"); it != moduleAttrs.end()) {
+    if (it->second == "async")
+      stage.transport = pipeline::Transport::Async;
+    else if (it->second != "blocking")
+      throw std::runtime_error("pp_transport must be blocking or async");
+  }
   return stage;
 }
 

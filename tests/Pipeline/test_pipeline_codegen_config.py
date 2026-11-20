@@ -180,6 +180,21 @@ class TestGenManifestStageAttrs(unittest.TestCase):
         }
         return cfg
 
+    def test_optional_wire_policy(self):
+        cfg = self._stage_cfg()
+        default = gen_manifest.gen_manifest(cfg)
+        self.assertNotIn("pp_wire_dtype", default)
+        self.assertNotIn("pp_transport", default)
+        for dtype in ("native", "f16"):
+            for transport in ("blocking", "async"):
+                explicit = gen_manifest.gen_manifest(
+                    cfg, wire_dtype=dtype, transport=transport
+                )
+                self.assertIn(f'pp_wire_dtype = "{dtype}"', explicit)
+                self.assertIn(f'pp_transport = "{transport}"', explicit)
+        with self.assertRaisesRegex(ValueError, "pp_wire_dtype"):
+            gen_manifest.gen_manifest(cfg, wire_dtype="fp8")
+
     def test_emits_pp_tokenizer_and_stop_token_ids(self):
         cfg = self._stage_cfg(eos_token_id=[151645, 151643])
         text = gen_manifest.gen_manifest(cfg)
