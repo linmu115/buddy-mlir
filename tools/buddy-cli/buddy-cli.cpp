@@ -377,7 +377,9 @@ int main(int argc, char **argv) {
       ->group("Inference");
   app.add_option("--image", imagePath, "Image file for vision-language models")
       ->group("Inference");
-  app.add_option("--max-tokens", maxTokens, "Max generated tokens")
+  app.add_option(
+         "--max-tokens", maxTokens,
+         "Max total sequence length (prompt + decode steps; 0 = no limit)")
       ->group("Inference")
       ->capture_default_str();
   app.add_option("--batch-size", batchSize,

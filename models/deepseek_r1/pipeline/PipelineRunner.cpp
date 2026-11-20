@@ -301,8 +301,9 @@ void PipelineRunner::run(const RunConfig &cfg) {
     pipeline::DistributedGenerateOptions genOpts;
     genOpts.prompt = cfg.prompt;
     genOpts.vocabPath = m.vocabPath;
-    genOpts.maxNewTokens = cfg.maxNewTokens;
-    genOpts.allowZeroMaxNewTokens = true;
+    genOpts.tokenLimitMode = pipeline::TokenLimitMode::TotalSequenceLength;
+    genOpts.maxTokens = cfg.maxNewTokens;
+    genOpts.allowZeroTokenLimit = true;
     genOpts.samplerConfig = cfg.samplerConfig;
     genOpts.streamJsonl = cfg.streamJsonl;
     // Test-only hooks (do not change public RunConfig).

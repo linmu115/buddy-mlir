@@ -58,12 +58,35 @@ struct StageCheckOptions {
   bool requireModelName = false;
 };
 
+enum class TokenLimitMode {
+  /// Match whole-model TextGeneration.cpp (`--max-tokens N`):
+  /// prefill always emits 1 token (unless EOS), followed by
+  /// `max(0, maxTokens - promptRows)` decode steps, producing up to
+  /// `max(1, maxTokens - promptRows + 1)` tokens for `1 <= N <= context`.
+  /// `0` maps to the remaining stage context (`context - promptRows + 1`) when
+  /// `allowZeroTokenLimit` is true. Values `> context` are rejected because
+  /// pipeline stages use a fixed-size KV cache without overflow eviction.
+  TotalSequenceLength,
+  /// Direct upper bound on newly generated tokens (including the first token
+  /// from prefill). Used by the standalone `pipeline` example
+  /// (`MAX_NEW_TOKENS`).
+  NewTokens,
+};
+
 struct DistributedGenerateOptions {
   std::string prompt;
   std::string vocabPath;
-  /// 0 maps to the context-allowed limit when allowZeroMaxNewTokens is true.
-  int maxNewTokens = 0;
-  bool allowZeroMaxNewTokens = true;
+  /// Semantics applied to `maxTokens` when rank 0 resolves the generated-token
+  /// count before broadcasting to all ranks.
+  TokenLimitMode tokenLimitMode = TokenLimitMode::TotalSequenceLength;
+  /// Token limit interpreted according to `tokenLimitMode`:
+  /// - TotalSequenceLength: total sequence length N (matching whole-model
+  ///   `--max-tokens N`); 0 fills remaining stage context when
+  ///   `allowZeroTokenLimit` is true.
+  /// - NewTokens: exact upper bound on newly generated tokens; 0 fills
+  ///   remaining stage context when `allowZeroTokenLimit` is true.
+  int maxTokens = 0;
+  bool allowZeroTokenLimit = true;
   buddy::SamplerConfig samplerConfig{};
   /// Optional output file for sampled-row FP16 logits (empty or "-" disables).
   std::string logitsDumpPath;
@@ -75,6 +98,54 @@ struct DistributedGenerateOptions {
   /// "<traceStagePrefix>.rank<rank>.log".
   std::string traceStagePrefix;
 };
+
+/// Convert the user-facing token limit into the internal generated-token count
+/// (including the first token sampled from prefill) on rank 0 before broadcast.
+inline int resolveGeneratedTokenLimit(int maxTokens, TokenLimitMode mode,
+                                      bool allowZero, int promptRows,
+                                      int context) {
+  if (context <= 0)
+    throw std::runtime_error("field context must be positive (got " +
+                             std::to_string(context) + ")");
+  if (promptRows <= 0 || promptRows > context)
+    throw std::runtime_error("promptRows (" + std::to_string(promptRows) +
+                             ") out of context range (1.." +
+                             std::to_string(context) + ")");
+  if (maxTokens < 0)
+    throw std::runtime_error("field maxTokens must be non-negative (got " +
+                             std::to_string(maxTokens) + ")");
+
+  const int maxAllowedNewTokens = context - promptRows + 1;
+  if (maxTokens == 0) {
+    if (!allowZero)
+      throw std::runtime_error("generation length must be positive");
+    return maxAllowedNewTokens;
+  }
+
+  if (mode == TokenLimitMode::NewTokens) {
+    if (maxTokens > maxAllowedNewTokens)
+      throw std::runtime_error(
+          "field maxNewTokens (" + std::to_string(maxTokens) +
+          ") exceeds remaining context limit (" +
+          std::to_string(maxAllowedNewTokens) +
+          ", context=" + std::to_string(context) +
+          ", promptRows=" + std::to_string(promptRows) + ")");
+    return maxTokens;
+  }
+
+  // TokenLimitMode::TotalSequenceLength (matches runtime/llm/TextGeneration.cpp):
+  //   1 <= N <= promptRows     -> 1 generated token (prefill only, 0 decode steps)
+  //   promptRows < N <= context -> N - promptRows + 1 generated tokens
+  //   N > context              -> exceeds static pipeline KV cache context.
+  if (maxTokens > context)
+    throw std::runtime_error(
+        "field maxTokens (" + std::to_string(maxTokens) +
+        ") exceeds pipeline stage context (" + std::to_string(context) +
+        ", promptRows=" + std::to_string(promptRows) + ")");
+  if (maxTokens <= promptRows)
+    return 1;
+  return maxTokens - promptRows + 1;
+}
 
 inline void checkAllStages(MPI_Comm comm, int rank, int ranks,
                            const StageConfig &config,
@@ -288,9 +359,9 @@ inline void generateDistributed(const DistributedGenerateOptions &opts,
   const bool first = (rank == 0);
   const bool last = (rank == ranks - 1);
 
-  if (opts.maxNewTokens < 0)
-    throw std::runtime_error("field maxNewTokens must be non-negative (got " +
-                             std::to_string(opts.maxNewTokens) + ")");
+  if (opts.maxTokens < 0)
+    throw std::runtime_error("field maxTokens must be non-negative (got " +
+                             std::to_string(opts.maxTokens) + ")");
   if (opts.testEosAtStep < 0)
     throw std::runtime_error("field testEosAtStep must be non-negative (got " +
                              std::to_string(opts.testEosAtStep) + ")");
@@ -298,7 +369,7 @@ inline void generateDistributed(const DistributedGenerateOptions &opts,
   BlockingActivation activation(config, comm);
 
   int promptRows = 0;
-  int resolvedMaxNewTokens = 0;
+  int resolvedNewTokens = 0;
   std::vector<int64_t> tokenInput;
   if (first) {
     if (opts.vocabPath.empty())
@@ -323,34 +394,23 @@ inline void generateDistributed(const DistributedGenerateOptions &opts,
     promptRows = static_cast<int>(text.getTokenCnt());
     tokenInput.assign(text.getData(), text.getData() + config.context);
 
-    const int maxAllowed = config.context - promptRows + 1;
-    if (opts.maxNewTokens == 0) {
-      if (!opts.allowZeroMaxNewTokens)
-        throw std::runtime_error("generation length must be positive");
-      resolvedMaxNewTokens = maxAllowed;
-    } else if (opts.maxNewTokens > maxAllowed) {
-      throw std::runtime_error(
-          "field maxNewTokens (" + std::to_string(opts.maxNewTokens) +
-          ") exceeds remaining context limit (" + std::to_string(maxAllowed) +
-          ", context=" + std::to_string(config.context) +
-          ", promptRows=" + std::to_string(promptRows) + ")");
-    } else {
-      resolvedMaxNewTokens = opts.maxNewTokens;
-    }
+    resolvedNewTokens = resolveGeneratedTokenLimit(
+        opts.maxTokens, opts.tokenLimitMode, opts.allowZeroTokenLimit,
+        promptRows, config.context);
   }
 
-  std::array<int, 2> broadcastMeta{promptRows, resolvedMaxNewTokens};
+  std::array<int, 2> broadcastMeta{promptRows, resolvedNewTokens};
   mpiCheck(MPI_Bcast(broadcastMeta.data(), 2, MPI_INT, 0, comm));
   promptRows = broadcastMeta[0];
-  resolvedMaxNewTokens = broadcastMeta[1];
+  resolvedNewTokens = broadcastMeta[1];
 
   if (promptRows <= 0 || promptRows > config.context)
     throw std::runtime_error("broadcast promptRows out of context range (" +
                              std::to_string(promptRows) + ")");
   const int maxAllowed = config.context - promptRows + 1;
-  if (resolvedMaxNewTokens <= 0 || resolvedMaxNewTokens > maxAllowed)
+  if (resolvedNewTokens <= 0 || resolvedNewTokens > maxAllowed)
     throw std::runtime_error("generation length (" +
-                             std::to_string(resolvedMaxNewTokens) +
+                             std::to_string(resolvedNewTokens) +
                              ") exceeds remaining context limit (" +
                              std::to_string(maxAllowed) + ")");
 
@@ -367,7 +427,7 @@ inline void generateDistributed(const DistributedGenerateOptions &opts,
 
   buddy::Sampler sampler(opts.samplerConfig);
   std::vector<int> generated;
-  generated.reserve(static_cast<size_t>(resolvedMaxNewTokens));
+  generated.reserve(static_cast<size_t>(resolvedNewTokens));
 
   auto finishStepOnLast = [&](const void *rawOut, int genStep, int &token,
                               int &stop) {
@@ -512,7 +572,7 @@ inline void generateDistributed(const DistributedGenerateOptions &opts,
 
     if (!stop) {
       int64_t nextToken = token;
-      for (int genStep = 1; genStep < resolvedMaxNewTokens; ++genStep) {
+      for (int genStep = 1; genStep < resolvedNewTokens; ++genStep) {
         const int pos = n0 + genStep - 1;
         const ActivationHeader expected =
             makeChunkDecodeHeader(frameStep, pos, config.context);
@@ -569,7 +629,7 @@ inline void generateDistributed(const DistributedGenerateOptions &opts,
       }
     }
 
-    for (int step = 0; step < resolvedMaxNewTokens; ++step) {
+    for (int step = 0; step < resolvedNewTokens; ++step) {
       const ActivationHeader expected =
           makeActivationHeader(step, promptRows, config.context);
       ActivationHeader header = expected;

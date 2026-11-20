@@ -267,6 +267,101 @@ void runFieldMismatch(int rank, int ranks) {
     std::cout << "PASS stage-chain field-mismatch\n";
 }
 
+void runTokenLimit(int rank, int ranks) {
+  if (ranks != 1)
+    throw std::runtime_error("token-limit requires 1 rank");
+  using buddy::runtime::pipeline::resolveGeneratedTokenLimit;
+  using buddy::runtime::pipeline::TokenLimitMode;
+
+  auto expectEq = [](int actual, int expected, const char *label) {
+    if (actual != expected) {
+      throw std::runtime_error(std::string(label) + ": expected " +
+                               std::to_string(expected) + ", got " +
+                               std::to_string(actual));
+    }
+  };
+  auto expectThrow = [](int maxTokens, TokenLimitMode mode, bool allowZero,
+                        int promptRows, int context,
+                        const std::string &expectedSubstr, const char *label) {
+    try {
+      (void)resolveGeneratedTokenLimit(maxTokens, mode, allowZero, promptRows,
+                                       context);
+    } catch (const std::runtime_error &err) {
+      const std::string msg = err.what();
+      if (msg.find(expectedSubstr) == std::string::npos) {
+        throw std::runtime_error(std::string(label) + ": diagnostic '" + msg +
+                                 "' did not contain '" + expectedSubstr + "'");
+      }
+      return;
+    }
+    throw std::runtime_error(std::string(label) + ": expected throw");
+  };
+
+  // TotalSequenceLength mode (matches runtime/llm/TextGeneration.cpp):
+  //   1 <= N <= P   -> 1 generated token (prefill only)
+  //   P < N <= C    -> N - P + 1 generated tokens
+  //   N == 0        -> C - P + 1 (if allowZero)
+  //   N > C         -> error (static pipeline KV cache)
+  constexpr int kCtx = 64;
+  expectEq(resolveGeneratedTokenLimit(56, TokenLimitMode::TotalSequenceLength,
+                                      true, 25, kCtx),
+           32, "total-m1-56");
+  expectEq(resolveGeneratedTokenLimit(26, TokenLimitMode::TotalSequenceLength,
+                                      true, 25, kCtx),
+           2, "total-p-plus-1");
+  expectEq(resolveGeneratedTokenLimit(25, TokenLimitMode::TotalSequenceLength,
+                                      true, 25, kCtx),
+           1, "total-eq-p");
+  expectEq(resolveGeneratedTokenLimit(10, TokenLimitMode::TotalSequenceLength,
+                                      true, 25, kCtx),
+           1, "total-lt-p");
+  expectEq(resolveGeneratedTokenLimit(1, TokenLimitMode::TotalSequenceLength,
+                                      true, 25, kCtx),
+           1, "total-1");
+  expectEq(resolveGeneratedTokenLimit(64, TokenLimitMode::TotalSequenceLength,
+                                      true, 25, kCtx),
+           40, "total-eq-ctx");
+  expectEq(resolveGeneratedTokenLimit(0, TokenLimitMode::TotalSequenceLength,
+                                      true, 25, kCtx),
+           40, "total-zero");
+  expectEq(resolveGeneratedTokenLimit(64, TokenLimitMode::TotalSequenceLength,
+                                      true, 64, kCtx),
+           1, "total-p-eq-ctx");
+  expectEq(resolveGeneratedTokenLimit(0, TokenLimitMode::TotalSequenceLength,
+                                      true, 64, kCtx),
+           1, "total-p-eq-ctx-zero");
+  expectEq(resolveGeneratedTokenLimit(10, TokenLimitMode::TotalSequenceLength,
+                                      true, 7, kCtx),
+           4, "total-short-prompt");
+
+  expectThrow(65, TokenLimitMode::TotalSequenceLength, true, 25, kCtx,
+              "exceeds pipeline stage context", "total-gt-ctx");
+  expectThrow(4096, TokenLimitMode::TotalSequenceLength, true, 25, kCtx,
+              "exceeds pipeline stage context", "total-default-gt-ctx");
+  expectThrow(-1, TokenLimitMode::TotalSequenceLength, true, 25, kCtx,
+              "must be non-negative", "total-negative");
+  expectThrow(0, TokenLimitMode::TotalSequenceLength, false, 25, kCtx,
+              "generation length must be positive", "total-zero-disallowed");
+
+  // NewTokens mode (used by standalone pipeline example):
+  expectEq(resolveGeneratedTokenLimit(32, TokenLimitMode::NewTokens, false, 25,
+                                      kCtx),
+           32, "new-32");
+  expectEq(resolveGeneratedTokenLimit(40, TokenLimitMode::NewTokens, false, 25,
+                                      kCtx),
+           40, "new-max-allowed");
+  expectEq(resolveGeneratedTokenLimit(0, TokenLimitMode::NewTokens, true, 25,
+                                      kCtx),
+           40, "new-zero-allowed");
+  expectThrow(41, TokenLimitMode::NewTokens, false, 25, kCtx,
+              "exceeds remaining context limit", "new-gt-max-allowed");
+  expectThrow(0, TokenLimitMode::NewTokens, false, 25, kCtx,
+              "generation length must be positive", "new-zero-disallowed");
+
+  if (rank == 0)
+    std::cout << "PASS stage-chain token-limit\n";
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -297,6 +392,8 @@ int main(int argc, char **argv) {
       runModelNameMismatch(rank, ranks);
     else if (mode == "field-mismatch")
       runFieldMismatch(rank, ranks);
+    else if (mode == "token-limit")
+      runTokenLimit(rank, ranks);
     else
       throw std::runtime_error("unknown mode: " + mode);
   } catch (const std::exception &err) {

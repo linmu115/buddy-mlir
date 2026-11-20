@@ -400,7 +400,7 @@ PROMPT='Explain step by step how to add the integers from 1 to 100.'
   --stage-model "$PKG_DIR/stage0.rax" \
   --stage-model "$PKG_DIR/stage1.rax" \
   --prompt "$PROMPT" \
-  --max-tokens 32
+  --max-tokens 56
 ```
 
 Observed `stdout` on x86_64 WSL (`reports/pp-docs/05-run-and-verify.log`):
@@ -413,10 +413,17 @@ For manifest-only bundles, pass the per-stage manifest paths instead (for
 example, `--stage-model "$PKG_MO/stage0/stage0.rax" --stage-model "$PKG_MO/stage1/stage1.rax"`
 for 2 ranks, or 4 paths with `-n 4` for 4 ranks).
 
-In pipeline stage mode, `--max-tokens` specifies the number of **new** tokens to
-generate (unlike legacy single-process DeepSeek R1 where it caps total sequence
-length). Passing `--max-tokens 0` fills the remaining context
-(`context - prompt_tokens + 1`).
+In both whole-model (`--model`) and pipeline stage (`--stage-model`) modes,
+`--max-tokens N` specifies the **total sequence length** (prompt + decode
+steps): prefill always emits 1 token (unless EOS), followed by
+`max(0, N - prompt_tokens)` decode steps, producing up to
+`max(1, N - prompt_tokens + 1)` generated tokens for `1 <= N <= context`. For
+the 25-token reference prompt above, `--max-tokens 56` produces 32 generated
+tokens (`56 - 25 + 1 = 32`). Passing `--max-tokens 0` removes the user cap up
+to the stage context limit (`context - prompt_tokens + 1`). Values
+`N > context` are rejected in pipeline mode because pipeline stages use a
+fixed-size KV cache without overflow eviction (whereas whole-model mode performs
+sliding-window KV eviction via `handleKVCacheOverflow`).
 
 Measured single-node x86_64 WSL results (`reports/pp-docs/05-run-and-verify.log`,
 8-core host, context 64, 32 generated tokens, greedy):
@@ -505,7 +512,7 @@ traffic over the same 10GbE interface rather than a management NIC:
     --stage-model /opt/buddy/stages/stage0.rax \
     --stage-model /opt/buddy/stages/stage1.rax \
     --prompt 'Explain step by step how to add the integers from 1 to 100.' \
-    --max-tokens 32
+    --max-tokens 56
 ```
 
 For `N` nodes (e.g., 4 boards), list all `N` hosts in `hosts`, pass `-n N`, and
@@ -526,7 +533,7 @@ EOF
   --stage-model "$PKG_MO/stage0/stage0.rax" \
   --stage-model "$PKG_MO/stage1/stage1.rax" \
   --prompt 'Explain step by step how to add the integers from 1 to 100.' \
-  --max-tokens 32
+  --max-tokens 56
 ```
 
 ### 4. Rank-to-Host Placement Guidelines
@@ -627,7 +634,7 @@ BUDDY_PP_DUMP_LOGITS=stage-logits.f16 \
     --stage-model "$PKG_DIR/stage0.rax" \
     --stage-model "$PKG_DIR/stage1.rax" \
     --prompt 'Explain step by step how to add the integers from 1 to 100.' \
-    --max-tokens 32 \
+    --max-tokens 56 \
   > stage-out.json
 
 # Token ID comparison:

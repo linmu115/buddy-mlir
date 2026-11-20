@@ -58,7 +58,7 @@ private:
   void *handle;
 };
 
-void generate(int count, const std::string &prompt, const char *vocab,
+void generate(int maxNewTokens, const std::string &prompt, const char *vocab,
               const std::string &logitsFile, Stage &stage, int rank,
               int ranks) {
   buddy::runtime::pipeline::checkAllStages(MPI_COMM_WORLD, rank, ranks,
@@ -66,8 +66,12 @@ void generate(int count, const std::string &prompt, const char *vocab,
   buddy::runtime::pipeline::DistributedGenerateOptions opts;
   opts.prompt = prompt;
   opts.vocabPath = vocab ? vocab : "";
-  opts.maxNewTokens = count;
-  opts.allowZeroMaxNewTokens = false;
+  // This standalone example keeps MAX_NEW_TOKENS as a direct generated-token
+  // count (including the prefill token), distinct from `buddy-cli --max-tokens`
+  // which specifies total sequence length.
+  opts.tokenLimitMode = buddy::runtime::pipeline::TokenLimitMode::NewTokens;
+  opts.maxTokens = maxNewTokens;
+  opts.allowZeroTokenLimit = false;
   opts.samplerConfig = buddy::SamplerConfig{};
   opts.logitsDumpPath = logitsFile;
   buddy::runtime::pipeline::generateDistributed(opts, stage, MPI_COMM_WORLD,
@@ -85,8 +89,10 @@ int main(int argc, char **argv) {
     mpiCheck(MPI_Comm_rank(MPI_COMM_WORLD, &rank));
     mpiCheck(MPI_Comm_size(MPI_COMM_WORLD, &ranks));
     if (argc != 5 + ranks)
-      throw std::runtime_error("usage: pipeline VOCAB MAX_NEW_TOKENS PROMPT "
-                               "LOGITS_FILE_OR_DASH STAGE_DIR...");
+      throw std::runtime_error(
+          "usage: pipeline VOCAB MAX_NEW_TOKENS PROMPT "
+          "LOGITS_FILE_OR_DASH STAGE_DIR... "
+          "(MAX_NEW_TOKENS is the positive count of newly generated tokens)");
     {
       StageLibrary library(std::filesystem::absolute(argv[5 + rank]));
       auto stage = library.create(argv[5 + rank]);

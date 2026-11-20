@@ -94,6 +94,7 @@ set(_BUDDY_PIPELINE_CHAIN_TESTS
   buddy-pipeline-stage-chain-gap-2rank
   buddy-pipeline-stage-chain-model-name-mismatch
   buddy-pipeline-stage-chain-field-mismatch
+  buddy-pipeline-stage-chain-token-limit
 )
 
 if(_BUDDY_PIPELINE_HAVE_MPI)
@@ -316,6 +317,7 @@ if(_BUDDY_PIPELINE_HAVE_MPI)
   _add_stage_chain_test(buddy-pipeline-stage-chain-gap-2rank 2 gap-2rank)
   _add_stage_chain_test(buddy-pipeline-stage-chain-model-name-mismatch 2 model-name-mismatch)
   _add_stage_chain_test(buddy-pipeline-stage-chain-field-mismatch 2 field-mismatch)
+  _add_stage_chain_test(buddy-pipeline-stage-chain-token-limit 1 token-limit)
 else()
   message(STATUS
     "[pipeline-tests] MPI not found; MPI unit tests will be skipped in CTest.")
@@ -349,8 +351,10 @@ option(BUDDY_PIPELINE_E2E_EMBED_PAYLOAD
 set(BUDDY_PIPELINE_E2E_PROMPT
   "Explain step by step how to add the integers from 1 to 100." CACHE STRING
   "Prompt matching the reference logits in BUDDY_PIPELINE_VALIDATION_DIR")
-set(BUDDY_PIPELINE_E2E_MAX_TOKENS "32" CACHE STRING
-  "Number of generated tokens matching the reference logits")
+set(BUDDY_PIPELINE_E2E_MAX_TOKENS "56" CACHE STRING
+  "Total sequence length (--max-tokens) shared by whole-model and pipeline runs (56 yields 32 generated tokens for the 25-token reference prompt)")
+set(BUDDY_PIPELINE_E2E_WHOLE_MODEL_RAX "" CACHE FILEPATH
+  "Optional whole-model .rax package to verify exact token parity with the same --max-tokens")
 set(BUDDY_PIPELINE_E2E_VOCAB_SIZE "151936" CACHE STRING
   "Vocabulary size passed to check_result.py for logits comparison")
 
@@ -675,6 +679,15 @@ if(BUDDY_ENABLE_PIPELINE_E2E_TESTS)
       DEPENDS ${_PP_E2E_STAGE_OUTPUTS}
     )
 
+    set(_PP_E2E_WHOLE_MODEL_ARGS)
+    if(BUDDY_PIPELINE_E2E_WHOLE_MODEL_RAX)
+      if(NOT EXISTS "${BUDDY_PIPELINE_E2E_WHOLE_MODEL_RAX}")
+        message(FATAL_ERROR
+          "[pipeline-tests] BUDDY_PIPELINE_E2E_WHOLE_MODEL_RAX not found: ${BUDDY_PIPELINE_E2E_WHOLE_MODEL_RAX}")
+      endif()
+      set(_PP_E2E_WHOLE_MODEL_ARGS --whole-model "${BUDDY_PIPELINE_E2E_WHOLE_MODEL_RAX}")
+    endif()
+
     add_test(NAME buddy-pipeline-e2e-2stage-logits
       COMMAND "${Python3_EXECUTABLE}" "${_PP_E2E_RUNNER_SCRIPT}"
         logits
@@ -682,6 +695,7 @@ if(BUDDY_ENABLE_PIPELINE_E2E_TESTS)
         "--numproc-flag=${_BUDDY_PIPELINE_MPI_NUMPROC_FLAG}"
         --buddy-cli "$<TARGET_FILE:buddy-cli>"
         ${_PP_E2E_STAGE_RAX_ARGS}
+        ${_PP_E2E_WHOLE_MODEL_ARGS}
         --validation-dir "${BUDDY_PIPELINE_VALIDATION_DIR}"
         --check-result "${_PP_E2E_CHECK_RESULT_SCRIPT}"
         --prompt "${BUDDY_PIPELINE_E2E_PROMPT}"

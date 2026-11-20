@@ -24,7 +24,7 @@ def main():
             "--temperature",
             "0",
             "--max-tokens",
-            "64",
+            "56",
             "--stream-jsonl",
         ],
         stdout=subprocess.PIPE,
@@ -38,9 +38,9 @@ def main():
             tokens.append(event["token_id"])
         elif event["event"] == "done":
             done = True
-    if not done or len(tokens) < 32:
-        sys.exit(f"Incomplete baseline: {len(tokens)} sampled IDs, done={done}")
-    print(json.dumps({"prompt": PROMPT, "token_ids": tokens[:32]}))
+    if not done or len(tokens) != 32:
+        sys.exit(f"Unexpected baseline: {len(tokens)} sampled IDs (expected 32), done={done}")
+    print(json.dumps({"prompt": PROMPT, "token_ids": tokens}))
 
 
 if __name__ == "__main__":

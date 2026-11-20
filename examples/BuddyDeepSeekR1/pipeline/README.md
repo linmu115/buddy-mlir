@@ -90,5 +90,8 @@ version, and expected step/pos/rows (with `0 <= pos < context` for decode),
 probes the payload with `MPI_Probe` and `MPI_Get_count` to confirm
 `rows * activationWidth` elements fit in the allocated buffer, and passes the
 received `pos` to `decode`; any mismatch logs diagnostics and calls `MPI_Abort`.
-The fourth argument to the runner is a path for raw FP16 logits at the sampled
-positions. Pass `-` to disable the dump.
+The second argument (`MAX_NEW_TOKENS`, e.g. `32` above) is the positive number
+of newly generated tokens (including the first token from prefill), unlike
+`buddy-cli --max-tokens` which specifies total sequence length. The fourth
+argument to the runner is a path for raw FP16 logits at the sampled positions.
+Pass `-` to disable the dump.

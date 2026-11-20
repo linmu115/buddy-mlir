@@ -59,8 +59,13 @@ struct RunConfig {
   /// prompt-file runs.
   int promptLength = 0;
 
-  /// Upper bound on generated tokens. The first generated token comes from
-  /// prefill; subsequent tokens come from decode. 0 = no limit.
+  /// Value of CLI `--max-tokens`. In DeepSeek R1 whole-model (`runGeneration`)
+  /// and pipeline (`PipelineRunner`) modes this is a total sequence-length
+  /// limit (prompt + decode steps): prefill always emits 1 token (unless EOS),
+  /// followed by `max(0, maxNewTokens - promptTokens)` decode steps, producing
+  /// up to `max(1, maxNewTokens - promptTokens + 1)` generated tokens; 0 = no
+  /// limit (capped by stage context in pipeline mode). Some other model runners
+  /// interpret this field as a generated-token count.
   int maxNewTokens = 4096;
 
   /// Runtime batch size override. 0 means use the packaged model default.

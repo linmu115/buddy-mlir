@@ -17,6 +17,7 @@
 """End-to-end pipeline-parallel tests for buddy-cli --stage-model."""
 
 import argparse
+import json
 import os
 import shutil
 import subprocess
@@ -133,6 +134,54 @@ def run_logits_test(args: argparse.Namespace) -> int:
             if check_proc.stderr:
                 sys.stderr.write(check_proc.stderr)
             raise SystemExit(f"check_result.py failed against baseline {name}")
+
+    if args.whole_model:
+        whole_model = Path(args.whole_model)
+        if not whole_model.is_file():
+            raise SystemExit(f"whole-model .rax package not found: {whole_model}")
+        whole_cmd = [
+            args.buddy_cli,
+            "--model",
+            str(whole_model),
+            "--prompt",
+            args.prompt,
+            "--temperature",
+            "0",
+            "--max-tokens",
+            str(args.max_tokens),
+            "--stream-jsonl",
+        ]
+        whole_proc = run_cmd(whole_cmd, timeout=args.timeout, env=env)
+        if whole_proc.returncode != 0:
+            sys.stderr.write(
+                f"whole-model buddy-cli failed with exit code {whole_proc.returncode}\n"
+            )
+            if whole_proc.stdout:
+                sys.stderr.write(f"stdout:\n{whole_proc.stdout}\n")
+            if whole_proc.stderr:
+                sys.stderr.write(f"stderr:\n{whole_proc.stderr}\n")
+            return 1
+        whole_tokens: list[int] = []
+        done = False
+        for line in whole_proc.stdout.splitlines():
+            ev = json.loads(line)
+            if ev.get("event") == "token" and ev.get("token_id", -1) >= 0:
+                whole_tokens.append(int(ev["token_id"]))
+            elif ev.get("event") == "done":
+                done = True
+        if not done:
+            raise SystemExit("whole-model stream-jsonl output missing done event")
+        stage_data = json.loads(actual_json.read_text(encoding="utf-8"))
+        stage_tokens = [int(t) for t in stage_data.get("token_ids", [])]
+        if whole_tokens != stage_tokens:
+            raise SystemExit(
+                f"whole-model vs pipeline token mismatch for --max-tokens {args.max_tokens}: "
+                f"whole={len(whole_tokens)} tokens, stage={len(stage_tokens)} tokens"
+            )
+        print(
+            f"[whole-model] {len(stage_tokens)}/{len(whole_tokens)} sampled token IDs "
+            f"match with shared --max-tokens {args.max_tokens}"
+        )
 
     print("PASS pipeline e2e 2-stage bit-exact logits")
     return 0
@@ -281,6 +330,21 @@ def run_cli_errors_test(args: argparse.Namespace) -> int:
             ],
             "--max-tokens must be non-negative",
         ),
+        (
+            "max-tokens-exceeds-context",
+            2,
+            [
+                "--stage-model",
+                str(stage0),
+                "--stage-model",
+                str(stage1),
+                "--max-tokens",
+                "4096",
+                "--prompt",
+                args.prompt,
+            ],
+            "exceeds pipeline stage context",
+        ),
     ]
 
     env = os.environ.copy()
@@ -360,8 +424,13 @@ def main() -> int:
         default=os.environ.get("BUDDY_CHECK_RESULT_PY", ""),
         required=not bool(os.environ.get("BUDDY_CHECK_RESULT_PY")),
     )
-    logits_p.add_argument("--max-tokens", type=int, default=32)
+    logits_p.add_argument("--max-tokens", type=int, default=56)
     logits_p.add_argument("--vocab-size", type=int, default=151936)
+    logits_p.add_argument(
+        "--whole-model",
+        default=os.environ.get("BUDDY_PIPELINE_E2E_WHOLE_MODEL_RAX", ""),
+        help="Optional whole-model .rax to compare directly with the same --max-tokens",
+    )
 
     err_p = subparsers.add_parser("cli-errors")
     add_common(err_p)
