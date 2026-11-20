@@ -430,33 +430,71 @@ inline void checkAllStages(MPI_Comm comm, int rank, int ranks,
         std::to_string(expectedStart) + " > totalLayers=" +
         std::to_string(refTotalLayers));
   }
-  if (opts.transport == Transport::Async && !config.prefillChunk)
-    throw std::runtime_error("pp_transport=async is not implemented");
 }
 
 namespace detail {
 inline void traceStageCall(const std::string &prefix, int rank,
-                           const char *phase, int step, int pos) {
+                           const char *phase, const ActivationHeader &h,
+                           bool needLogits) {
   if (prefix.empty())
     return;
   const std::string path = prefix + ".rank" + std::to_string(rank) + ".log";
   std::ofstream out(path, std::ios::app);
   if (!out)
     throw std::runtime_error("cannot open stage trace file " + path);
-  out << "rank=" << rank << " phase=" << phase << " step=" << step
-      << " pos=" << pos << '\n';
+  out << "rank=" << rank << " phase=" << phase << " step=" << h.step
+      << " pos=" << h.pos << " rows=" << h.rows << " logits=" << needLogits
+      << '\n';
   out.flush();
 }
 } // namespace detail
 
-inline void generateTokenized(const DistributedGenerateOptions &opts, Stage &stage,
-                              MPI_Comm comm, int rank, int ranks, int promptRows,
-                              int resolvedNewTokens, std::vector<int64_t> &tokenInput,
+inline void generateTokenized(const DistributedGenerateOptions &opts,
+                              Stage &stage, MPI_Comm comm, int rank, int ranks,
+                              int promptRows, int resolvedNewTokens,
+                              std::vector<int64_t> &tokenInput,
                               AsyncActivation *async) {
   const auto &config = stage.configuration();
   const bool first = rank == 0, last = rank == ranks - 1;
   const int version = resolveWireSpec(config.dtype, opts.wireDtype).version;
   BlockingActivation activation(config, comm, opts.wireDtype);
+
+  int capacity = 0;
+  std::vector<float> hiddenF32;
+  std::vector<uint16_t> hiddenF16;
+  void *hidden = nullptr;
+  if (!first && !async) {
+    if (!computeElementCount(config.prefillChunk ? config.prefillChunk
+                                                 : config.context,
+                             config.activationWidth, capacity))
+      throw std::length_error("activation shape exceeds MPI element count");
+    if (config.dtype == ActivationType::F32) {
+      hiddenF32.resize(capacity);
+      hidden = hiddenF32.data();
+    } else {
+      hiddenF16.resize(capacity);
+      hidden = hiddenF16.data();
+    }
+  }
+
+  auto receive = [&](const ActivationHeader &h, bool preposted) -> void * {
+    if (async) {
+      if (!preposted)
+        async->postReceive(h, rank - 1);
+      return async->finishReceive(h, rank - 1);
+    }
+    FrameInterval interval(rank, h.step, "recv-wait");
+    activation.receive(hidden, capacity, rank - 1, h);
+    return hidden;
+  };
+  auto send = [&](const ActivationHeader &h, const void *output) {
+    if (async) {
+      async->postSend(h, output, rank + 1);
+    } else {
+      FrameInterval interval(rank, h.step, "send-wait");
+      activation.send(h, output, rank + 1);
+    }
+  };
 
   std::vector<float> logits;
   std::ofstream raw;
@@ -515,21 +553,6 @@ inline void generateTokenized(const DistributedGenerateOptions &opts, Stage &sta
     // Chunked prefill + decode (matches ModelSession::_emit_chunked_prefill).
     const int C = config.prefillChunk;
     const PromptFramePlan plan(promptRows, C, config.context, version);
-    const size_t hiddenElems =
-        static_cast<size_t>(C) * static_cast<size_t>(config.activationWidth);
-    std::vector<float> hiddenF32;
-    std::vector<uint16_t> hiddenF16;
-    void *hiddenPtr = nullptr;
-    if (!first) {
-      if (config.dtype == ActivationType::F32) {
-        hiddenF32.resize(hiddenElems);
-        hiddenPtr = hiddenF32.data();
-      } else {
-        hiddenF16.resize(hiddenElems);
-        hiddenPtr = hiddenF16.data();
-      }
-    }
-
     const void *prefillFinalOut = nullptr;
     std::vector<int64_t> chunkTokens(first && plan.prefillTokens() ? C : 0);
     if (!first && async)
@@ -541,31 +564,28 @@ inline void generateTokenized(const DistributedGenerateOptions &opts, Stage &sta
       const auto &header = frame.header;
       void *input;
       if (!first) {
-        if (async)
-          input = async->finishReceive(header, rank - 1);
-        else {
-          activation.receive(hiddenPtr, hiddenElems, rank - 1, header);
-          input = hiddenPtr;
-        }
+        input = receive(header, true);
       } else if (frame.prefill) {
         for (int r = 0; r < C; ++r)
-          chunkTokens[r] = tokenInput[std::min(header.pos + r, plan.prefillTokens() - 1)];
+          chunkTokens[r] =
+              tokenInput[std::min(header.pos + r, plan.prefillTokens() - 1)];
         input = chunkTokens.data();
       } else {
         input = &tokenInput[header.pos];
       }
 
       detail::traceStageCall(opts.traceStagePrefix, rank,
-                             frame.prefill ? "prefill" : "decode",
-                             header.step, header.pos);
-      const void *output = frame.prefill
-                               ? stage.prefillChunk(input, header.pos, frame.needLogits)
-                               : stage.decodeData(input, header.pos);
+                             frame.prefill ? "prefill" : "decode", header,
+                             frame.needLogits);
+      const void *output;
+      {
+        FrameInterval interval(rank, header.step, "compute");
+        output = frame.prefill
+                     ? stage.prefillChunk(input, header.pos, frame.needLogits)
+                     : stage.decodeData(input, header.pos);
+      }
       if (!last) {
-        if (async)
-          async->postSend(header, output, rank + 1);
-        else
-          activation.send(header, output, rank + 1);
+        send(header, output);
       } else if (frame.needLogits) {
         prefillFinalOut = output;
       }
@@ -589,30 +609,23 @@ inline void generateTokenized(const DistributedGenerateOptions &opts, Stage &sta
       int64_t nextToken = token;
       for (int genStep = 1; genStep < resolvedNewTokens; ++genStep) {
         const int pos = promptRows + (genStep - 1);
-        const ActivationHeader expected =
+        const auto header =
             makeChunkDecodeHeader(frameStep, pos, config.context, version);
-        ActivationHeader header = expected;
-        void *input = nullptr;
-        if (first) {
-          input = &nextToken;
-        } else {
-          header =
-              activation.receive(hiddenPtr, hiddenElems, rank - 1, expected);
-          input = hiddenPtr;
+        void *input = first ? &nextToken : receive(header, false);
+        detail::traceStageCall(opts.traceStagePrefix, rank, "decode", header,
+                               true);
+        const void *output;
+        {
+          FrameInterval interval(rank, header.step, "compute");
+          output = stage.decodeData(input, header.pos);
         }
-
-        if (!opts.traceStagePrefix.empty())
-          detail::traceStageCall(opts.traceStagePrefix, rank, "decode",
-                                 header.step, header.pos);
-
-        const void *output = stage.decodeData(input, header.pos);
 
         token = 0;
         stop = 0;
         if (last) {
           finishStepOnLast(output, genStep, token, stop);
         } else {
-          activation.send(header, output, rank + 1);
+          send(header, output);
           if (first)
             mpiCheck(MPI_Recv(&token, 1, MPI_INT, ranks - 1, kTokenTag, comm,
                               MPI_STATUS_IGNORE));
@@ -628,47 +641,23 @@ inline void generateTokenized(const DistributedGenerateOptions &opts, Stage &sta
       }
     }
   } else {
-    // Non-chunked prefill + decode (existing FP16 path preserved verbatim).
-    const size_t hiddenElems =
-        static_cast<size_t>(config.context) * config.activationWidth;
-    std::vector<uint16_t> hiddenF16;
-    std::vector<float> hiddenF32;
-    void *hiddenPtr = nullptr;
-    if (!first) {
-      if (config.dtype == ActivationType::F16) {
-        hiddenF16.resize(hiddenElems);
-        hiddenPtr = hiddenF16.data();
-      } else {
-        hiddenF32.resize(hiddenElems);
-        hiddenPtr = hiddenF32.data();
-      }
-    }
-
     for (int step = 0; step < resolvedNewTokens; ++step) {
-      const ActivationHeader expected =
+      const auto header =
           makeActivationHeader(step, promptRows, config.context, version);
-      ActivationHeader header = expected;
-      void *input = tokenInput.data();
-      if (!first) {
-        header =
-            activation.receive(hiddenPtr, hiddenElems, rank - 1, expected);
-        input = hiddenPtr;
+      void *input = first ? tokenInput.data() : receive(header, false);
+      detail::traceStageCall(opts.traceStagePrefix, rank,
+                             step == 0 ? "prefill" : "decode", header, true);
+      const void *output;
+      {
+        FrameInterval interval(rank, step, "compute");
+        if (config.dtype == ActivationType::F16) {
+          output = header.step == 0 ? stage.prefill(input)
+                                    : stage.decode(input, header.pos);
+        } else {
+          output = header.step == 0 ? stage.prefillData(input)
+                                    : stage.decodeData(input, header.pos);
+        }
       }
-
-      if (!opts.traceStagePrefix.empty())
-        detail::traceStageCall(opts.traceStagePrefix, rank,
-                               header.step == 0 ? "prefill" : "decode",
-                               header.step, header.pos);
-
-      const void *output = nullptr;
-      if (config.dtype == ActivationType::F16) {
-        output = header.step == 0 ? stage.prefill(input)
-                                  : stage.decode(input, header.pos);
-      } else {
-        output = header.step == 0 ? stage.prefillData(input)
-                                  : stage.decodeData(input, header.pos);
-      }
-
       int token = 0;
       int stop = 0;
       if (last) {
@@ -683,7 +672,7 @@ inline void generateTokenized(const DistributedGenerateOptions &opts, Stage &sta
         }
         finishStepOnLast(rowOut, step, token, stop);
       } else {
-        activation.send(header, output, rank + 1);
+        send(header, output);
         if (first)
           mpiCheck(MPI_Recv(&token, 1, MPI_INT, ranks - 1, kTokenTag, comm,
                             MPI_STATUS_IGNORE));
@@ -710,6 +699,37 @@ inline void generateTokenized(const DistributedGenerateOptions &opts, Stage &sta
         std::cout << (i ? "," : "") << generated[i];
       std::cout << "]}\n" << std::flush;
     }
+  }
+}
+
+inline void generatePrepared(const DistributedGenerateOptions &opts,
+                             Stage &stage, MPI_Comm comm, int rank, int ranks,
+                             int promptRows, int resolvedNewTokens,
+                             std::vector<int64_t> &tokenInput) {
+  const auto &config = stage.configuration();
+  std::optional<AsyncActivation> async;
+  if (ranks > 1 && opts.transport == Transport::Async)
+    async.emplace(config, comm, opts.wireDtype, rank > 0, rank < ranks - 1,
+                  config.prefillChunk ? 2 : 1);
+  try {
+    generateTokenized(opts, stage, comm, rank, ranks, promptRows,
+                      resolvedNewTokens, tokenInput, async ? &*async : nullptr);
+    if (async)
+      async->drain();
+  } catch (const std::exception &e) {
+    if (!async)
+      throw;
+    std::cerr << "rank " << rank << " pipeline error: " << e.what()
+              << std::endl;
+    MPI_Abort(comm, 1);
+    std::abort();
+  } catch (...) {
+    if (!async)
+      throw;
+    std::cerr << "rank " << rank << " pipeline error: unknown exception"
+              << std::endl;
+    MPI_Abort(comm, 1);
+    std::abort();
   }
 }
 
@@ -753,22 +773,8 @@ inline void generateDistributed(const DistributedGenerateOptions &opts,
                              ") exceeds remaining context limit (" +
                              std::to_string(maxAllowed) + ")");
 
-  std::optional<AsyncActivation> async;
-  if (ranks > 1 && opts.transport == Transport::Async)
-    async.emplace(config, comm, opts.wireDtype, !first, rank < ranks - 1,
-                  config.prefillChunk ? 2 : 1);
-  try {
-    generateTokenized(opts, stage, comm, rank, ranks, promptRows,
-                      resolvedNewTokens, tokenInput, async ? &*async : nullptr);
-    if (async)
-      async->drain();
-  } catch (const std::exception &e) {
-    if (!async)
-      throw;
-    std::cerr << "rank " << rank << " pipeline error: " << e.what() << std::endl;
-    MPI_Abort(comm, 1);
-    std::abort();
-  }
+  generatePrepared(opts, stage, comm, rank, ranks, promptRows,
+                   resolvedNewTokens, tokenInput);
 }
 
 } // namespace buddy::runtime::pipeline

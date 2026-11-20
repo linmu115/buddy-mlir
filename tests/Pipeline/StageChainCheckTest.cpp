@@ -227,7 +227,7 @@ void runFieldMismatch(int rank, int ranks) {
   expectFailure(rank, ranks, cfg, policy, "pp_transport mismatch: rank 1",
                 "transport");
   policy.transport = Transport::Async;
-  expectFailure(rank, ranks, cfg, policy, "async is not implemented", "async");
+  checkAllStages(MPI_COMM_WORLD, rank, ranks, cfg, policy);
 
   // totalLayers mismatch
   expectFailure(rank, ranks,

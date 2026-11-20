@@ -22,6 +22,38 @@
 #include <cstdio>
 #include <vector>
 
+// Monotonic timestamps can be compared across ranks on the same host.
+class FrameInterval {
+public:
+  static bool enabled() {
+    static const bool on = [] {
+      const char *value = std::getenv("BUDDY_PP_TIMING");
+      return value && std::strcmp(value, "1") == 0;
+    }();
+    return on;
+  }
+
+  FrameInterval(int rank, int step, const char *event)
+      : rank(rank), step(step), event(event), start(enabled() ? now() : 0) {}
+  ~FrameInterval() {
+    if (enabled())
+      std::fprintf(
+          stderr,
+          "pp_time rank=%d step=%d event=%s begin_ns=%lld end_ns=%lld\n", rank,
+          step, event, start, now());
+  }
+
+private:
+  static long long now() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+  }
+  int rank, step;
+  const char *event;
+  long long start;
+};
+
 class AsyncActivation : private ActivationProtocol {
   using WireDtype = buddy::runtime::pipeline::WireDtype;
   using WireSpec = buddy::runtime::pipeline::WireSpec;
@@ -33,15 +65,18 @@ class AsyncActivation : private ActivationProtocol {
     std::vector<uint16_t> halves;
     MPI_Request head = MPI_REQUEST_NULL, body = MPI_REQUEST_NULL;
     bool occupied = false;
-    void *data() { return floats.empty() ? static_cast<void *>(halves.data())
-                                         : static_cast<void *>(floats.data()); }
+    void *data() {
+      return floats.empty() ? static_cast<void *>(halves.data())
+                            : static_cast<void *>(floats.data());
+    }
   };
 
 public:
   // All ranks enter together. Only allocate the directions this rank uses.
   AsyncActivation(const StageConfig &cfg, MPI_Comm control, WireDtype wire,
                   bool hasRx, bool hasTx, int window, bool synchronous = false)
-      : ActivationProtocol(cfg, control, resolveWireSpec(cfg.dtype, wire).version),
+      : ActivationProtocol(cfg, control,
+                           resolveWireSpec(cfg.dtype, wire).version),
         spec(resolveWireSpec(cfg.dtype, wire)),
         type(spec.dtype == ActivationType::F32 ? MPI_FLOAT : MPI_UINT16_T),
         capacity(checkedElementCount(prefillChunk ? prefillChunk : context)),
@@ -75,6 +110,7 @@ public:
   MPI_Comm communicator() const { return comm; }
 
   void postReceive(const ActivationHeader &frame, int peer) {
+    FrameInterval interval(rank, frame.step, "recv-post");
     const int n = checkFrame(frame, peer);
     Slot &s = rx[frame.step % window];
     if (s.occupied || !s.data())
@@ -82,21 +118,28 @@ public:
     s.occupied = true;
     s.frame = frame;
     check(MPI_Irecv(s.header.data(), 4, MPI_INT32_T, peer, kHeaderTag, comm,
-                    &s.head), frame, peer);
+                    &s.head),
+          frame, peer);
     check(MPI_Irecv(s.data(), n, type, peer, kActivationTag, comm, &s.body),
           frame, peer);
   }
 
   // Native data lives until the same RX slot is posted again. The one shared
-  // f32 decode buffer lives until the next finishReceive. Stage calls serialize.
+  // f32 decode buffer lives until the next finishReceive. Stage calls
+  // serialize.
   void *finishReceive(const ActivationHeader &frame, int peer) {
     Slot &s = rx.at(static_cast<size_t>(frame.step) % window);
     if (!s.occupied || s.frame != frame)
       abortProtocol(peer, peer, frame, nullptr, "unexpected receive slot");
-    waitReceive(s.head, MPI_INT32_T, kHeaderTag, 4, peer, frame, nullptr);
-    const ActivationHeader got{s.header[0], s.header[1], s.header[2], s.header[3]};
-    const int n = validateReceived(got, frame, capacity, peer, peer);
-    waitReceive(s.body, type, kActivationTag, n, peer, frame, &got);
+    int n;
+    {
+      FrameInterval interval(rank, frame.step, "recv-wait");
+      waitReceive(s.head, MPI_INT32_T, kHeaderTag, 4, peer, frame, nullptr);
+      const ActivationHeader got{s.header[0], s.header[1], s.header[2],
+                                 s.header[3]};
+      n = validateReceived(got, frame, capacity, peer, peer);
+      waitReceive(s.body, type, kActivationTag, n, peer, frame, &got);
+    }
     s.occupied = false;
     if (spec.compressed()) {
       buddy::runtime::pipeline::decodeInto(s.halves.data(), n, decoded.data(),
@@ -111,7 +154,8 @@ public:
     Slot &s = tx[frame.step % window];
     waitSend(s);
     if (!data || !s.data())
-      abortProtocol(peer, peer, frame, nullptr, "missing activation send buffer");
+      abortProtocol(peer, peer, frame, nullptr,
+                    "missing activation send buffer");
     if (spec.compressed()) {
       try {
         buddy::runtime::pipeline::encodeInto(static_cast<const float *>(data),
@@ -125,10 +169,13 @@ public:
     s.frame = frame;
     s.header = {frame.version, frame.step, frame.pos, frame.rows};
     s.occupied = true;
+    FrameInterval interval(rank, frame.step, "send-post");
     auto send = synchronous ? MPI_Issend : MPI_Isend;
-    check(send(s.header.data(), 4, MPI_INT32_T, peer, kHeaderTag, comm, &s.head),
-          frame, peer);
-    check(send(s.data(), n, type, peer, kActivationTag, comm, &s.body), frame, peer);
+    check(
+        send(s.header.data(), 4, MPI_INT32_T, peer, kHeaderTag, comm, &s.head),
+        frame, peer);
+    check(send(s.data(), n, type, peer, kActivationTag, comm, &s.body), frame,
+          peer);
   }
 
   void drain() {
@@ -136,7 +183,13 @@ public:
       if (rx[i].occupied)
         abortProtocol(rank, rank, rx[i].frame, nullptr, "unconsumed receive");
       waitSend(tx[i]);
+      if (rx[i].head != MPI_REQUEST_NULL || rx[i].body != MPI_REQUEST_NULL ||
+          tx[i].head != MPI_REQUEST_NULL || tx[i].body != MPI_REQUEST_NULL)
+        abortProtocol(rank, rank, {}, nullptr,
+                      "request still active after drain");
     }
+    if (FrameInterval::enabled())
+      std::fprintf(stderr, "pp_drain rank=%d pending=0\n", rank);
   }
 
 private:
@@ -165,6 +218,7 @@ private:
   void waitSend(Slot &s) {
     if (!s.occupied)
       return;
+    FrameInterval interval(rank, s.frame.step, "send-wait");
     check(MPI_Wait(&s.head, MPI_STATUS_IGNORE), s.frame, rank + 1);
     check(MPI_Wait(&s.body, MPI_STATUS_IGNORE), s.frame, rank + 1);
     s.occupied = false;
@@ -178,8 +232,8 @@ private:
     const char *part = got ? "payload" : "header";
     const auto mismatch = [&](const std::string &actual) {
       abortProtocol(peer, peer, frame, got,
-                    std::string(part) + " element count mismatch (got " + actual +
-                    ", expected " + std::to_string(count) + ")");
+                    std::string(part) + " element count mismatch (got " +
+                        actual + ", expected " + std::to_string(count) + ")");
     };
     if (rc != MPI_SUCCESS) {
       int cls;
@@ -193,7 +247,8 @@ private:
     int actual;
     check(MPI_Get_count(&status, dtype, &actual), frame, peer);
     if (actual != count)
-      mismatch(actual == MPI_UNDEFINED ? "MPI_UNDEFINED" : std::to_string(actual));
+      mismatch(actual == MPI_UNDEFINED ? "MPI_UNDEFINED"
+                                       : std::to_string(actual));
   }
 
   WireSpec spec;

@@ -45,9 +45,11 @@ public:
   PromptFrame operator[](int i) const {
     const bool final = i == size() - 1;
     if (final && prompt < chunk)
-      return {makeChunkDecodeHeader(i, prompt - 1, context, version), false, true};
+      return {makeChunkDecodeHeader(i, prompt - 1, context, version), false,
+              true};
     const int pos = final ? prompt - chunk : i * chunk;
-    return {makeChunkPrefillHeader(i, pos, chunk, context, version), true, final};
+    return {makeChunkPrefillHeader(i, pos, chunk, context, version), true,
+            final};
   }
 
 private:

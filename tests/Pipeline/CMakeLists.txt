@@ -384,11 +384,15 @@ if(_BUDDY_PIPELINE_HAVE_MPI)
     string(REPLACE "protocol-" "protocol-async-" _async_name "${_name}")
     list(APPEND _BUDDY_PIPELINE_PROTOCOL_TESTS "${_async_name}")
   endforeach()
-  foreach(mode IN ITEMS window header-first payload-first bad-long-payload)
+  foreach(mode IN ITEMS window header-first payload-first bad-long-payload bad-queued)
     set(args)
     set(ranks 2)
     if(mode STREQUAL "window")
       set(ranks 3)
+    elseif(mode STREQUAL "bad-queued")
+      set(args --expect-fail --expect-output "header step mismatch"
+        --counter-file "${_BUDDY_PIPELINE_PROTOCOL_WORK_DIR}/async-queued.counter"
+        --expect-compute-calls 0 --expect-prefill-calls 0 --expect-decode-calls 0)
     elseif(mode STREQUAL "bad-long-payload")
       set(args --expect-fail --expect-output "payload element count mismatch"
         --counter-file "${_BUDDY_PIPELINE_PROTOCOL_WORK_DIR}/async-long.counter"
@@ -423,6 +427,27 @@ if(_BUDDY_PIPELINE_HAVE_MPI)
     MPI::MPI_CXX
   )
   list(APPEND _BUDDY_PIPELINE_UNIT_DEPENDS buddy-pipeline-stage-chain-test)
+
+  add_executable(buddy-pipeline-generation-test GenerationTest.cpp)
+  target_compile_features(buddy-pipeline-generation-test PRIVATE cxx_std_17)
+  target_include_directories(buddy-pipeline-generation-test PRIVATE
+    "${CMAKE_SOURCE_DIR}/models/deepseek_r1/pipeline"
+    "${CMAKE_SOURCE_DIR}/frontend/Interfaces"
+    "${CMAKE_BINARY_DIR}/frontend/Interfaces")
+  target_link_libraries(buddy-pipeline-generation-test PRIVATE buddy_runtime_core MPI::MPI_CXX)
+  list(APPEND _BUDDY_PIPELINE_UNIT_DEPENDS buddy-pipeline-generation-test)
+  foreach(case IN ITEMS single multi throw)
+    set(ranks 3)
+    if(case STREQUAL "single")
+      set(ranks 1)
+    endif()
+    add_test(NAME buddy-pipeline-generation-${case}
+      COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/run_generation_test.py"
+        "${MPIEXEC_EXECUTABLE}" "${_BUDDY_PIPELINE_MPI_NUMPROC_FLAG}" ${ranks}
+        "$<TARGET_FILE:buddy-pipeline-generation-test>" ${case})
+    set_tests_properties(buddy-pipeline-generation-${case} PROPERTIES
+      TIMEOUT 100 LABELS "pipeline;pipeline-unit;pipeline-mpi")
+  endforeach()
 
   function(_add_stage_chain_test test_name ranks mode)
     add_test(NAME ${test_name}

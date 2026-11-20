@@ -692,6 +692,35 @@ int runArrival(int rank, bool payloadFirst) {
   return 0;
 }
 
+// Both frames have matched before validation. Frame 0 has a bad step and a
+// short payload, frame 1 is good. Header validation must win immediately.
+int runBadQueued(int rank, const std::string &counterFile) {
+  constexpr int rows = 8;
+  auto cfg = makeTestConfig(ActivationType::F16, rows);
+  AsyncActivation a(cfg, MPI_COMM_WORLD, buddy::runtime::pipeline::WireDtype::Native,
+                    rank == 1, rank == 0, 2);
+  for (int i = 0; i < 2; ++i) {
+    auto h = makeChunkPrefillHeader(i, i * rows, rows, kContext);
+    if (rank == 0) {
+      std::array<int32_t, 4> raw{h.version, 1, h.pos, h.rows};
+      auto data = fillPayload(i, rows);
+      mpiCheck(MPI_Ssend(raw.data(), 4, MPI_INT32_T, 1, kHeaderTag, a.communicator()));
+      mpiCheck(MPI_Ssend(data.data(), data.size() - (i == 0), MPI_UINT16_T, 1,
+                         kActivationTag, a.communicator()));
+    } else {
+      a.postReceive(h, 0);
+    }
+  }
+  mpiCheck(MPI_Barrier(MPI_COMM_WORLD));
+  if (rank == 1) {
+    writeCounterFile(counterFile, 0, 0, 0, -1, -1);
+    a.finishReceive(makeChunkPrefillHeader(0, 0, rows, kContext), 0);
+    writeCounterFile(counterFile, 1, 1, 0, 0, 0);
+  }
+  mpiCheck(MPI_Barrier(MPI_COMM_WORLD));
+  return 0;
+}
+
 int runWindow(int rank, int ranks) {
   constexpr int frames = 7, rows = 32;
   auto cfg = makeTestConfig(ActivationType::F16, rows);
@@ -741,7 +770,9 @@ int main(int argc, char **argv) {
       mode.erase(0, 6);
     const std::string counterFile = argc >= 3 ? argv[2] : "";
     int rc = 0;
-    if (mode == "window")
+    if (mode == "bad-queued")
+      rc = runBadQueued(rank, counterFile);
+    else if (mode == "window")
       rc = runWindow(rank, ranks);
     else if (mode == "header-first" || mode == "payload-first")
       rc = runArrival(rank, mode == "payload-first");
