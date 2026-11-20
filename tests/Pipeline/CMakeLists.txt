@@ -68,6 +68,36 @@ set_tests_properties(buddy-pipeline-stage-manifest PROPERTIES
 list(APPEND _BUDDY_PIPELINE_UNIT_DEPENDS buddy-pipeline-stage-manifest-test)
 
 # ------------------------------------------------------------------------------
+# Layer 1A-py: Codegen config/manifest & MoE stage export Python unit tests
+# ------------------------------------------------------------------------------
+add_test(NAME buddy-pipeline-codegen-config
+  COMMAND "${Python3_EXECUTABLE}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/test_pipeline_codegen_config.py"
+)
+set_tests_properties(buddy-pipeline-codegen-config PROPERTIES
+  TIMEOUT 30
+  PASS_REGULAR_EXPRESSION "Pipeline codegen config tests passed"
+  LABELS "pipeline;pipeline-unit"
+)
+
+add_test(NAME buddy-pipeline-moe-stage-export
+  COMMAND "${Python3_EXECUTABLE}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/test_moe_stage_export.py"
+)
+set(_BUDDY_PIPELINE_PY_PATH
+  "${CMAKE_BINARY_DIR}/python_packages:${CMAKE_SOURCE_DIR}/tools/buddy-codegen")
+if(TARGET python-package-buddy)
+  list(APPEND _BUDDY_PIPELINE_UNIT_DEPENDS python-package-buddy)
+endif()
+set_tests_properties(buddy-pipeline-moe-stage-export PROPERTIES
+  TIMEOUT 180
+  SKIP_RETURN_CODE 77
+  PASS_REGULAR_EXPRESSION "MoE stage export tests passed"
+  ENVIRONMENT "PYTHONPATH=${_BUDDY_PIPELINE_PY_PATH}"
+  LABELS "pipeline;pipeline-unit"
+)
+
+# ------------------------------------------------------------------------------
 # Layer 1B & 1C: MPI protocol & stage-chain unit tests (skipped if no MPI)
 # ------------------------------------------------------------------------------
 set(_BUDDY_PIPELINE_PROTOCOL_TESTS
