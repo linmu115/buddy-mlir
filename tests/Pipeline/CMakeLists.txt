@@ -10,9 +10,11 @@
 #   - BlockingMPI 16-byte header protocol & bad-frame injection tests (MPI)
 #   - checkAllStages stage-chain & metadata validation tests (MPI)
 #
-# Layer 2 (default OFF, enable with -DBUDDY_ENABLE_PIPELINE_E2E_TESTS=ON):
-#   - 2-stage buddy-cli --stage-model bit-exact logits check via check_result.py
-#   - buddy-cli --stage-model error paths
+# Layer 2 (default OFF):
+#   - DeepSeek-R1 E2E (-DBUDDY_ENABLE_PIPELINE_E2E_TESTS=ON):
+#     2-stage buddy-cli --stage-model bit-exact FP16 logits check + CLI errors
+#   - Tiny Qwen3-MoE w4g32 E2E (-DBUDDY_ENABLE_PIPELINE_MOE_E2E_TESTS=ON):
+#     1/2/3-stage short/long prompt bit-exact FP32 logits check + stop hook
 #
 # ===----------------------------------------------------------------------===//
 
@@ -45,6 +47,7 @@ function(_add_buddy_pipeline_skipped_mpi_test test_name extra_labels)
 endfunction()
 
 set(_BUDDY_PIPELINE_UNIT_DEPENDS)
+set(_BUDDY_PIPELINE_E2E_DEPENDS)
 set(_BUDDY_PIPELINE_ALL_DEPENDS)
 
 # ------------------------------------------------------------------------------
@@ -774,13 +777,191 @@ if(BUDDY_ENABLE_PIPELINE_E2E_TESTS)
       buddy-cli
       buddy-pipeline-e2e-fixtures
     )
+    list(APPEND _BUDDY_PIPELINE_E2E_DEPENDS
+      buddy-cli
+      buddy-pipeline-e2e-fixtures
+    )
+  endif()
+endif()
 
-    add_custom_target(check-buddy-pipeline-e2e
-      COMMAND "${CMAKE_CTEST_COMMAND}" --output-on-failure -L "^pipeline-e2e$"
-      DEPENDS buddy-cli buddy-pipeline-e2e-fixtures
+# ------------------------------------------------------------------------------
+# Layer 2B: Tiny Qwen3-MoE w4g32 pipeline E2E test (default OFF)
+# ------------------------------------------------------------------------------
+option(BUDDY_ENABLE_PIPELINE_MOE_E2E_TESTS
+  "Enable tiny Qwen3-MoE w4g32 pipeline-parallel E2E test (generates a fixed-seed tiny model when model dir is empty)"
+  OFF)
+set(BUDDY_PIPELINE_MOE_E2E_MODEL_DIR "" CACHE PATH
+  "Optional pre-generated tiny Qwen3-MoE HF model directory (auto-generated with fixed seed if empty)")
+set(BUDDY_PIPELINE_MOE_E2E_VOCAB_FILE
+  "${CMAKE_SOURCE_DIR}/examples/BuddyQwen3/vocab.txt" CACHE FILEPATH
+  "Vocabulary file for tiny Qwen3-MoE pipeline E2E test")
+set(BUDDY_PIPELINE_MOE_E2E_RAX_PACK "" CACHE FILEPATH
+  "Optional pre-built rax-pack executable for MoE pipeline E2E")
+set(BUDDY_PIPELINE_MOE_E2E_BUDDY_OPT "" CACHE FILEPATH
+  "Optional pre-built buddy-opt executable for MoE pipeline E2E")
+set(BUDDY_PIPELINE_MOE_E2E_PYTHON_PACKAGES "" CACHE PATH
+  "Optional directory containing built buddy_mlir Python package (defaults to CMAKE_BINARY_DIR/python_packages)")
+set(BUDDY_PIPELINE_MOE_E2E_WHOLE_MODEL_RAX "" CACHE FILEPATH
+  "Optional whole-model qwen3_vl_moe.rax to verify exact token parity with MoE pipeline")
+set(BUDDY_PIPELINE_MOE_E2E_HEAD_DIM "64" CACHE STRING
+  "head_dim used when auto-generating the fixed-seed tiny Qwen3-MoE model")
+set(BUDDY_PIPELINE_MOE_E2E_SEED "42" CACHE STRING
+  "Fixed random seed used when auto-generating the tiny Qwen3-MoE model")
+set(BUDDY_PIPELINE_MOE_E2E_COMPILE_JOBS "2" CACHE STRING
+  "Parallel MLIR->.o jobs for MoE pipeline E2E compilation")
+
+if(BUDDY_ENABLE_PIPELINE_MOE_E2E_TESTS)
+  if(NOT _BUDDY_PIPELINE_HAVE_MPI OR NOT BUDDY_CLI_ENABLE_MPI)
+    message(STATUS
+      "[pipeline-tests] MPI or BUDDY_CLI_ENABLE_MPI unavailable; "
+      "MoE pipeline E2E test will be skipped in CTest.")
+    _add_buddy_pipeline_skipped_mpi_test(buddy-pipeline-e2e-moe-w4g32 "pipeline-e2e;pipeline-moe-e2e")
+  else()
+    if(NOT EXISTS "${BUDDY_PIPELINE_MOE_E2E_VOCAB_FILE}")
+      message(FATAL_ERROR
+        "[pipeline-tests] BUDDY_PIPELINE_MOE_E2E_VOCAB_FILE not found: ${BUDDY_PIPELINE_MOE_E2E_VOCAB_FILE}")
+    endif()
+
+    set(_MOE_E2E_DEPS buddy-cli)
+
+    if(BUDDY_PIPELINE_MOE_E2E_RAX_PACK)
+      if(NOT EXISTS "${BUDDY_PIPELINE_MOE_E2E_RAX_PACK}")
+        message(FATAL_ERROR
+          "[pipeline-tests] BUDDY_PIPELINE_MOE_E2E_RAX_PACK not found: ${BUDDY_PIPELINE_MOE_E2E_RAX_PACK}")
+      endif()
+      set(_MOE_E2E_RAX_PACK_BIN "${BUDDY_PIPELINE_MOE_E2E_RAX_PACK}")
+    elseif(BUDDY_PIPELINE_E2E_RAX_PACK AND EXISTS "${BUDDY_PIPELINE_E2E_RAX_PACK}")
+      set(_MOE_E2E_RAX_PACK_BIN "${BUDDY_PIPELINE_E2E_RAX_PACK}")
+    elseif(DEFINED QWEN3_VL_MOE_PIPELINE_RAX_PACK AND QWEN3_VL_MOE_PIPELINE_RAX_PACK AND EXISTS "${QWEN3_VL_MOE_PIPELINE_RAX_PACK}")
+      set(_MOE_E2E_RAX_PACK_BIN "${QWEN3_VL_MOE_PIPELINE_RAX_PACK}")
+    else()
+      set(_MOE_E2E_RAX_PACK_BIN "$<TARGET_FILE:rax-pack>")
+      list(APPEND _MOE_E2E_DEPS rax-pack)
+    endif()
+
+    if(BUDDY_PIPELINE_MOE_E2E_BUDDY_OPT)
+      if(NOT EXISTS "${BUDDY_PIPELINE_MOE_E2E_BUDDY_OPT}")
+        message(FATAL_ERROR
+          "[pipeline-tests] BUDDY_PIPELINE_MOE_E2E_BUDDY_OPT not found: ${BUDDY_PIPELINE_MOE_E2E_BUDDY_OPT}")
+      endif()
+      set(_MOE_E2E_BUDDY_OPT_BIN "${BUDDY_PIPELINE_MOE_E2E_BUDDY_OPT}")
+    else()
+      set(_MOE_E2E_BUDDY_OPT_BIN "$<TARGET_FILE:buddy-opt>")
+      list(APPEND _MOE_E2E_DEPS buddy-opt)
+    endif()
+
+    if(TARGET buddy_models_qwen3_vl_moe_pipeline_runner)
+      set(_MOE_E2E_RUNNER_TARGET buddy_models_qwen3_vl_moe_pipeline_runner)
+    elseif(TARGET buddy_models_deepseek_r1_pipeline_runner)
+      set(_MOE_E2E_RUNNER_TARGET buddy_models_deepseek_r1_pipeline_runner)
+    elseif(TARGET buddy-pipeline-e2e-runner)
+      set(_MOE_E2E_RUNNER_TARGET buddy-pipeline-e2e-runner)
+    else()
+      add_library(buddy-pipeline-moe-e2e-runner SHARED EXCLUDE_FROM_ALL
+        "${CMAKE_SOURCE_DIR}/models/deepseek_r1/pipeline/PipelineRunner.cpp"
+        "${CMAKE_SOURCE_DIR}/models/deepseek_r1/pipeline/PipelineRunnerPlugin.cpp"
+      )
+      set_target_properties(buddy-pipeline-moe-e2e-runner PROPERTIES
+        LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/moe_e2e_fixtures"
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/moe_e2e_fixtures"
+        OUTPUT_NAME "qwen3_vl_moe_pipeline_runner"
+        PREFIX ""
+      )
+      target_include_directories(buddy-pipeline-moe-e2e-runner PRIVATE
+        "${CMAKE_SOURCE_DIR}/models/deepseek_r1/pipeline"
+        "${CMAKE_SOURCE_DIR}/frontend/Interfaces"
+        "${CMAKE_BINARY_DIR}/frontend/Interfaces"
+      )
+      target_link_libraries(buddy-pipeline-moe-e2e-runner PRIVATE
+        buddy_runtime_core
+        MPI::MPI_CXX
+        ${CMAKE_DL_LIBS}
+      )
+      target_compile_features(buddy-pipeline-moe-e2e-runner PRIVATE cxx_std_17)
+      set(_MOE_E2E_RUNNER_TARGET buddy-pipeline-moe-e2e-runner)
+    endif()
+    list(APPEND _MOE_E2E_DEPS ${_MOE_E2E_RUNNER_TARGET})
+
+    set(_MOE_E2E_PY_PKGS "${CMAKE_BINARY_DIR}/python_packages")
+    if(BUDDY_PIPELINE_MOE_E2E_PYTHON_PACKAGES)
+      if(NOT IS_DIRECTORY "${BUDDY_PIPELINE_MOE_E2E_PYTHON_PACKAGES}")
+        message(FATAL_ERROR
+          "[pipeline-tests] BUDDY_PIPELINE_MOE_E2E_PYTHON_PACKAGES not found: ${BUDDY_PIPELINE_MOE_E2E_PYTHON_PACKAGES}")
+      endif()
+      set(_MOE_E2E_PY_PKGS "${BUDDY_PIPELINE_MOE_E2E_PYTHON_PACKAGES}")
+    endif()
+    set(_MOE_E2E_PY_PATH
+      "${_MOE_E2E_PY_PKGS}:${CMAKE_SOURCE_DIR}/tools/buddy-codegen")
+
+    set(_MOE_E2E_MODEL_ARGS)
+    if(BUDDY_PIPELINE_MOE_E2E_MODEL_DIR)
+      if(NOT IS_DIRECTORY "${BUDDY_PIPELINE_MOE_E2E_MODEL_DIR}")
+        message(FATAL_ERROR
+          "[pipeline-tests] BUDDY_PIPELINE_MOE_E2E_MODEL_DIR not found: ${BUDDY_PIPELINE_MOE_E2E_MODEL_DIR}")
+      endif()
+      set(_MOE_E2E_MODEL_ARGS --model-dir "${BUDDY_PIPELINE_MOE_E2E_MODEL_DIR}")
+    endif()
+
+    set(_MOE_E2E_WHOLE_ARGS)
+    if(BUDDY_PIPELINE_MOE_E2E_WHOLE_MODEL_RAX)
+      if(NOT EXISTS "${BUDDY_PIPELINE_MOE_E2E_WHOLE_MODEL_RAX}")
+        message(FATAL_ERROR
+          "[pipeline-tests] BUDDY_PIPELINE_MOE_E2E_WHOLE_MODEL_RAX not found: ${BUDDY_PIPELINE_MOE_E2E_WHOLE_MODEL_RAX}")
+      endif()
+      set(_MOE_E2E_WHOLE_ARGS --whole-model "${BUDDY_PIPELINE_MOE_E2E_WHOLE_MODEL_RAX}")
+    endif()
+
+    string(JOIN ":" _MOE_E2E_MLIR_INCS ${MLIR_INCLUDE_DIRS})
+
+    add_test(NAME buddy-pipeline-e2e-moe-w4g32
+      COMMAND "${Python3_EXECUTABLE}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/run_moe_pipeline_e2e_test.py"
+        --mpiexec "${MPIEXEC_EXECUTABLE}"
+        "--numproc-flag=${_BUDDY_PIPELINE_MPI_NUMPROC_FLAG}"
+        --buddy-cli "$<TARGET_FILE:buddy-cli>"
+        --rax-pack "${_MOE_E2E_RAX_PACK_BIN}"
+        --buddy-opt "${_MOE_E2E_BUDDY_OPT_BIN}"
+        --llvm-tools-dir "${LLVM_TOOLS_BINARY_DIR}"
+        --c-compiler "${CMAKE_C_COMPILER}"
+        --cxx-compiler "${CMAKE_CXX_COMPILER}"
+        --mlir-include-dirs "${_MOE_E2E_MLIR_INCS}"
+        --mlir-runtime-dir "${LLVM_LIBRARY_DIR}"
+        --runner-lib "$<TARGET_FILE:${_MOE_E2E_RUNNER_TARGET}>"
+        --vocab-file "${BUDDY_PIPELINE_MOE_E2E_VOCAB_FILE}"
+        --check-result "${CMAKE_SOURCE_DIR}/examples/BuddyDeepSeekR1/pipeline/check_result.py"
+        ${_MOE_E2E_MODEL_ARGS}
+        ${_MOE_E2E_WHOLE_ARGS}
+        --head-dim "${BUDDY_PIPELINE_MOE_E2E_HEAD_DIM}"
+        --seed "${BUDDY_PIPELINE_MOE_E2E_SEED}"
+        --compile-jobs "${BUDDY_PIPELINE_MOE_E2E_COMPILE_JOBS}"
+        --work-dir "${CMAKE_CURRENT_BINARY_DIR}/e2e-work-moe"
+        --timeout 240
+    )
+    set_tests_properties(buddy-pipeline-e2e-moe-w4g32 PROPERTIES
+      TIMEOUT 600
+      PASS_REGULAR_EXPRESSION "PASS pipeline moe e2e bit-exact f32 logits"
+      ENVIRONMENT_MODIFICATION "PYTHONPATH=path_list_prepend:${_MOE_E2E_PY_PATH}"
+      LABELS "pipeline;pipeline-e2e;pipeline-moe-e2e;pipeline-mpi"
+    )
+
+    list(APPEND _BUDDY_PIPELINE_ALL_DEPENDS ${_MOE_E2E_DEPS})
+    list(APPEND _BUDDY_PIPELINE_E2E_DEPENDS ${_MOE_E2E_DEPS})
+
+    add_custom_target(check-buddy-pipeline-moe-e2e
+      COMMAND "${CMAKE_CTEST_COMMAND}" --output-on-failure -L "^pipeline-moe-e2e$"
+      DEPENDS ${_MOE_E2E_DEPS}
       WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
     )
   endif()
+endif()
+
+if(_BUDDY_PIPELINE_E2E_DEPENDS)
+  list(REMOVE_DUPLICATES _BUDDY_PIPELINE_E2E_DEPENDS)
+  add_custom_target(check-buddy-pipeline-e2e
+    COMMAND "${CMAKE_CTEST_COMMAND}" --output-on-failure -L "^pipeline-e2e$"
+    DEPENDS ${_BUDDY_PIPELINE_E2E_DEPENDS}
+    WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+  )
 endif()
 
 add_custom_target(check-buddy-pipeline-unit
