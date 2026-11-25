@@ -52,3 +52,8 @@ if(BUILD_TESTING)
   set_tests_properties(test_route_b_counts_and_roles test_route_b_pack_layout
     PROPERTIES LABELS route-b TIMEOUT 240)
 endif()
+
+option(BJ47_ROUTE_B_HOST "Also build the MPI Route B host" OFF)
+if(BJ47_ROUTE_B_HOST)
+  add_subdirectory(host)
+endif()

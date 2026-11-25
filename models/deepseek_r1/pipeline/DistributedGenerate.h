@@ -25,6 +25,7 @@
 
 #include "PromptFramePlan.h"
 #include "buddy/runtime/pipeline/mpi/AsyncMPI.h"
+#include <memory>
 #include <optional>
 
 #include "buddy/LLM/TextContainer.h"
@@ -118,9 +119,8 @@ struct DistributedGenerateOptions {
 
 inline bool isStopToken(int token, int eosId,
                         const std::vector<int> &stopTokenIds) {
-  return token == eosId ||
-         std::find(stopTokenIds.begin(), stopTokenIds.end(), token) !=
-             stopTokenIds.end();
+  return token == eosId || std::find(stopTokenIds.begin(), stopTokenIds.end(),
+                                     token) != stopTokenIds.end();
 }
 
 inline int tokenizePrompt(const std::string &prompt,
@@ -140,27 +140,25 @@ inline int tokenizePrompt(const std::string &prompt,
     // Match whole-model Qwen3VLMoeRunner (Text::tokenizeQwen3). Pass at least
     // 2*prompt.size()+8 so prompts exceeding `context` are rejected cleanly
     // instead of being silently truncated before the 5-token assistant suffix.
-    text.tokenizeQwen3(vocabPath,
-                       std::max<size_t>(static_cast<size_t>(context),
-                                        2 * prompt.size() + 8));
+    text.tokenizeQwen3(vocabPath, std::max<size_t>(static_cast<size_t>(context),
+                                                   2 * prompt.size() + 8));
   } else {
     if (prompt.empty() || prompt.front() == ' ')
-      throw std::runtime_error(
-          "field prompt must be non-empty and start with a non-space character");
+      throw std::runtime_error("field prompt must be non-empty and start with "
+                               "a non-space character");
     // Space is mapped to a two-byte character. Allow the chat markers too
     // so the tokenizer can report a too-long prompt before the model runs.
-    text.tokenizeDeepSeekR1(vocabPath,
-                            std::max<size_t>(static_cast<size_t>(context),
-                                             2 * prompt.size() + 6));
+    text.tokenizeDeepSeekR1(
+        vocabPath,
+        std::max<size_t>(static_cast<size_t>(context), 2 * prompt.size() + 6));
   }
 
   if (text.getTokenCnt() == 0)
     throw std::runtime_error("field prompt produced zero tokens");
   if (text.getTokenCnt() > static_cast<size_t>(context))
-    throw std::runtime_error("tokenized prompt (" +
-                             std::to_string(text.getTokenCnt()) +
-                             ") exceeds model context (" +
-                             std::to_string(context) + ")");
+    throw std::runtime_error(
+        "tokenized prompt (" + std::to_string(text.getTokenCnt()) +
+        ") exceeds model context (" + std::to_string(context) + ")");
   const int promptRows = static_cast<int>(text.getTokenCnt());
   tokenInput.assign(text.getData(), text.getData() + context);
   return promptRows;
@@ -200,9 +198,10 @@ inline int resolveGeneratedTokenLimit(int maxTokens, TokenLimitMode mode,
     return maxTokens;
   }
 
-  // TokenLimitMode::TotalSequenceLength (matches runtime/llm/TextGeneration.cpp):
-  //   1 <= N <= promptRows     -> 1 generated token (prefill only, 0 decode steps)
-  //   promptRows < N <= context -> N - promptRows + 1 generated tokens
+  // TokenLimitMode::TotalSequenceLength (matches
+  // runtime/llm/TextGeneration.cpp):
+  //   1 <= N <= promptRows     -> 1 generated token (prefill only, 0 decode
+  //   steps) promptRows < N <= context -> N - promptRows + 1 generated tokens
   //   N > context              -> exceeds static pipeline KV cache context.
   if (maxTokens > context)
     throw std::runtime_error(
@@ -246,15 +245,16 @@ inline void checkAllStages(MPI_Comm comm, int rank, int ranks,
       throw std::runtime_error("field model_name exceeds MPI message size");
     const int localLen = static_cast<int>(opts.modelName.size());
     std::vector<int> lengths(static_cast<size_t>(ranks), 0);
-    mpiCheck(MPI_Allgather(&localLen, 1, MPI_INT, lengths.data(), 1, MPI_INT,
-                           comm));
+    mpiCheck(
+        MPI_Allgather(&localLen, 1, MPI_INT, lengths.data(), 1, MPI_INT, comm));
 
     std::vector<int> displs(static_cast<size_t>(ranks), 0);
     int64_t totalChars = 0;
     for (int r = 0; r < ranks; ++r) {
       if (lengths[r] < 0)
-        throw std::runtime_error("field model_name has negative length on rank " +
-                                 std::to_string(r));
+        throw std::runtime_error(
+            "field model_name has negative length on rank " +
+            std::to_string(r));
       if (totalChars > std::numeric_limits<int>::max() - lengths[r])
         throw std::runtime_error("field model_name aggregate length overflows");
       displs[r] = static_cast<int>(totalChars);
@@ -277,10 +277,10 @@ inline void checkAllStages(MPI_Comm comm, int rank, int ranks,
         throw std::runtime_error("field model_name is empty on rank " +
                                  std::to_string(r));
       if (modelNames[r] != modelNames[0])
-        throw std::runtime_error(
-            "field model_name mismatch: rank " + std::to_string(r) + " has '" +
-            modelNames[r] + "', expected '" + modelNames[0] +
-            "' (from rank 0)");
+        throw std::runtime_error("field model_name mismatch: rank " +
+                                 std::to_string(r) + " has '" + modelNames[r] +
+                                 "', expected '" + modelNames[0] +
+                                 "' (from rank 0)");
     }
   }
 
@@ -307,10 +307,10 @@ inline void checkAllStages(MPI_Comm comm, int rank, int ranks,
                              std::to_string(refVocab) + ")");
   if (refDtype != static_cast<int>(ActivationType::F16) &&
       refDtype != static_cast<int>(ActivationType::F32))
-    throw std::runtime_error("field dtype must be f16 or f32 (rank 0 has " +
-                             std::string(activationTypeName(
-                                 static_cast<ActivationType>(refDtype))) +
-                             ")");
+    throw std::runtime_error(
+        "field dtype must be f16 or f32 (rank 0 has " +
+        std::string(activationTypeName(static_cast<ActivationType>(refDtype))) +
+        ")");
   if (refPrefillChunk < 0 || refPrefillChunk > refContext)
     throw std::runtime_error(
         "field prefillChunk out of context range (rank 0 has " +
@@ -330,11 +330,10 @@ inline void checkAllStages(MPI_Comm comm, int rank, int ranks,
     const int prefillChunk = stage[8];
 
     if (totalLayers != refTotalLayers)
-      throw std::runtime_error("field totalLayers mismatch: rank " +
-                               std::to_string(r) + " has " +
-                               std::to_string(totalLayers) + ", expected " +
-                               std::to_string(refTotalLayers) +
-                               " (from rank 0)");
+      throw std::runtime_error(
+          "field totalLayers mismatch: rank " + std::to_string(r) + " has " +
+          std::to_string(totalLayers) + ", expected " +
+          std::to_string(refTotalLayers) + " (from rank 0)");
     if (context != refContext)
       throw std::runtime_error("field context mismatch: rank " +
                                std::to_string(r) + " has " +
@@ -363,11 +362,10 @@ inline void checkAllStages(MPI_Comm comm, int rank, int ranks,
           std::string(
               activationTypeName(static_cast<ActivationType>(refDtype))));
     if (prefillChunk != refPrefillChunk)
-      throw std::runtime_error("field prefillChunk mismatch: rank " +
-                               std::to_string(r) + " has " +
-                               std::to_string(prefillChunk) + ", expected " +
-                               std::to_string(refPrefillChunk) +
-                               " (from rank 0)");
+      throw std::runtime_error(
+          "field prefillChunk mismatch: rank " + std::to_string(r) + " has " +
+          std::to_string(prefillChunk) + ", expected " +
+          std::to_string(refPrefillChunk) + " (from rank 0)");
 
     auto fieldValue = [](int field, int value) -> std::string {
       if (field == 9)
@@ -402,17 +400,17 @@ inline void checkAllStages(MPI_Comm comm, int rank, int ranks,
     if (r > 0) {
       if (startLayer < expectedStart)
         throw std::runtime_error("field startLayer/endLayer overlap: rank " +
-                                 std::to_string(r) + " startLayer=" +
-                                 std::to_string(startLayer) +
+                                 std::to_string(r) +
+                                 " startLayer=" + std::to_string(startLayer) +
                                  " overlaps rank " + std::to_string(r - 1) +
                                  " endLayer=" + std::to_string(expectedStart));
       if (startLayer > expectedStart)
         throw std::runtime_error("field startLayer/endLayer gap (missing "
                                  "layers): rank " +
-                                 std::to_string(r - 1) + " endLayer=" +
-                                 std::to_string(expectedStart) + " < rank " +
-                                 std::to_string(r) + " startLayer=" +
-                                 std::to_string(startLayer));
+                                 std::to_string(r - 1) +
+                                 " endLayer=" + std::to_string(expectedStart) +
+                                 " < rank " + std::to_string(r) +
+                                 " startLayer=" + std::to_string(startLayer));
     }
     expectedStart = endLayer;
   }
@@ -420,15 +418,16 @@ inline void checkAllStages(MPI_Comm comm, int rank, int ranks,
   if (expectedStart != refTotalLayers) {
     if (expectedStart < refTotalLayers)
       throw std::runtime_error(
-          "field endLayer/totalLayers gap (missing trailing layers): last rank " +
-          std::to_string(ranks - 1) + " endLayer=" +
-          std::to_string(expectedStart) + " < totalLayers=" +
-          std::to_string(refTotalLayers));
+          "field endLayer/totalLayers gap (missing trailing layers): last "
+          "rank " +
+          std::to_string(ranks - 1) +
+          " endLayer=" + std::to_string(expectedStart) +
+          " < totalLayers=" + std::to_string(refTotalLayers));
     throw std::runtime_error(
         "field endLayer/totalLayers exceeds model: last rank " +
-        std::to_string(ranks - 1) + " endLayer=" +
-        std::to_string(expectedStart) + " > totalLayers=" +
-        std::to_string(refTotalLayers));
+        std::to_string(ranks - 1) +
+        " endLayer=" + std::to_string(expectedStart) +
+        " > totalLayers=" + std::to_string(refTotalLayers));
   }
 }
 
@@ -469,8 +468,10 @@ inline void generateTokenized(const DistributedGenerateOptions &opts,
                              config.activationWidth, capacity))
       throw std::length_error("activation shape exceeds MPI element count");
     if (config.dtype == ActivationType::F32) {
-      hiddenF32.resize(capacity);
-      hidden = hiddenF32.data();
+      hiddenF32.resize(size_t(capacity) + 15);
+      void *base = hiddenF32.data();
+      size_t space = hiddenF32.size() * sizeof(float);
+      hidden = std::align(64, size_t(capacity) * sizeof(float), base, space);
     } else {
       hiddenF16.resize(capacity);
       hidden = hiddenF16.data();
@@ -521,19 +522,17 @@ inline void generateTokenized(const DistributedGenerateOptions &opts,
                               int &stop) {
     if (config.dtype == ActivationType::F16) {
       const auto *f16 = static_cast<const uint16_t *>(rawOut);
-      if (raw.is_open() &&
-          !raw.write(reinterpret_cast<const char *>(f16),
-                     static_cast<std::streamsize>(logits.size() *
-                                                  sizeof(uint16_t))))
+      if (raw.is_open() && !raw.write(reinterpret_cast<const char *>(f16),
+                                      static_cast<std::streamsize>(
+                                          logits.size() * sizeof(uint16_t))))
         throw std::runtime_error("error writing " + opts.logitsDumpPath);
       std::transform(f16, f16 + logits.size(), logits.begin(),
                      buddy::kvcache::detail::halfToFloat);
     } else {
       const auto *f32 = static_cast<const float *>(rawOut);
-      if (raw.is_open() &&
-          !raw.write(reinterpret_cast<const char *>(f32),
-                     static_cast<std::streamsize>(logits.size() *
-                                                  sizeof(float))))
+      if (raw.is_open() && !raw.write(reinterpret_cast<const char *>(f32),
+                                      static_cast<std::streamsize>(
+                                          logits.size() * sizeof(float))))
         throw std::runtime_error("error writing " + opts.logitsDumpPath);
       std::copy_n(f32, logits.size(), logits.begin());
     }
@@ -546,9 +545,10 @@ inline void generateTokenized(const DistributedGenerateOptions &opts,
     if (opts.streamJsonl) {
       std::cout << "{\"event\":\"token\",\"phase\":\""
                 << (genStep == 0 ? "prefill" : "decode")
-                << "\",\"iteration\":" << genStep << ",\"user\":0,\"token_id\":"
-                << token << ",\"text\":\"\",\"stopped\":"
-                << (stop ? "true" : "false") << "}\n"
+                << "\",\"iteration\":" << genStep
+                << ",\"user\":0,\"token_id\":" << token
+                << ",\"text\":\"\",\"stopped\":" << (stop ? "true" : "false")
+                << "}\n"
                 << std::flush;
     }
     if (!first)
@@ -565,6 +565,9 @@ inline void generateTokenized(const DistributedGenerateOptions &opts,
       for (int i = 0; i < std::min(2, plan.size()); ++i)
         async->postReceive(plan[i].header, rank - 1);
 
+    const bool observe = first && std::getenv("BUDDY_PP_OBSERVE");
+    auto firstFrame = observe ? std::chrono::steady_clock::now()
+                              : std::chrono::steady_clock::time_point{};
     for (int i = 0; i < plan.size(); ++i) {
       const auto frame = plan[i];
       const auto &header = frame.header;
@@ -607,6 +610,12 @@ inline void generateTokenized(const DistributedGenerateOptions &opts,
     } else if (first) {
       mpiCheck(MPI_Recv(&token, 1, MPI_INT, ranks - 1, kTokenTag, comm,
                         MPI_STATUS_IGNORE));
+    }
+    if (observe) {
+      auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - firstFrame)
+                    .count();
+      std::fprintf(stderr, "pp_first rank=0 ttft_us=%lld\n", (long long)us);
     }
     if (ranks > 1)
       mpiCheck(MPI_Bcast(&stop, 1, MPI_INT, ranks - 1, comm));
@@ -759,6 +768,14 @@ inline void generateDistributed(const DistributedGenerateOptions &opts,
     promptRows = tokenizePrompt(opts.prompt, opts.vocabPath, config.context,
                                 opts.tokenizer, tokenInput);
 
+    if (std::getenv("BUDDY_PP_OBSERVE")) {
+      std::ostringstream ids;
+      ids << "pp_prompt ids=[";
+      for (int i = 0; i < promptRows; ++i)
+        ids << (i ? "," : "") << tokenInput[i];
+      ids << "]\n";
+      std::fputs(ids.str().c_str(), stderr);
+    }
     resolvedNewTokens = resolveGeneratedTokenLimit(
         opts.maxTokens, opts.tokenLimitMode, opts.allowZeroTokenLimit,
         promptRows, config.context);

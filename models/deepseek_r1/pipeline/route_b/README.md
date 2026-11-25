@@ -65,3 +65,51 @@ The optional target `bj47_checked_heap_runtime` builds a verification backend in
 the same executable and component DSOs. It allocates scratch from the system
 heap, rejects invalid frees, and clears and frees outstanding scratch on return.
 The loaded runtime path is printed by the harness.
+
+## Publish and run the MPI host
+
+Place the matching tokenizer vocabulary alongside the stage-1 component
+files. Publishing checks every weight and kernel against its receipt and
+binds their hashes, tokenizer, runtime and model settings into the bundle ID.
+
+```sh
+python3 tools/buddy-codegen/gen_manifest.py --format route-b-json \
+  --config "$BUNDLE/components.json" -o "$BUNDLE/route-b.json"
+cmake -S models/deepseek_r1/pipeline/route_b/host -B "$HOST_BUILD" \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build "$HOST_BUILD" --target buddy-pp-route-b
+```
+
+The host requires a C++17 compiler, MPI, nlohmann-json and OpenSSL Crypto.
+Use the K3 toolchain and target OpenSSL libraries for a cross build. Set
+`RISCV_MPI_DIR` to the target MPICH prefix. A kernel build can also enable
+`BJ47_ROUTE_B_HOST` to expose the executable target in the same build tree.
+Native host builds with testing enabled include three mock-kernel tests.
+Build the default target before running `ctest --test-dir "$HOST_BUILD"`.
+
+Deploy the index, vocabulary, kernels, shared runtime and weights to the
+same relative paths on all participating hosts. Verify deployed file hashes
+against the published index. Launch with the board's MPI fabric settings,
+runtime library paths and AI-core selection. The host validates the index,
+range chain and live kernel descriptors before generation. Each process
+opens only the weight blobs belonging to its current range plus RoPE.
+
+```sh
+mpiexec -n 2 buddy-pp-route-b --bundle "$BUNDLE/route-b.json" \
+  --ranges 0:14,14:28 --prompt "What is the capital of France?" --total-tokens 128
+```
+
+For a new request, restart with `--ranges 0:16,16:28`. Each process starts
+with empty persistent KV for its new range. In MPMD jobs supply a single
+`--stage-range A:B` per rank. A single rank defaults to the whole model.
+`--total-tokens` follows the Route A total sequence length convention.
+The baseline uses blocking FP32 transport and greedy sampling. Set
+`BUDDY_PP_TIMING=1` for existing per-frame compute/communication intervals
+and per-stage logical mapping/KV byte counts. Set `BUDDY_PP_OBSERVE=1`
+to also emit READY, actual prompt IDs, rank-0 first-frame-to-token time and
+per-rank Linux VmHWM for either route. READY precedes tokenization.
+
+Kernel files are small enough to check their complete SHA-256 before
+dlopen on every launch. To recheck the contents of every local weight
+mapping, add `--verify-weights`. This touches all its pages and is excluded
+from hot-restart and residency measurements.

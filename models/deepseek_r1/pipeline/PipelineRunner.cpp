@@ -15,7 +15,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "PipelineRunner.h"
-#include "DistributedGenerate.h"
+#include "PipelineGenerate.h"
 
 #include "buddy/runtime/core/ModelManifest.h"
 #include "buddy/runtime/pipeline/Stage.h"
@@ -153,55 +153,6 @@ private:
   void *handle = nullptr;
 };
 
-void checkLocalConfig(const StageManifest &spec, const StageConfig &config) {
-  if (spec.startLayer != config.startLayer)
-    throw std::runtime_error(
-        "local config mismatch on field pp_start_layer: manifest has " +
-        std::to_string(spec.startLayer) + ", stage library reports " +
-        std::to_string(config.startLayer));
-  if (spec.endLayer != config.endLayer)
-    throw std::runtime_error(
-        "local config mismatch on field pp_end_layer: manifest has " +
-        std::to_string(spec.endLayer) + ", stage library reports " +
-        std::to_string(config.endLayer));
-  if (spec.totalLayers != config.totalLayers)
-    throw std::runtime_error(
-        "local config mismatch on field pp_total_layers: manifest has " +
-        std::to_string(spec.totalLayers) + ", stage library reports " +
-        std::to_string(config.totalLayers));
-  if (spec.activationWidth != config.activationWidth)
-    throw std::runtime_error(
-        "local config mismatch on field pp_activation_width: manifest has " +
-        std::to_string(spec.activationWidth) + ", stage library reports " +
-        std::to_string(config.activationWidth));
-
-  const std::string libType = pipeline::activationTypeName(config.dtype);
-  if (spec.activationType != libType ||
-      (config.dtype != ActivationType::F16 &&
-       config.dtype != ActivationType::F32))
-    throw std::runtime_error(
-        "local config mismatch on field pp_activation_type: manifest has '" +
-        spec.activationType + "', stage library reports '" + libType + "'");
-
-  if (config.context <= 0)
-    throw std::runtime_error("stage library reports non-positive field context "
-                             "(" +
-                             std::to_string(config.context) + ")");
-  if (config.vocabSize <= 0)
-    throw std::runtime_error(
-        "stage library reports non-positive field vocabSize (" +
-        std::to_string(config.vocabSize) + ")");
-  if (config.prefillChunk < 0 || config.prefillChunk > config.context)
-    throw std::runtime_error(
-        "stage library reports out-of-range field prefillChunk (" +
-        std::to_string(config.prefillChunk) + ")");
-  if (spec.prefillChunk > 0 && spec.prefillChunk != config.prefillChunk)
-    throw std::runtime_error(
-        "local config mismatch on field pp_prefill_chunk: manifest has " +
-        std::to_string(spec.prefillChunk) + ", stage library reports " +
-        std::to_string(config.prefillChunk));
-}
-
 void validateRunConfig(const RunConfig &cfg) {
   if (cfg.raxPath.empty())
     throw std::runtime_error("field raxPath must be non-empty");
@@ -229,49 +180,13 @@ void validateRunConfig(const RunConfig &cfg) {
                              std::to_string(cfg.maxNewTokens) + ")");
 }
 
-int parseOptionalPositiveEnvInt(const char *name) {
-  const char *raw = std::getenv(name);
-  if (!raw || raw[0] == '\0')
-    return 0;
-  std::string value(raw);
-  int parsed = 0;
-  const char *end = value.data() + value.size();
-  const auto res = std::from_chars(value.data(), end, parsed);
-  if (res.ec != std::errc{} || res.ptr != end || parsed <= 0)
-    throw std::runtime_error(std::string("invalid test hook ") + name + "='" +
-                             value + "' (expected positive integer)");
-  return parsed;
-}
-
-std::string optionalEnvString(const char *name) {
-  const char *raw = std::getenv(name);
-  if (!raw || raw[0] == '\0')
-    return {};
-  return std::string(raw);
-}
-
-pipeline::TokenizerKind resolveTokenizerKind(const std::string &name) {
-  if (name.empty() || name == "deepseek_r1")
-    return pipeline::TokenizerKind::DeepSeekR1;
-  if (name == "qwen3")
-    return pipeline::TokenizerKind::Qwen3;
-  throw std::runtime_error("unsupported stage tokenizer '" + name +
-                           "' (expected 'deepseek_r1' or 'qwen3')");
-}
-
-void appendUniqueStopToken(std::vector<int> &stopTokenIds, int tokenId) {
-  if (std::find(stopTokenIds.begin(), stopTokenIds.end(), tokenId) ==
-      stopTokenIds.end())
-    stopTokenIds.push_back(tokenId);
-}
-
 [[noreturn]] void abortPipelineJob(MPI_Comm comm, int rank,
                                    const std::string &raxPath,
                                    const std::string &modelName,
                                    const std::string &detail) {
   std::ostringstream os;
-  os << "rank " << rank << " [package="
-     << (raxPath.empty() ? "<unset>" : raxPath);
+  os << "rank " << rank
+     << " [package=" << (raxPath.empty() ? "<unset>" : raxPath);
   if (!modelName.empty())
     os << ", model=" << modelName;
   os << "]: " << detail << '\n';
@@ -306,53 +221,8 @@ void PipelineRunner::run(const RunConfig &cfg) {
 
     StageLibrary lib(m.soPath);
     auto stage = lib.create(m.weightPaths);
-    checkLocalConfig(spec, stage->configuration());
-
-    pipeline::StageCheckOptions checkOpts;
-    checkOpts.modelName = m.modelName;
-    checkOpts.requireModelName = true;
-    checkOpts.wireDtype = spec.wireDtype;
-    checkOpts.transport = spec.transport;
-    pipeline::checkAllStages(comm, rank, size, stage->configuration(),
-                             checkOpts);
-
-    pipeline::DistributedGenerateOptions genOpts;
-    genOpts.transport = spec.transport;
-    genOpts.wireDtype = spec.wireDtype;
-    if (rank == 0) {
-      const auto wire =
-          resolveWireSpec(stage->configuration().dtype, spec.wireDtype);
-      std::cerr << "pipeline transport="
-                << (spec.transport == pipeline::Transport::Async ? "async" : "blocking")
-                << " requested_wire="
-                << (spec.wireDtype == pipeline::WireDtype::F16 ? "f16"
-                                                               : "native")
-                << " effective_wire="
-                << (size == 1 ? "none"
-                              : pipeline::activationTypeName(wire.dtype))
-                << " version=" << wire.version << '\n';
-    }
-    genOpts.prompt = cfg.prompt;
-    genOpts.vocabPath = m.vocabPath;
-    genOpts.tokenizer = resolveTokenizerKind(spec.tokenizer);
-    genOpts.stopTokenIds = spec.stopTokenIds;
-    if (genOpts.tokenizer == pipeline::TokenizerKind::Qwen3) {
-      // Match whole-model Qwen3VLMoeRunner stop tokens: <|im_end|> and
-      // <|endoftext|>.
-      appendUniqueStopToken(genOpts.stopTokenIds, 151645);
-      appendUniqueStopToken(genOpts.stopTokenIds, 151643);
-    }
-    genOpts.tokenLimitMode = pipeline::TokenLimitMode::TotalSequenceLength;
-    genOpts.maxTokens = cfg.maxNewTokens;
-    genOpts.allowZeroTokenLimit = true;
-    genOpts.samplerConfig = cfg.samplerConfig;
-    genOpts.streamJsonl = cfg.streamJsonl;
-    // Test-only hooks (do not change public RunConfig).
-    genOpts.logitsDumpPath = optionalEnvString("BUDDY_PP_DUMP_LOGITS");
-    genOpts.testEosAtStep = parseOptionalPositiveEnvInt("BUDDY_PP_TEST_EOS_STEP");
-    genOpts.traceStagePrefix = optionalEnvString("BUDDY_PP_TRACE_STAGE");
-
-    pipeline::generateDistributed(genOpts, *stage, comm, rank, size);
+    runDistributedStage(*stage, spec, m.modelName, m.vocabPath, cfg, comm, rank,
+                        size);
   } catch (const std::exception &err) {
     abortPipelineJob(comm, rank, cfg.raxPath, modelName, err.what());
   } catch (...) {
