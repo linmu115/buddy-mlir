@@ -58,7 +58,11 @@
 #include <time.h>
 #include <unistd.h>
 
+#ifdef BUDDY_COMPONENT_RUNTIME
+#define API __attribute__((visibility("default")))
+#else
 #define API __attribute__((visibility("hidden")))
+#endif
 #define MAX_ARGS 24
 
 typedef struct ident ident_t;

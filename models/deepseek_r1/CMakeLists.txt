@@ -108,3 +108,7 @@ buddy_add_pipeline_stages(
   VAR_PREFIX DEEPSEEKR1
   FALLBACK_VOCAB "${CMAKE_SOURCE_DIR}/examples/BuddyDeepSeekR1/vocab.txt"
 )
+
+if(BJ47_ROUTE_B_BUNDLE)
+  add_subdirectory(pipeline/route_b)
+endif()

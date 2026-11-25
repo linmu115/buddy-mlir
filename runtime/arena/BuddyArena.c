@@ -44,7 +44,11 @@
 #include <stdlib.h>
 #include <sys/mman.h>
 
+#ifdef BUDDY_COMPONENT_RUNTIME
+#define HIDDEN __attribute__((visibility("default")))
+#else
 #define HIDDEN __attribute__((visibility("hidden")))
+#endif
 
 #ifndef BUDDY_ARENA_DEFAULT_PREFAULT_MB
 #define BUDDY_ARENA_DEFAULT_PREFAULT_MB 512

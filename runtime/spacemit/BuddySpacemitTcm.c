@@ -60,7 +60,11 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#ifdef BUDDY_COMPONENT_RUNTIME
+#define API __attribute__((visibility("default")))
+#else
 #define API __attribute__((visibility("hidden")))
+#endif
 #define MAX_REGIONS 16
 #define MAX_CPUS 64
 

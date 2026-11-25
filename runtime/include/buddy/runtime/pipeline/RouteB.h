@@ -1,0 +1,56 @@
+#pragma once
+#include <stdint.h>
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef struct {
+  uint32_t abi_version, struct_bytes, role; /* 1=embed, 2=decoder, 3=head */
+  uint32_t chunk, context, width, kv_heads, head_dim, vocab_size;
+  uint64_t f32_elements, i8_elements, rope_elements;
+  uint64_t aux_prefill_bytes, aux_decode_bytes, required_alignment;
+  uint8_t layout_id[32], shape_id[32]; /* SHA-256 */
+} BJ47KernelInfoV1;
+
+typedef struct {
+  const float *f32;
+  const int8_t *q4;
+} BJ47WeightsV1;
+
+typedef struct {
+  int64_t cache_position;
+  const float *cos_rows;
+  const float *sin_rows;
+  const void *aux; /* same decoder DSO defines and consumes it */
+} BJ47FrameV1;
+
+/* Every DSO exports this on its own dlopen handle. Library owns the result. */
+const BJ47KernelInfoV1 *bj47_kernel_info_v1(void);
+
+/* embed.so: rows fixed to chunk or 1 by the entry */
+int32_t embed_prefill(const float *table, const int64_t *ids, float *out);
+int32_t embed_decode(const float *table, const int64_t *ids, float *out);
+
+/* decoder_layer.so: caller owns cos, sin, aux, K, V and out */
+int32_t prepare_prefill(const float *inv_freq, int64_t pos, float *cos_rows,
+                        float *sin_rows, void *aux);
+int32_t prepare_decode(const float *inv_freq, int64_t pos, float *cos_rows,
+                       float *sin_rows, void *aux);
+int32_t layer_prefill(const BJ47WeightsV1 *w, const float *in, float *k,
+                      float *v, const BJ47FrameV1 *frame, float *out);
+int32_t layer_decode(const BJ47WeightsV1 *w, const float *in, float *k,
+                     float *v, const BJ47FrameV1 *frame, float *out);
+
+/* lm_head.so: row points at one contiguous H-vector; logits has V floats */
+int32_t lm_head(const BJ47WeightsV1 *w, const float *row, float *logits);
+
+/* The info descriptor stays V1. Head kernel ABI 2 has two numerical paths.
+ * Select by phase; lm_head is a compatibility alias for lm_head_decode.
+ * Caller buffers must be contiguous, disjoint and aligned to
+ * required_alignment. A successful prepare fills both [R,D] arrays. No aux
+ * allocation is required. */
+int32_t lm_head_decode(const BJ47WeightsV1 *, const float *, float *);
+int32_t lm_head_prefill(const BJ47WeightsV1 *, const float *, float *);
+#ifdef __cplusplus
+}
+#endif
