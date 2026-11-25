@@ -152,7 +152,7 @@ def checkpoint_key_for_param(
         global_idx = start + int(match.group(1))
         ckpt_key = f"{model_prefix}layers.{global_idx}.{match.group(2)}"
     elif local_name.startswith("model."):
-        ckpt_key = f"{model_prefix}{local_name[len('model.'):]}"
+        ckpt_key = f"{model_prefix}{local_name[len('model.') :]}"
     else:
         ckpt_key = local_name
     if ckpt_key in weight_map:
@@ -170,8 +170,18 @@ def checkpoint_key_for_param(
     )
 
 
-def select_layers(model, start, end, total):
+def select_layers(model, start, end, total, role="stage"):
     """Select a half-open layer interval before Dynamo traces decoder.forward."""
+    if role not in ("stage", "embed", "decoder", "head"):
+        raise ValueError(f"unknown component role {role!r}")
+    if not 0 <= start < end <= total or (
+        role == "decoder" and end != start + 1
+    ):
+        raise ValueError(f"invalid {role} interval [{start}, {end})")
+    keep_embed = role == "embed" or (role == "stage" and start == 0)
+    keep_head = role == "head" or (role == "stage" and end == total)
+    if role in ("embed", "head"):
+        end = start
     decoder = model.model
     decoder.layers = torch.nn.ModuleList(decoder.layers[start:end])
     if getattr(model.config, "layer_types", None) is not None:
@@ -179,9 +189,9 @@ def select_layers(model, start, end, total):
     model.config.num_hidden_layers = end - start
     for local_idx, layer in enumerate(decoder.layers):
         layer.self_attn.layer_idx = local_idx
-    if start:
+    if not keep_embed:
         decoder.embed_tokens = torch.nn.Identity()
-    if end != total:
+    if not keep_head:
         decoder.norm = torch.nn.Identity()
         model.lm_head = torch.nn.Identity()
 
@@ -353,7 +363,9 @@ def load_stage_full(config, start, end):
     return model, total, width
 
 
-def _load_tensor_into_dtype(reader, ckpt_key, expected_shape, target_dtype, transpose_12=False):
+def _load_tensor_into_dtype(
+    reader, ckpt_key, expected_shape, target_dtype, transpose_12=False
+):
     """Load one tensor, validate shape, optionally transpose dims (1, 2), and cast."""
     raw = reader.get_tensor(ckpt_key)
     if transpose_12:
@@ -383,7 +395,7 @@ def _load_tensor_into_dtype(reader, ckpt_key, expected_shape, target_dtype, tran
     return raw
 
 
-def load_stage_lazy(config, start, end):
+def load_stage_lazy(config, start, end, role="stage"):
     """Build an empty meta model, crop layers, and load only stage tensors.
 
     Supports Qwen2ForCausalLM and Qwen3-MoE across all three on-disk layouts:
@@ -417,7 +429,7 @@ def load_stage_lazy(config, start, end):
             model = Qwen3MoeForCausalLM(hf_config)
         else:
             model = AutoModelForCausalLM.from_config(hf_config)
-    select_layers(model, start, end, total)
+    select_layers(model, start, end, total, role)
 
     weight_map = resolve_safetensors_map(model_dir)
 
@@ -469,7 +481,7 @@ def load_stage_lazy(config, start, end):
                 loaded_tensors += 1
 
     # 2. Layer-by-layer, shard-by-shard loading.
-    for local_idx in range(end - start):
+    for local_idx in range(len(model.model.layers)):
         global_idx = start + local_idx
         params = layer_params.get(local_idx, {})
         has_moe_experts = (
@@ -491,9 +503,7 @@ def load_stage_lazy(config, start, end):
             dn_merged_key = (
                 f"{model_prefix}layers.{global_idx}.{_MOE_DOWN_SUFFIX}"
             )
-            split_probe = (
-                f"{model_prefix}layers.{global_idx}.mlp.experts.0.gate_proj.weight"
-            )
+            split_probe = f"{model_prefix}layers.{global_idx}.mlp.experts.0.gate_proj.weight"
 
             if gu_merged_key in weight_map and dn_merged_key in weight_map:
                 transpose_experts = (
@@ -662,7 +672,9 @@ def check_parameter_layout(prefill, decode):
 def stage_w4g32_param_counts(hf_config, start, end, total, ime):
     """Expected (f32_params, i8_params) element counts for stage [start, end)."""
     hf_dict = (
-        hf_config.to_dict() if hasattr(hf_config, "to_dict") else dict(hf_config)
+        hf_config.to_dict()
+        if hasattr(hf_config, "to_dict")
+        else dict(hf_config)
     )
     if not hf_dict.get("architectures"):
         model_type = hf_dict.get("model_type")
@@ -684,7 +696,9 @@ def export_k3_weights_direct(graph, config, output_dir, expected_counts):
     tag_to_weight = {w["tag"]: w for w in config["weights"]}
     for required in ("f32_params", "i8_params"):
         if required not in tag_to_weight:
-            raise ValueError(f"w4g32 stage config missing weight bucket {required}")
+            raise ValueError(
+                f"w4g32 stage config missing weight bucket {required}"
+            )
 
     f32_path = Path(output_dir) / tag_to_weight["f32_params"]["file"]
     i8_path = Path(output_dir) / tag_to_weight["i8_params"]["file"]
@@ -867,12 +881,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument(
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--route-b", action="store_true")
+    mode.add_argument(
         "--layers",
         type=int,
         nargs=2,
         metavar=("START", "END"),
-        required=True,
         help="zero-based interval [START, END)",
     )
     parser.add_argument(
@@ -882,8 +897,14 @@ def main():
         help="checkpoint loading strategy: lazy (stage weights only) or full",
     )
     args = parser.parse_args()
+    config = json.loads(args.config.read_text())
+    if args.route_b:
+        from route_b_export import export_template_bundle
+
+        export_template_bundle(config, args.output_dir, args.load_mode)
+        return
     export_stage(
-        json.loads(args.config.read_text()),
+        config,
         *args.layers,
         args.output_dir,
         load_mode=args.load_mode,

@@ -406,22 +406,10 @@ def derive_thread_cores(spec: dict, kernels: str | None) -> list | None:
     return list(raw)
 
 
-def w4g32_stage_param_counts(
-    hf: dict,
-    start: int,
-    end: int,
-    total: int,
-    ime: bool,
-    *,
-    prefill_chunk: int | None = None,
+def w4g32_component_param_counts(
+    hf: dict, ime: bool, *, prefill_chunk: int | None = None
 ) -> dict:
-    """w4g32 (graph/transform/k3_w4.py) buffer sizes for layer interval
-    [start, end) of a Qwen2 or Qwen3-MoE model (whole model when start=0 and
-    end=total): every Linear weight [K, N] becomes K * N * 9 / 16 bytes of
-    int4 tiles with their f16 scales; the embedding, the norms, the q / k / v
-    biases (Qwen2) or q/k norms and router (Qwen3-MoE), and the RoPE inv_freq
-    stay f32. With `ime` ("prefill_ime"), the dense layer weights other than
-    the LM head and MoE experts get a second copy, in the IME layout."""
+    """Physical element counts per owner after the K3 w4g32 rewrite."""
     arch = (hf.get("architectures") or ["?"])[0]
     if arch not in ("Qwen2ForCausalLM", "Qwen3MoeForCausalLM"):
         raise ValueError(
@@ -439,10 +427,6 @@ def w4g32_stage_param_counts(
                 f"w4g32 needs prefill_chunk to be a multiple of "
                 f"{W4G32_CHUNK_MULTIPLE}, got {prefill_chunk}"
             )
-    if not 0 <= start < end <= total:
-        raise ValueError(
-            f"invalid layer interval [{start}, {end}) for {total} layers"
-        )
     h = hf["hidden_size"]
     heads = hf["num_attention_heads"]
     d = hf.get("head_dim") or (h // heads)
@@ -453,7 +437,6 @@ def w4g32_stage_param_counts(
         )
     kv = (hf.get("num_key_value_heads") or heads) * d
     vocab = hf["vocab_size"]
-    count = end - start
     linears = [
         (h, heads * d),  # q, k, v: one weight, one tile range each
         (h, kv),
@@ -494,20 +477,48 @@ def w4g32_stage_param_counts(
     # experts: the MoE kernel has no matrix-engine tiles)
     per_layer = sum(k * n for k, n in linears) * (2 if ime else 1)
     per_layer += experts * sum(k * n for k, n in expert_linears)
-    lm_head = h * vocab if end == total else 0
-    i8 = (count * per_layer + lm_head) * 9 // 16
     f32_layer = 2 * h
     if moe:
         f32_layer += 2 * d + h * experts  # q_norm, k_norm, router
     else:
         f32_layer += heads * d + 2 * kv  # the q / k / v biases
-    f32 = (
-        (vocab * h if start == 0 else 0)
-        + count * f32_layer
-        + (h if end == total else 0)
-        + d // 2
-    )
-    return {"f32_elements": f32, "i8_elements": i8}
+    return {
+        "embed": {"f32_elements": vocab * h, "i8_elements": 0},
+        "decoder": {
+            "f32_elements": f32_layer,
+            "i8_elements": per_layer * 9 // 16,
+        },
+        "rope": {"f32_elements": d // 2, "i8_elements": 0},
+        "head": {"f32_elements": h, "i8_elements": h * vocab * 9 // 16},
+    }
+
+
+def w4g32_stage_param_counts(
+    hf: dict,
+    start: int,
+    end: int,
+    total: int,
+    ime: bool,
+    *,
+    prefill_chunk: int | None = None,
+) -> dict:
+    if not 0 <= start < end <= total:
+        raise ValueError(
+            f"invalid layer interval [{start}, {end}) for {total} layers"
+        )
+    parts = w4g32_component_param_counts(hf, ime, prefill_chunk=prefill_chunk)
+    owners = {
+        "rope": 1,
+        "decoder": end - start,
+        "embed": start == 0,
+        "head": end == total,
+    }
+    return {
+        bucket: sum(
+            parts[role][bucket] * count for role, count in owners.items()
+        )
+        for bucket in ("f32_elements", "i8_elements")
+    }
 
 
 def w4g32_param_counts(hf: dict, prefill_chunk: int, ime: bool) -> dict:
