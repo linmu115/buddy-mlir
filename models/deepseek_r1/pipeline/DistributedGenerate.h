@@ -487,9 +487,15 @@ inline void generateTokenized(const DistributedGenerateOptions &opts,
     activation.receive(hidden, capacity, rank - 1, h);
     return hidden;
   };
+  // Software-progress MPI providers may leave a large send idle throughout
+  // the next stage computation. Opt in to completing chunk sends on the
+  // two-rank path while retaining preposted receives.
+  const char *completion = std::getenv("BUDDY_PP_COMPLETE_PREFILL_SEND");
+  const bool completePrefill = ranks == 2 && config.prefillChunk > 0 &&
+                               completion && std::string(completion) == "1";
   auto send = [&](const ActivationHeader &h, const void *output) {
     if (async) {
-      async->postSend(h, output, rank + 1);
+      async->postSend(h, output, rank + 1, completePrefill && h.rows > 1);
     } else {
       FrameInterval interval(rank, h.step, "send-wait");
       activation.send(h, output, rank + 1);

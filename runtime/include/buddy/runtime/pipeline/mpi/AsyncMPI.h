@@ -149,7 +149,8 @@ public:
     return s.data();
   }
 
-  void postSend(const ActivationHeader &frame, const void *data, int peer) {
+  void postSend(const ActivationHeader &frame, const void *data, int peer,
+                bool completeBeforeReturn = false) {
     const int n = checkFrame(frame, peer);
     Slot &s = tx[frame.step % window];
     waitSend(s);
@@ -169,13 +170,17 @@ public:
     s.frame = frame;
     s.header = {frame.version, frame.step, frame.pos, frame.rows};
     s.occupied = true;
-    FrameInterval interval(rank, frame.step, "send-post");
-    auto send = synchronous ? MPI_Issend : MPI_Isend;
-    check(
-        send(s.header.data(), 4, MPI_INT32_T, peer, kHeaderTag, comm, &s.head),
-        frame, peer);
-    check(send(s.data(), n, type, peer, kActivationTag, comm, &s.body), frame,
-          peer);
+    {
+      FrameInterval interval(rank, frame.step, "send-post");
+      auto send = synchronous ? MPI_Issend : MPI_Isend;
+      check(
+          send(s.header.data(), 4, MPI_INT32_T, peer, kHeaderTag, comm, &s.head),
+          frame, peer);
+      check(send(s.data(), n, type, peer, kActivationTag, comm, &s.body), frame,
+            peer);
+    }
+    if (completeBeforeReturn)
+      waitSend(s);
   }
 
   void drain() {
