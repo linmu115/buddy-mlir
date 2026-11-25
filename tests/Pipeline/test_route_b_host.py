@@ -279,3 +279,20 @@ with tempfile.TemporaryDirectory() as directory:
         run(mpmd(other), "model_name")
         run(mpmd(manifest, ("0:13", "14:28")), "gap")
         run(mpmd(manifest))
+
+        # Fail one rank before its first collective, then after plan consensus
+        # while its peer is entering the next collective.
+        index["weights"][0]["dtype"] = "f16"
+        save(other, index)
+        run(mpmd(other), "bucket")
+        (root / "decoder-27.q4").unlink()
+        run(mpmd(manifest), "open")
+
+        # Both ranks' own ranges agree with their neighbours, but the third
+        # rank presents a different full plan for the other two processes.
+        list_job = []
+        for plan in ("0:7,7:14,14:28", "0:7,7:14,14:28", "0:8,8:14,14:28"):
+            if list_job:
+                list_job.append(":")
+            list_job.extend(["-n", "1", *cli(), "--ranges", plan])
+        run([MPI, *list_job], "model_name")
