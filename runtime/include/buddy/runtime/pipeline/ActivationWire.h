@@ -19,6 +19,10 @@
 
 #include "buddy/runtime/pipeline/Stage.h"
 
+#if defined(__riscv_zvfh) && defined(__riscv_v_intrinsic)
+#include <riscv_vector.h>
+#endif
+
 #include <cstring>
 #include <limits>
 #include <string>
@@ -72,7 +76,26 @@ inline void encodeInto(const float *src, size_t count, uint16_t *dst,
                        size_t capacity) {
   if (count > capacity)
     throw std::length_error("activation encode buffer too small");
-  for (size_t i = 0; i < count; ++i) {
+  size_t i = 0;
+#if defined(__riscv_zvfh) && defined(__riscv_v_intrinsic)
+  while (i < count) {
+    const size_t vl = __riscv_vsetvl_e32m4(count - i);
+    const auto values = __riscv_vle32_v_f32m4(src + i, vl);
+    const auto bits = __riscv_vreinterpret_v_f32m4_u32m4(values);
+    const auto magnitude = __riscv_vand_vx_u32m4(bits, 0x7fffffff, vl);
+    // 65520 is the first magnitude which rounds to infinity under RNE.
+    // Replay a rejected vector below to preserve the first error and prefix.
+    if (__riscv_vfirst_m_b8(
+            __riscv_vmsgeu_vx_u32m4_b8(magnitude, 0x477ff000, vl), vl) >= 0)
+      break;
+    const auto halves =
+        __riscv_vfncvt_f_f_w_f16m2_rm(values, __RISCV_FRM_RNE, vl);
+    __riscv_vse16_v_u16m2(dst + i, __riscv_vreinterpret_v_f16m2_u16m2(halves),
+                          vl);
+    i += vl;
+  }
+#endif
+  for (; i < count; ++i) {
     uint32_t bits;
     std::memcpy(&bits, src + i, sizeof(bits));
     const uint16_t sign = (bits >> 16) & 0x8000;
@@ -99,7 +122,21 @@ inline void decodeInto(const uint16_t *src, size_t count, float *dst,
                        size_t capacity) {
   if (count > capacity)
     throw std::length_error("activation decode buffer too small");
-  for (size_t i = 0; i < count; ++i) {
+  size_t i = 0;
+#if defined(__riscv_zvfh) && defined(__riscv_v_intrinsic)
+  while (i < count) {
+    const size_t vl = __riscv_vsetvl_e16m2(count - i);
+    const auto bits = __riscv_vle16_v_u16m2(src + i, vl);
+    const auto magnitude = __riscv_vand_vx_u16m2(bits, 0x7fff, vl);
+    if (__riscv_vfirst_m_b8(__riscv_vmsgeu_vx_u16m2_b8(magnitude, 0x7c00, vl),
+                            vl) >= 0)
+      break;
+    const auto halves = __riscv_vreinterpret_v_u16m2_f16m2(bits);
+    __riscv_vse32_v_f32m4(dst + i, __riscv_vfwcvt_f_f_v_f32m4(halves, vl), vl);
+    i += vl;
+  }
+#endif
+  for (; i < count; ++i) {
     const uint32_t sign = uint32_t(src[i] & 0x8000) << 16;
     int exp = (src[i] >> 10) & 31;
     uint32_t fraction = src[i] & 1023;
