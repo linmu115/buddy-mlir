@@ -19,6 +19,46 @@ from transformers import Qwen2Config, Qwen2ForCausalLM
 
 
 class CountsAndRoles(unittest.TestCase):
+    def test_moe_attention_only_has_duplicate_ime_tiles(self):
+        hf = {
+            "architectures": ["Qwen3MoeForCausalLM"],
+            "hidden_size": 256,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 64,
+            "vocab_size": 151936,
+            "moe_intermediate_size": 128,
+            "num_experts": 8,
+            "norm_topk_prob": True,
+            "num_hidden_layers": 4,
+        }
+        for ime in (False, True):
+            for start in range(4):
+                for end in range(start + 1, 5):
+                    layers = end - start
+                    counts = w4g32_stage_param_counts(hf, start, end, 4, ime)
+                    self.assertEqual(
+                        counts["f32_elements"],
+                        32
+                        + 2688 * layers
+                        + (start == 0) * 38895616
+                        + (end == 4) * 256,
+                    )
+                    self.assertEqual(
+                        counts["i8_elements"],
+                        layers * (442368 + 110592 * (1 + ime))
+                        + (end == 4) * 21878784,
+                    )
+        for extra in (
+            {"use_sliding_window": True},
+            {"layer_types": ["sliding_attention"]},
+            {"decoder_sparse_step": 2},
+            {"mlp_only_layers": [0]},
+            {"norm_topk_prob": False},
+        ):
+            with self.assertRaises(ValueError):
+                w4g32_component_param_counts({**hf, **extra}, True)
+
     def test_route_b_counts_and_roles(self):
         hf = {
             "architectures": ["Qwen2ForCausalLM"],

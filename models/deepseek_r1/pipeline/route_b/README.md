@@ -1,4 +1,4 @@
-# Qwen2 K3 component kernels
+# Qwen2 and Qwen3-MoE K3 component kernels
 
 Export from the original full-model configuration. Use the same native Buddy
 Python packages, MLIR binaries and K3 cross toolchain as a working Route A build.
@@ -13,8 +13,7 @@ cmake -G Ninja -S models/deepseek_r1/pipeline/route_b -B "$BUILD" \
 cmake --build "$BUILD" --target bj47-route-b-kernels
 ```
 
-The export directory must be new. Publication occurs after all 28 component
-graphs and weight layouts have been checked for the 1.5B checkpoint. Only the
+The export directory must be new. Publication occurs after every layer graph and weight layout has been checked. Only the
 first decoder goes through fusion and MLIR emission. `components.json` indexes
 content hashes and global layer IDs. `slots.json` uses layer 0 names as
 template-local names. For another global layer, substitute its index in the

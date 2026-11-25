@@ -10,10 +10,31 @@ foreach(var BJ47_ROUTE_B_BUNDLE BJ47_BUDDY_OPT BJ47_LLVM_TOOLS BJ47_CRUNNER)
     message(FATAL_ERROR "Set ${var} to an existing artifact")
   endif()
 endforeach()
+set(components "${BJ47_ROUTE_B_BUNDLE}/components.json")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${components}")
+file(READ "${components}" metadata)
+string(JSON prefault ERROR_VARIABLE missing GET "${metadata}" config arena_prefault_mb)
+if(missing)
+  set(prefault 512)
+endif()
+separate_arguments(shim_flags NATIVE_COMMAND "${CMAKE_CXX_FLAGS}")
+string(TOUPPER "${CMAKE_BUILD_TYPE}" build_type)
+separate_arguments(build_flags NATIVE_COMMAND "${CMAKE_CXX_FLAGS_${build_type}}")
+list(APPEND shim_flags ${build_flags})
+if(CMAKE_CXX_COMPILER_TARGET)
+  list(APPEND shim_flags "--target=${CMAKE_CXX_COMPILER_TARGET}")
+endif()
+if(CMAKE_CXX_COMPILER_EXTERNAL_TOOLCHAIN)
+  list(APPEND shim_flags "--gcc-toolchain=${CMAKE_CXX_COMPILER_EXTERNAL_TOOLCHAIN}")
+endif()
+if(CMAKE_SYSROOT)
+  list(APPEND shim_flags "--sysroot=${CMAKE_SYSROOT}")
+endif()
+list(TRANSFORM shim_flags PREPEND "--cxx-flag=")
 add_library(bj47_kernel_runtime SHARED Runtime.c
   "${repo}/runtime/arena/BuddyArena.c" "${repo}/runtime/threadpool/BuddyThreadPool.c"
   "${repo}/runtime/spacemit/BuddySpacemitTcm.c")
-target_compile_definitions(bj47_kernel_runtime PRIVATE BUDDY_COMPONENT_RUNTIME)
+target_compile_definitions(bj47_kernel_runtime PRIVATE BUDDY_COMPONENT_RUNTIME BUDDY_ARENA_DEFAULT_PREFAULT_MB=${prefault})
 target_compile_options(bj47_kernel_runtime PRIVATE -O2)
 target_link_libraries(bj47_kernel_runtime PRIVATE pthread dl m)
 set_target_properties(bj47_kernel_runtime PROPERTIES LIBRARY_OUTPUT_DIRECTORY "${BJ47_ROUTE_B_BUNDLE}")
@@ -32,7 +53,7 @@ foreach(role embed decoder_layer lm_head)
   add_custom_command(OUTPUT "${out}" "${receipt}"
     COMMAND "${Python3_EXECUTABLE}" "${codegen}/build_route_b.py"
       --bundle "${BJ47_ROUTE_B_BUNDLE}" --role "${role}" --work "${CMAKE_CURRENT_BINARY_DIR}/${role}"
-      --buddy-opt "${BJ47_BUDDY_OPT}" --llvm "${BJ47_LLVM_TOOLS}" --cxx "${CMAKE_CXX_COMPILER}" --crunner "${BJ47_CRUNNER}"
+      --buddy-opt "${BJ47_BUDDY_OPT}" --llvm "${BJ47_LLVM_TOOLS}" --cxx "${CMAKE_CXX_COMPILER}" --crunner "${BJ47_CRUNNER}" ${shim_flags}
     DEPENDS bj47_kernel_runtime ${mlir} "${BJ47_ROUTE_B_BUNDLE}/components.json"
       "${codegen}/build_route_b.py" "${codegen}/route_b_lower.py" "${codegen}/compile_pipeline.py"
       Shim.h "${repo}/runtime/include/buddy/runtime/pipeline/RouteB.h"

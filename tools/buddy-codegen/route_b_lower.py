@@ -1,4 +1,4 @@
-"""Specialize the static Qwen2 component IR. Reject unrecognized driver shapes.
+"""Specialize the static K3 component IR. Reject unrecognized driver shapes.
 
 The packed driver supplies the slot offsets and the subgraph operand ordering.
 Make the actual subgraph the private MLIR entry, so no full-stage return struct
@@ -57,7 +57,12 @@ def subgraph(ir, driver, role, phase, rows, dim):
     output = ty.replace("tensor", "memref")
     args = list(zip(bindings, [s[1].rstrip("x") for s in shapes], strict=True))
     if role == "decoder_layer":
-        inv = one(r"call @k3_attn_\w+\([^)]*, (%arg\d+)\)", ir)
+        # K3 attention takes inv_freq after cache_position. Qwen3 then
+        # passes its two per-head RMSNorm weights.
+        operands = one(r"call @k3_attn_\w+\(([^)]*)\)", ir).split(", ")
+        if len(operands) not in (7, 9):
+            raise ValueError("unsupported K3 attention signature")
+        inv = operands[6]
         idx = [s[0] for s in shapes].index(inv)
         old = "tensor<" + shapes[idx][1] + "f32>"
         row_ty = f"tensor<{rows * dim}xf32>"
@@ -68,15 +73,27 @@ def subgraph(ir, driver, role, phase, rows, dim):
         lines = []
         for line in ir.splitlines():
             if "call @k3_attn_" in line:
-                line = line.replace(inv + ")", inv + ", %sines)").replace(
-                    old + ") ->", row_ty + ", " + row_ty + ") ->"
+                call, types = line.split(" : (")
+                inputs, outputs = types.split(") -> ", 1)
+                operands.insert(7, "%sines")
+                inputs = inputs.split(", ")
+                inputs[6:7] = [row_ty, row_ty]
+                line = (
+                    call[: call.index("(") + 1]
+                    + ", ".join(operands)
+                    + ") : ("
+                    + ", ".join(inputs)
+                    + ") -> "
+                    + outputs
                 )
             elif "private @k3_attn_" in line:
-                old_arg = old + ' {bufferization.access = "read"}'
-                line = line.replace(
-                    old_arg + ")",
-                    ", ".join([old_arg.replace(old, row_ty)] * 2) + ")",
-                )
+                head, rest = line.split("(", 1)
+                params, outputs = rest.split(") -> ", 1)
+                params = params.split(", ")
+                if not params[6].startswith(old + " "):
+                    raise ValueError("expected inv_freq at attention operand 6")
+                params[6:7] = [params[6].replace(old, row_ty)] * 2
+                line = head + "(" + ", ".join(params) + ") -> " + outputs
             lines.append(line)
         ir = "\n".join(lines)
     signature += ", %dest: " + output
@@ -138,7 +155,7 @@ def prepared_attention(ir, chunk, dim):
         if rows not in (1, chunk):
             raise ValueError("unsupported attention rows")
         body = body.replace(
-            "%arg6: " + ROW + ")", "%arg6: " + ROW + ", %sines: " + ROW + ")"
+            "%arg6: " + ROW, "%arg6: " + ROW + ", %sines: " + ROW
         )
         for op, src in (("cos", "%arg6"), ("sin", "%sines")):
             value, vec = one(
@@ -203,7 +220,7 @@ def final_projection(graph, kernels):
     """Bind the last external matmul allocation to the caller's single-row output."""
     calls = list(
         re.finditer(
-            r"^    (%\w+) = call @(k3_q4_plain_m1_\w+)\(([^)]*)\) : \(([^)]*)\) -> tensor<1x(\d+)xf32>$",
+            r"^    (%\w+) = call @(k3_(?:q4_plain|moe)_m1_\w+)\(([^)]*)\) : \(([^)]*)\) -> tensor<1x(\d+)xf32>$",
             graph,
             re.M,
         )

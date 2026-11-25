@@ -1,6 +1,7 @@
 {
   "hf_model_path": "Qwen/Qwen3-VL-30B-A3B-Instruct",
   "model_family": "qwen3_vl_moe",
+  "stop_token_ids": [151645, 151643],
   "variant": "w4g32",
   "max_token_len": 1024,
   "num_threads": 8,

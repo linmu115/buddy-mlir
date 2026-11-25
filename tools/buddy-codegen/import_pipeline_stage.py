@@ -395,6 +395,17 @@ def _load_tensor_into_dtype(
     return raw
 
 
+def stage_text_config(raw_hf_config):
+    """Use the same text-only config for shape validation and lazy loading."""
+    raw = raw_hf_config.to_dict()
+    text = text_decoder_config(raw)
+    if text is raw:
+        return raw_hf_config, False
+    from transformers import Qwen3MoeConfig
+
+    return Qwen3MoeConfig(**text), True
+
+
 def load_stage_lazy(config, start, end, role="stage"):
     """Build an empty meta model, crop layers, and load only stage tensors.
 
@@ -409,15 +420,9 @@ def load_stage_lazy(config, start, end, role="stage"):
     model_path = resolve_model_path(config)
     model_dir = resolve_checkpoint_dir(model_path)
     raw_hf_config = AutoConfig.from_pretrained(model_dir)
-    raw_hf_dict = raw_hf_config.to_dict()
-    text_dict = text_decoder_config(raw_hf_dict)
-    is_vl_moe = text_dict is not raw_hf_dict
+    hf_config, is_vl_moe = stage_text_config(raw_hf_config)
     if is_vl_moe:
-        from transformers import Qwen3MoeConfig, Qwen3MoeForCausalLM
-
-        hf_config = Qwen3MoeConfig(**text_dict)
-    else:
-        hf_config = raw_hf_config
+        from transformers import Qwen3MoeForCausalLM
 
     total, width = validate_stage_interval(hf_config, start, end)
     target_dtype = stage_dtype(config)

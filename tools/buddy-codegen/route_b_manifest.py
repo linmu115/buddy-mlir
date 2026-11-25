@@ -113,6 +113,8 @@ def publish(config_path, output, token_attrs):
         "templates": templates,
         "weights": components["weights"],
     }
+    if cfg.get("arena_prefault_mb") is not None:
+        index["arena_prefault_mb"] = cfg["arena_prefault_mb"]
     canonical = json.dumps(
         index, sort_keys=True, separators=(",", ":"), ensure_ascii=False
     )

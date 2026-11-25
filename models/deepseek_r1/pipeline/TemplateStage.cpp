@@ -90,7 +90,8 @@ struct Library {
         hexDigest(info->layout_id) != e.layout ||
         hexDigest(info->shape_id) != b.shape || info->aux_prefill_bytes ||
         info->aux_decode_bytes || !info->required_alignment ||
-        64 % info->required_alignment || (id != 2 && info->rope_elements) ||
+        64 % info->required_alignment ||
+        info->rope_elements != (id == 2 ? unsigned(b.headDim) / 2 : 0) ||
         (id == 1 && info->i8_elements))
       throw std::runtime_error("incompatible kernel descriptor: " + role);
   }

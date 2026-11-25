@@ -257,6 +257,7 @@ def build(a):
         [
             a.cxx,
             "-O2",
+            *a.cxx_flag,
             "-fPIC",
             "-shared",
             "-std=c++17",
@@ -292,6 +293,20 @@ def build(a):
         "shape_id": m["shape_id"],
         "symbols": symbols,
         "target_flags": ATTRS,
+        "cxx_compiler": subprocess.check_output(
+            [a.cxx, "--version"], text=True
+        ).splitlines()[0],
+        "cxx_flags": [
+            "-O2",
+            *(
+                f
+                for f in a.cxx_flag
+                if not f.startswith(("--sysroot=", "--gcc-toolchain="))
+            ),
+            "-fPIC",
+            "-shared",
+            "-std=c++17",
+        ],
         "runtime": "libbj47_kernel_runtime.so",
         "kernel_info_struct": "BJ47KernelInfoV1",
     }
@@ -307,4 +322,5 @@ if __name__ == "__main__":
         p.add_argument("--" + arg, type=Path, required=True)
     for arg in ("role", "buddy-opt", "llvm", "cxx", "crunner"):
         p.add_argument("--" + arg, required=True)
+    p.add_argument("--cxx-flag", action="append", default=[])
     build(p.parse_args())

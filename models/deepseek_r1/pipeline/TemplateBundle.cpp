@@ -71,7 +71,8 @@ TemplateBundle TemplateBundle::load(const std::filesystem::path &index) {
           "bundle_id digest");
   require(
       j.at("format") == "bj47.route-b/1" && j.at("activation_type") == "f32" &&
-          j.at("architecture") == "Qwen2ForCausalLM" &&
+          (j.at("architecture") == "Qwen2ForCausalLM" ||
+           j.at("architecture") == "Qwen3MoeForCausalLM") &&
           j.at("variant") == "w4g32" && j.at("kernels") == "k3" &&
           j.at("prefill_ime") == true && j.at("pack_version") == "k3-w4g32/1",
       "format or model type");

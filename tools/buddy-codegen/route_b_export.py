@@ -13,6 +13,8 @@ from import_pipeline_stage import (
     check_parameter_layout,
     load_stage_lazy,
     resolve_model_path,
+    stage_text_config,
+    validate_stage_interval,
 )
 from transformers import AutoConfig
 
@@ -86,7 +88,17 @@ def slots(graph, original):
             transform += "/transpose-q4g32/" + (
                 "ime" if p.name.endswith("_ime") else "tiles"
             )
+            if key.endswith(("experts.gate_up_proj", "experts.down_proj")):
+                if p.name.endswith("_ime"):
+                    raise ValueError("MoE experts must have one tile layout")
+                transform = (
+                    "expert-wise/"
+                    + ("glu" if key.endswith("gate_up_proj") else "down")
+                    + "/q4g32"
+                )
         elif t.dtype == torch.float32:
+            if key.endswith("mlp.gate.weight"):
+                transform = "transpose-router"
             bucket = "rope" if key.endswith("inv_freq") else "f32"
         else:
             raise ValueError(f"unexpected dtype for {key}: {t.dtype}")
@@ -248,6 +260,8 @@ def export_one(config, root, role, index, expected, layouts, signatures):
     names = [provenance(graph, model) for graph in graphs]
     del model
     specs, ime_weights = {}, set()
+    # The two graphs refer to the same layer. Pack its expert bank once.
+    expert_cache = {}
     for graph, rows in zip(
         graphs,
         (config["prefill_chunk"] if role != "head" else 1, 1),
@@ -263,6 +277,7 @@ def export_one(config, root, role, index, expected, layouts, signatures):
                 config["compilation"]["num_threads"],
                 role == "decoder" and rows > 1,
                 ime_weights,
+                cache=expert_cache,
                 rewriter=(
                     PrefillHeadRewrite if graph is prefill else HeadRewrite
                 )
@@ -319,7 +334,8 @@ def export_one(config, root, role, index, expected, layouts, signatures):
 def export_template_bundle(config, out, load_mode):
     if (
         load_mode != "lazy"
-        or config["architecture"] != "Qwen2ForCausalLM"
+        or config["architecture"]
+        not in ("Qwen2ForCausalLM", "Qwen3MoeForCausalLM")
         or config["variant"] != "w4g32"
         or config["kernels"] != "k3"
         or config.get("prefill_chunk") != 64
@@ -334,11 +350,19 @@ def export_template_bundle(config, out, load_mode):
         )
     ):
         raise ValueError(
-            "Route B v1 requires lazy Qwen2 K3 w4g32 f32, IME chunk=64 with static KV, arena and thread pool"
+            "Route B v1 requires lazy Qwen2 or Qwen3-MoE K3 w4g32 f32, IME chunk=64 with static KV, arena and thread pool"
         )
     if out.exists():
         raise FileExistsError(out)
-    hf = AutoConfig.from_pretrained(resolve_model_path(config)).to_dict()
+    text, _ = stage_text_config(
+        AutoConfig.from_pretrained(resolve_model_path(config))
+    )
+    validate_stage_interval(text, 0, text.num_hidden_layers)
+    hf = text.to_dict()
+    if config["architecture"] != hf["architectures"][0]:
+        raise ValueError(
+            "checkpoint architecture differs from component config"
+        )
     total = hf["num_hidden_layers"]
     shape = config["shape"]
     dims = {

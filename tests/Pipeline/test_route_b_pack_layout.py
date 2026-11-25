@@ -124,7 +124,7 @@ def compare(bundle, stages):
     return result
 
 
-def test_route_b_pack_layout():
+def test_route_b_pack_layout(moe=False):
     """Seeded checkpoint, real A/B exporters, wrong-layer and equal-length slot mutations."""
     import copy
     import os
@@ -133,7 +133,12 @@ def test_route_b_pack_layout():
     from unittest.mock import patch
 
     import torch
-    from transformers import Qwen2Config, Qwen2ForCausalLM
+    from transformers import (
+        Qwen2Config,
+        Qwen2ForCausalLM,
+        Qwen3MoeConfig,
+        Qwen3MoeForCausalLM,
+    )
 
     repo = Path(__file__).resolve().parents[2]
     sys.path.insert(0, str(repo / "tools/buddy-codegen"))
@@ -147,7 +152,24 @@ def test_route_b_pack_layout():
     ):
         root = Path(d)
         torch.manual_seed(4747)
-        hf = Qwen2Config(
+        config_cls, model_cls = (
+            (Qwen3MoeConfig, Qwen3MoeForCausalLM)
+            if moe
+            else (Qwen2Config, Qwen2ForCausalLM)
+        )
+        expert_args = (
+            {
+                "num_experts": 8,
+                "num_experts_per_tok": 2,
+                "moe_intermediate_size": 128,
+                "norm_topk_prob": True,
+                "head_dim": 128,
+            }
+            if moe
+            else {}
+        )
+        hf = config_cls(
+            **expert_args,
             num_hidden_layers=3,
             hidden_size=256,
             num_attention_heads=2,
@@ -156,7 +178,7 @@ def test_route_b_pack_layout():
             vocab_size=768,
             tie_word_embeddings=False,
         )
-        model = Qwen2ForCausalLM(hf)
+        model = model_cls(hf)
         # Both norm slots have the same shape. Give them and each layer different contents.
         with torch.no_grad():
             for i, layer in enumerate(model.model.layers):
@@ -165,8 +187,9 @@ def test_route_b_pack_layout():
                 layer.self_attn.k_proj.weight.mul_(3.0)
         model.save_pretrained(root)
         del model
+        family = "qwen3_vl_moe" if moe else "deepseek_r1"
         spec = json.loads(
-            (repo / "models/deepseek_r1/specs/k3_w4g32.json").read_text()
+            (repo / "models" / family / "specs/k3_w4g32.json").read_text()
         )
         spec.update(hf_model_path=d, max_token_len=128)
         cfg = gen_config(spec, str(root / "config.json"))
@@ -218,6 +241,7 @@ if __name__ == "__main__":
 
     if sys.argv[1:] == ["--self-test"]:
         test_route_b_pack_layout()
+        test_route_b_pack_layout(moe=True)
         print("PASS seeded A/B layout, layer swap and same-shape slot swap")
         sys.exit(0)
     p = argparse.ArgumentParser()

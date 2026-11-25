@@ -451,6 +451,10 @@ def w4g32_component_param_counts(
         if not hf.get("norm_topk_prob", False):
             # the kernel computes the routing: the top-k weights normalized
             raise ValueError("w4g32 needs norm_topk_prob")
+        if hf.get("use_sliding_window") or any(
+            kind != "full_attention" for kind in hf.get("layer_types") or ()
+        ):
+            raise ValueError("w4g32 MoE requires full attention in every layer")
         inter = hf["moe_intermediate_size"]
         # transformers 5 writes num_experts as num_local_experts
         experts = hf.get("num_experts")

@@ -41,6 +41,25 @@ plus:
   of this model uses 1.3 GiB; with 512 MiB, the first call faulted in the
   rest and took 2.2 instead of 1.4 s.
 
+## Route B text-decoder bundle
+
+Generate the full-model configuration with the K3 spec above, then use
+`import_pipeline_stage.py --config "$CONFIG" --route-b --load-mode lazy
+--output-dir "$BUNDLE"` and the [component build instructions](../models/deepseek_r1/pipeline/route_b/README.md).
+Use `examples/BuddyQwen3/vocab.txt` when publishing the manifest. The spec
+uses both stop IDs from the Instruct checkpoint (151645 and 151643). The
+exporter loads one decoder layer at a time. It checks both phase layouts and
+graph signatures before publishing the bundle. The router and the per-head
+query/key norms stay in f32. Only the Q/K/V and output projections have a
+second IME layout. Both phases share the packed experts. The head exposes
+its two phase-specific ABI 2 entry points.
+
+For text tokens, the temporal, height and width position IDs are identical.
+Each coordinate selects the same angle at a given rotary frequency, so the
+prepared one-dimensional RoPE rows apply directly. Visual tokens require
+the separate multimodal path. The shared component runtime reads the
+configured arena prefault size at build time, in MiB per process.
+
 ## Run
 
 ```bash
