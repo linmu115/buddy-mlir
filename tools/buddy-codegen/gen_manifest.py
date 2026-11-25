@@ -30,7 +30,6 @@ import os
 import sys
 from io import StringIO
 
-
 _PIPELINE_TOKENIZER_MAP = {
     "deepseek_r1": "deepseek_r1",
     "qwen3": "qwen3",
@@ -47,6 +46,44 @@ def _normalize_dep_uri(raw: str) -> str:
     if ":" in s:
         return s
     return f"file:{s}"
+
+
+def _token_attrs(tokens):
+    stage_attrs = {}
+    raw_tokenizer = tokens.get("tokenizer")
+    if raw_tokenizer is not None and raw_tokenizer != "unknown":
+        if not isinstance(raw_tokenizer, str):
+            raise ValueError(
+                f"tokens.tokenizer must be a string, got {raw_tokenizer!r}"
+            )
+        norm_tokenizer = _PIPELINE_TOKENIZER_MAP.get(raw_tokenizer)
+        if norm_tokenizer is None:
+            raise ValueError(
+                f"unsupported pipeline_stage tokenizer: {raw_tokenizer!r} "
+                f"(expected 'deepseek_r1' or 'qwen3')"
+            )
+        stage_attrs["pp_tokenizer"] = norm_tokenizer
+
+    raw_stops = tokens.get("stop_token_ids")
+    if raw_stops is not None:
+        if not isinstance(raw_stops, (list, tuple)) or not raw_stops:
+            raise ValueError(
+                "tokens.stop_token_ids must be a non-empty list of integers"
+            )
+        norm_stops: list[int] = []
+        for item in raw_stops:
+            if isinstance(item, bool) or not isinstance(item, int) or item < 0:
+                raise ValueError(
+                    "tokens.stop_token_ids entry must be a non-negative "
+                    f"integer, got {item!r}"
+                )
+            if item not in norm_stops:
+                norm_stops.append(item)
+        stage_attrs["pp_stop_token_ids"] = ",".join(
+            str(tok) for tok in norm_stops
+        )
+
+    return stage_attrs
 
 
 def gen_manifest(
@@ -97,8 +134,11 @@ def gen_manifest(
                 stage_attrs[key] = value
         stage_attrs["pp_stage_version"] = "1"
         for field in (
-            "start_layer", "end_layer", "total_layers",
-            "activation_type", "activation_width",
+            "start_layer",
+            "end_layer",
+            "total_layers",
+            "activation_type",
+            "activation_width",
         ):
             if field not in stage:
                 raise ValueError(f"missing pipeline_stage.{field}")
@@ -118,51 +158,23 @@ def gen_manifest(
                     "f32 + i8 external weights"
                 )
             if int(config.get("prefill_chunk", 0)) <= 0:
-                raise ValueError("w4g32 pipeline_stage requires prefill_chunk > 0")
+                raise ValueError(
+                    "w4g32 pipeline_stage requires prefill_chunk > 0"
+                )
             stage_attrs["pp_prefill_chunk"] = str(int(config["prefill_chunk"]))
         else:
-            if (len(weights) != 1 or weights[0]["mlir_type"] != "f16"
-                    or weights[0].get("decode_file")):
-                raise ValueError("pipeline_stage requires one external f16 weight")
+            if (
+                len(weights) != 1
+                or weights[0]["mlir_type"] != "f16"
+                or weights[0].get("decode_file")
+            ):
+                raise ValueError(
+                    "pipeline_stage requires one external f16 weight"
+                )
             if int(config.get("prefill_chunk", 0)):
                 raise ValueError("pipeline_stage requires prefill_chunk = 0")
 
-        raw_tokenizer = tokens.get("tokenizer")
-        if raw_tokenizer is not None and raw_tokenizer != "unknown":
-            if not isinstance(raw_tokenizer, str):
-                raise ValueError(
-                    f"tokens.tokenizer must be a string, got {raw_tokenizer!r}"
-                )
-            norm_tokenizer = _PIPELINE_TOKENIZER_MAP.get(raw_tokenizer)
-            if norm_tokenizer is None:
-                raise ValueError(
-                    f"unsupported pipeline_stage tokenizer: {raw_tokenizer!r} "
-                    f"(expected 'deepseek_r1' or 'qwen3')"
-                )
-            stage_attrs["pp_tokenizer"] = norm_tokenizer
-
-        raw_stops = tokens.get("stop_token_ids")
-        if raw_stops is not None:
-            if not isinstance(raw_stops, (list, tuple)) or not raw_stops:
-                raise ValueError(
-                    "tokens.stop_token_ids must be a non-empty list of integers"
-                )
-            norm_stops: list[int] = []
-            for item in raw_stops:
-                if (
-                    isinstance(item, bool)
-                    or not isinstance(item, int)
-                    or item < 0
-                ):
-                    raise ValueError(
-                        "tokens.stop_token_ids entry must be a non-negative "
-                        f"integer, got {item!r}"
-                    )
-                if item not in norm_stops:
-                    norm_stops.append(item)
-            stage_attrs["pp_stop_token_ids"] = ",".join(
-                str(tok) for tok in norm_stops
-            )
+        stage_attrs.update(_token_attrs(tokens))
 
     so_name = "stage.so" if stage is not None else compilation["so_name"]
     runner_suffix = "_pipeline_runner.so" if stage is not None else "_runner.so"
@@ -244,7 +256,9 @@ def gen_manifest(
         width = stage["activation_width"]
         prefill_type = f"tensor<1x{prefill_len}x{width}x{stage_act_type}>"
         decode_type = f"tensor<1x1x{width}x{stage_act_type}>"
-    p(f'  rhal.buffer @{prefill_input} {{space = "host", type = {prefill_type}}}')
+    p(
+        f'  rhal.buffer @{prefill_input} {{space = "host", type = {prefill_type}}}'
+    )
     p(f'  rhal.buffer @{decode_input} {{space = "host", type = {decode_type}}}')
     p('  rhal.buffer @cache_position {space = "host", type = tensor<1xi64>}')
     p()
@@ -252,10 +266,14 @@ def gen_manifest(
     # Stage implementations own their KV buffers behind the Stage interface.
     kv_names = []
     if stage is None:
-        kv_tensor = f"tensor<1x{head_num}x{max_token_len}x{hidden_size}x{kv_mlir}>"
+        kv_tensor = (
+            f"tensor<1x{head_num}x{max_token_len}x{hidden_size}x{kv_mlir}>"
+        )
         for i in range(kv_layers):
             pad = " " * (1 if i < 10 else 0)
-            p(f'  rhal.buffer @kv{i}{pad} {{space = "dram", type = {kv_tensor}}}')
+            p(
+                f'  rhal.buffer @kv{i}{pad} {{space = "dram", type = {kv_tensor}}}'
+            )
             kv_names.append(f'"kv{i}"')
         p()
 
@@ -264,15 +282,22 @@ def gen_manifest(
         output_width = vocab_size
         output_type = logits_mlir if stage is None else stage_act_type
     else:
-        prefill_output, decode_output = "hidden_prefill_out", "hidden_decode_out"
+        prefill_output, decode_output = (
+            "hidden_prefill_out",
+            "hidden_decode_out",
+        )
         output_width = stage["activation_width"]
         output_type = stage_act_type
     # Chunked prefill returns the logits of the last row only on the final stage.
     output_rows = 1 if (chunk and last_stage) else (chunk or max_token_len)
     prefill_result = f"tensor<1x{output_rows}x{output_width}x{output_type}>"
     decode_result = f"tensor<1x1x{output_width}x{output_type}>"
-    p(f'  rhal.buffer @{prefill_output} {{space = "host", type = {prefill_result}}}')
-    p(f'  rhal.buffer @{decode_output} {{space = "host", type = {decode_result}}}')
+    p(
+        f'  rhal.buffer @{prefill_output} {{space = "host", type = {prefill_result}}}'
+    )
+    p(
+        f'  rhal.buffer @{decode_output} {{space = "host", type = {decode_result}}}'
+    )
     p()
 
     # -- Helper: build argument list -------------------------------------------
@@ -362,7 +387,15 @@ def main():
     )
     parser.add_argument("--pp-wire-dtype", choices=("native", "f16"))
     parser.add_argument("--pp-transport", choices=("blocking", "async"))
+    parser.add_argument(
+        "--format", choices=("rhal", "route-b-json"), default="rhal"
+    )
     args = parser.parse_args()
+    if args.format == "route-b-json":
+        from route_b_manifest import publish
+
+        publish(args.config, args.output, _token_attrs)
+        return 0
 
     with open(args.config) as f:
         config = json.load(f)
