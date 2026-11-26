@@ -112,6 +112,17 @@ void isolate(Differential &runner, const Store &op) {
   }
 }
 int main(int argc, char **argv) {
+  if (argc == 3 && string(argv[1]) == "--large-table") {
+    Weights table(argv[2], "large");
+    Ids rows(24);
+    std::iota(rows.begin(), rows.end(), 1 << 24);
+    auto y = table.gatherEngram("embed", rows);
+    for (int j = 0; j < 24; j++)
+      for (int k = 0; k < 256; k++)
+        if (y[j * 256 + k] != std::ldexp(j % 2 ? 1.125f : 1.f, k / 32 - 3))
+          return 1;
+    return 0;
+  }
   if (argc != 2)
     return 2;
   Weights weights(argv[1], "weights");

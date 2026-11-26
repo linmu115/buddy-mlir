@@ -120,6 +120,29 @@ struct Weights : Store {
       roundBF(out);
     return out;
   }
+  // Map both row-major arrays read-only. A released table is larger than
+  // 2^32 bytes even though its row IDs still fit in int32.
+  Vec gatherEngram(const string &prefix, const Ids &ids) const {
+    auto &data = (*this)[prefix + ".weight"],
+         &scales = (*this)[prefix + ".scale"];
+    if (data.type != "fp8" || scales.type != "scale" ||
+        data.shape.size() != 2 || data.shape[1] % 32 ||
+        scales.shape != Ids{data.shape[0], data.shape[1] / 32})
+      throw std::runtime_error("invalid Engram embedding table");
+    size_t width = data.shape[1], groups = width / 32;
+    Vec result(ids.size() * width);
+    for (size_t j = 0; j < ids.size(); j++) {
+      if (ids[j] < 0 || ids[j] >= data.shape[0])
+        continue;
+      size_t row = static_cast<size_t>(ids[j]);
+      auto dst = result.data() + j * width;
+      decodeFP8(data.u() + row * width, scales.u() + row * groups, width, 32,
+                dst);
+      for (size_t k = 0; k < width; k++)
+        dst[k] = bf16(dst[k]);
+    }
+    return result;
+  }
   void normalize(const string &key, Vec &x) const {
     norm(x, (*this)[key + ".weight"].f());
   }
@@ -149,17 +172,14 @@ struct Runner {
   }
   void engram(int l, int pos, const string &p, Vec &x) {
     int layer = l == 1 ? 0 : 1;
-    auto ids = hashRows(history.data(), pos, 2, 4, 4,
-                        w["hash.multipliers"].id() + layer * 4,
-                        w["hash.primes"].id() + layer * 12,
-                        w["hash.offsets"].id() + layer * 12);
-    Vec emb;
-    for (int id : ids) {
-      auto ptr = w[p + "embed.weight"].u() + id * 32;
-      float scale = ue8m0(w[p + "embed.scale"].u()[id]);
-      for (int j = 0; j < 32; j++)
-        emb.push_back(bf16(e4m3(ptr[j]) * scale));
-    }
+    auto &primes = w["hash.primes"];
+    int heads = primes.shape.at(2), order = primes.shape.at(1) + 1;
+    size_t cols = size_t(order - 1) * heads;
+    auto ids = hashRows(history.data(), pos, w["hash.token_map"].id()[2], order,
+                        heads, w["hash.multipliers"].id() + layer * order,
+                        primes.id() + layer * cols,
+                        w["hash.offsets"].id() + layer * cols);
+    auto emb = w.gatherEngram(p + "embed", ids);
     auto kv = w.proj(p + "wkv", emb);
     engramWrite(x.data(), kv.data(), w[p + "q_weight"].f(),
                 w[p + "k_weight"].f(), 128);

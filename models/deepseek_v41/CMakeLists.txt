@@ -17,6 +17,8 @@ if(BUDDY_ENABLE_TESTS AND BUDDY_DEEPSEEK_V41_SPEC_DIR)
   add_test(NAME buddy-v41-differential COMMAND buddy-v41-differential "${fixture}")
   set_tests_properties(buddy-v41-differential PROPERTIES FIXTURES_REQUIRED v41_weights)
   set_tests_properties(buddy-v41-fixture buddy-v41-reference PROPERTIES ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
+  add_test(NAME buddy-v41-mapped-table COMMAND "${Python3_EXECUTABLE}"
+    "${driver}/engram_large_mapping.py" "$<TARGET_FILE:buddy-v41-differential>" "${CMAKE_CURRENT_BINARY_DIR}")
   if(BUDDY_MLIR_ENABLE_PYTHON_PACKAGES)
     add_dependencies(buddy-v41-differential python-package-buddy python-package-buddy-mlir)
     add_test(NAME buddy-v41-quant-import COMMAND "${Python3_EXECUTABLE}"
