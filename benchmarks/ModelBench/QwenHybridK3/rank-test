@@ -1,0 +1,11 @@
+#!/bin/sh
+set -eu
+root="$(dirname "$(readlink -f "$0")")"
+cd "$root"
+out="$root/exp16-resume"
+mkdir -p "$out"
+if [ -n "${EXP16_COLD:-}" ]; then
+ python3 -c 'import glob,os; paths=sum((glob.glob(p) for p in ("*.q4","*.f32","*.f16")),[]); [(os.posix_fadvise(f.fileno(),0,0,os.POSIX_FADV_DONTNEED),f.close()) for f in map(lambda p:open(p,"rb"),paths)]'
+fi
+python3 "$root/rank-sample.py" launch "$$" "$out/${EXP16_LABEL:-http}-$(hostname)-$$"
+exec "$root/rank-27b" "$@"

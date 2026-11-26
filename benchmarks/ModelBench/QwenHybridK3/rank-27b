@@ -1,0 +1,5 @@
+#!/bin/sh
+set -eu
+root="$(dirname "$(readlink -f "$0")")"
+export PYTHONPATH="$root/pydeps"
+exec "$root/buddy-pp-route-b" "$@"

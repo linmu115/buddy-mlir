@@ -1,0 +1,2 @@
+#!/bin/sh
+exec "$(dirname "$0")/rank-27b" --mtp "$@"
