@@ -59,3 +59,13 @@ the attention items) -> lower with the residual fusion. Prefill also gained
   not help).
 - Barrier waits ~1.9 ms per token, mostly in gate / up: one expert per
   thread, ~16 us of imbalance per call.
+
+## Route B 30B prefill experts
+
+For 64 rows and top-8 routing, the measured first-layer MoE median was
+19.49 ms with RVV and 14.57 ms with the mixed integer IME/RVV kernel.
+Keep the canonical packed weights. Transpose one N128 tile in 16-group
+chunks, reuse it for up to two M8 blocks, and schedule the independent
+N8 dots together. Five routed rows gave the best measured threshold among
+4, 5, 6 and 8. A separate out-of-line full-width RVV helper was slower
+than inlining the four-row tail. See [the kernel and attention schedules](../../../../docs/K3Qwen3VLMoE.md).

@@ -163,10 +163,28 @@ this path when exporting the 30B template, including the last row of prefill.
 Decode MoE assigns one selected expert slot to a worker for gate/up and
 hidden-state quantization. A workshare barrier makes all eight slots visible
 before the output tiles accumulate them in slot order. The parallel join
-completes the final workshare. Prefill retains four-row expert blocks, and
-decode attention retains groups of two query heads.
+completes the final workshare.
 
-For the 48-layer 24+24 split, the optimized decoder, head and runtime were
+In the Route B 30B prefill specialization (64 rows, 128 experts, top-8,
+8 workers), an expert receiving at least five rows uses exact integer A100
+matrix dots. The same canonical N128 weight tile serves gate, up or down.
+Each worker transposes 16 K groups at a time into 53 KiB of private scratch
+in TCM or on the stack. The packed nibbles expand in registers. Up to two
+M8 blocks reuse each transposed tile. The kernel combines two K16 dots per
+group, restores the RVV signed 16-bit group sum, then applies the scales and
+f32 FMA in the original group order. Short experts use full-width inline RVV.
+On a real 30B first layer, paired median MoE time fell from 19.49 to
+14.57 ms. The model parameter format and byte count stay the same.
+
+For the 32-query-head, 4-KV-head decode template with head dimension 128 and
+capacity 1024, visible lengths through 384 use two query heads per work item
+with precomputed scores. Longer lengths share each KV load across four query
+heads and score one block at a time. When a softmax rescaling exponent
+is exactly zero, the long-context worker uses 1.0 directly. All other
+inputs use the original exponential, including nonfinite differences.
+Both branches preserve the per-head arithmetic order.
+
+In the earlier Wave-2 evaluation of the 48-layer 24+24 split, the decoder, head and runtime were
 benchmarked together. On the 18+30 split with a 256-token prompt, that
 combination regressed in end-to-end decode. The measured fallback combines
 the optimized head with the Wave-1 decoder and runtime. Package those exact

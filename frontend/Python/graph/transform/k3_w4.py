@@ -1890,9 +1890,14 @@ def _moe_fn(ty, spec):
         with ir.InsertionPoint(body):
             total = fn.idx(n) if isinstance(n, int) else n
             nthreads = fn.idx(threads)
-            lo = _divui(_muli(slot, total), nthreads)
-            hi = _divui(_muli(_addi(slot, fn.idx(1)), total), nthreads)
-            il = scf.ForOp(lo, hi, fn.idx(1))
+            if spec.get("ime_experts"):
+                # Adjacent experts have different row counts. Stripe their tiles
+                # across workers so heavily routed experts use the whole team.
+                il = scf.ForOp(slot, total, nthreads)
+            else:
+                lo = _divui(_muli(slot, total), nthreads)
+                hi = _divui(_muli(_addi(slot, fn.idx(1)), total), nthreads)
+                il = scf.ForOp(lo, hi, fn.idx(1))
             with ir.InsertionPoint(il.body):
                 body_fn(il.induction_variable)
                 scf.YieldOp([])
@@ -2138,6 +2143,9 @@ def _moe_decode(fn, ty, spec, expert, wgu, wd, bufs, y):
 
 # Prefill MoE: rows of one expert that share each unpacked weight vector.
 MOE_MB = 4
+IME_EXPERT_ROWS = 16
+IME_EXPERT_THRESHOLD = 5
+IME_EXPERT_TILE = "buddy_route_b_expert_tile"
 
 
 def _moe_groups(fn, ty, spec, idx, mb=MOE_MB):
@@ -2213,7 +2221,7 @@ def _moe_max_blocks(spec, mb):
     return min(pairs, pairs // mb + spec["experts"])
 
 
-def _moe_unit(fn, ty, grp, tiles, u, body):
+def _moe_unit(fn, ty, grp, tiles, u, body, hot=None):
     """Work unit u of `tiles` weight tiles per expert: one tile of one
     expert for one block of MOE_MB of its pairs. The units of an expert
     are contiguous, its tiles one after the other with all its blocks per
@@ -2228,9 +2236,11 @@ def _moe_unit(fn, ty, grp, tiles, u, body):
     nbe = memref.LoadOp(grp["nb"], [e]).result
     local = _subi(u, _muli(memref.LoadOp(grp["fb"], [e]).result, nt))
     t = _divui(local, nbe)
-    b0 = _muli(arith.RemUIOp(local, nbe).result, fn.idx(MOE_MB))
+    width = IME_EXPERT_ROWS if hot else MOE_MB
+    b0 = _muli(arith.RemUIOp(local, nbe).result, fn.idx(width))
     base = _addi(memref.LoadOp(grp["off"], [e]).result, b0)
-    left = _subi(memref.LoadOp(grp["cnt"], [e]).result, b0)
+    count = memref.LoadOp(grp["cnt"], [e]).result
+    left = _subi(count, b0)
 
     def block(n):
         pairs = [
@@ -2253,7 +2263,52 @@ def _moe_unit(fn, ty, grp, tiles, u, body):
             dispatch(n - 1)
             scf.YieldOp([])
 
-    dispatch(MOE_MB)
+    if hot is None:
+        dispatch(MOE_MB)
+        return
+    # Every cold expert fits in one RVV block. For a hot expert the
+    # final IME block masks its padded rows at writeback.
+    use_ime = arith.CmpIOp(
+        arith.CmpIPredicate.uge, count, fn.idx(IME_EXPERT_THRESHOLD)
+    ).result
+    branch = scf.IfOp(use_ime, has_else=True)
+    with ir.InsertionPoint(branch.then_block):
+        n = arith.MinUIOp(left, fn.idx(width)).result
+        hot(e, t, grp["lst"], base, n)
+        scf.YieldOp([])
+    with ir.InsertionPoint(branch.else_block):
+        dispatch(MOE_MB)
+        scf.YieldOp([])
+
+
+def _ime_expert_projection(
+    fn, ty, w, tile, q, s, pairs, start, rows, k, divisor
+):
+    out = memref.AllocaOp(
+        _memref([IME_EXPERT_ROWS, NB], ty.f32), [], [], alignment=128
+    ).result
+
+    def addr(v):
+        return memref.ExtractAlignedPointerAsIndexOp(v).result
+
+    ptr = _addi(
+        _addi(addr(w), memref.ExtractStridedMetadataOp(w).offset),
+        _muli(tile, fn.idx(tile_bytes(k))),
+    )
+    args = [
+        ptr,
+        addr(q),
+        addr(s),
+        _addi(addr(pairs), _muli(start, fn.idx(8))),
+        addr(out),
+        fn.idx(k),
+        rows,
+        fn.idx(divisor),
+    ]
+    func.CallOp(
+        [], IME_EXPERT_TILE, [arith.IndexCastOp(ty.i64, v).result for v in args]
+    )
+    return out
 
 
 def _moe_prefill(fn, ty, spec, items, quantize, wgu, wd, bufs, y):
@@ -2262,24 +2317,59 @@ def _moe_prefill(fn, ty, spec, items, quantize, wgu, wd, bufs, y):
     ti, th = inter // NB, k // NB
     vf = _vec(NB, ty.f32)
     idx, wts, xq, xs, h, hq, hs = bufs
-    grp = _moe_groups(fn, ty, spec, idx)
+    hybrid = spec.get("ime_experts", False)
+    grp = _moe_groups(fn, ty, spec, idx, IME_EXPERT_ROWS if hybrid else MOE_MB)
+
+    def rvv(k, a, tile, rows, suffix):
+        if hybrid:
+            return _accumulate(fn, ty, {"k": k}, a, tile, rows)
+        return _tile_accumulator(fn, ty, k, a, tile, rows, suffix)
 
     def gate_up(e, t, pairs):
         tg = _addi(_muli(e, fn.idx(2 * ti)), _muli(t, fn.idx(2)))
         rows = [_divui(p, fn.idx(kk)) for p in pairs]
         a = {"w": wgu, "xq": xq, "xs": xs}
-        gs = _tile_accumulator(fn, ty, k, a, tg, rows, "expert_gu")
-        us = _tile_accumulator(
-            fn, ty, k, a, _addi(tg, fn.idx(1)), rows, "expert_gu"
-        )
+        gs = rvv(k, a, tg, rows, "expert_gu")
+        us = rvv(k, a, _addi(tg, fn.idx(1)), rows, "expert_gu")
         for p, g, u in zip(pairs, gs, us):
             vector.StoreOp(
                 _silu_mul(fn, ty, g, u, NB), h, [p, _muli(t, fn.idx(NB))]
             )
 
+    def hot_gu(e, t, pairs, start, rows):
+        tile = _addi(_muli(e, fn.idx(2 * ti)), _muli(t, fn.idx(2)))
+        g = _ime_expert_projection(
+            fn, ty, wgu, tile, xq, xs, pairs, start, rows, k, kk
+        )
+        u = _ime_expert_projection(
+            fn,
+            ty,
+            wgu,
+            _addi(tile, fn.idx(1)),
+            xq,
+            xs,
+            pairs,
+            start,
+            rows,
+            k,
+            kk,
+        )
+        loop = scf.ForOp(fn.idx(0), rows, fn.idx(1))
+        with ir.InsertionPoint(loop.body):
+            i = loop.induction_variable
+            p = memref.LoadOp(pairs, [_addi(start, i)]).result
+            gv = vector.LoadOp(vf, g, [i, fn.idx(0)]).result
+            uv = vector.LoadOp(vf, u, [i, fn.idx(0)]).result
+            vector.StoreOp(
+                _silu_mul(fn, ty, gv, uv, NB), h, [p, _muli(t, fn.idx(NB))]
+            )
+            scf.YieldOp([])
+
     items(
         _muli(grp["nblk"], fn.idx(ti)),
-        lambda u: _moe_unit(fn, ty, grp, ti, u, gate_up),
+        lambda u: _moe_unit(
+            fn, ty, grp, ti, u, gate_up, hot_gu if hybrid else None
+        ),
     )
     quantize(h, m * kk, inter, hq, hs)
     z = _alloc(_memref([m * kk, k], ty.f32))
@@ -2287,13 +2377,31 @@ def _moe_prefill(fn, ty, spec, items, quantize, wgu, wd, bufs, y):
     def down(e, t, pairs):
         wt = _addi(_muli(e, fn.idx(th)), t)
         a = {"w": wd, "xq": hq, "xs": hs}
-        vs = _tile_accumulator(fn, ty, inter, a, wt, pairs, "expert_down")
+        vs = rvv(inter, a, wt, pairs, "expert_down")
         for p, v in zip(pairs, vs):
             vector.StoreOp(v, z, [p, _muli(t, fn.idx(NB))])
 
+    def hot_down(e, t, pairs, start, rows):
+        tile = _addi(_muli(e, fn.idx(th)), t)
+        out = _ime_expert_projection(
+            fn, ty, wd, tile, hq, hs, pairs, start, rows, inter, 1
+        )
+        loop = scf.ForOp(fn.idx(0), rows, fn.idx(1))
+        with ir.InsertionPoint(loop.body):
+            i = loop.induction_variable
+            p = memref.LoadOp(pairs, [_addi(start, i)]).result
+            vector.StoreOp(
+                vector.LoadOp(vf, out, [i, fn.idx(0)]).result,
+                z,
+                [p, _muli(t, fn.idx(NB))],
+            )
+            scf.YieldOp([])
+
     items(
         _muli(grp["nblk"], fn.idx(th)),
-        lambda u: _moe_unit(fn, ty, grp, th, u, down),
+        lambda u: _moe_unit(
+            fn, ty, grp, th, u, down, hot_down if hybrid else None
+        ),
     )
 
     def combine(it):
@@ -2672,7 +2780,8 @@ def _attn_decode_vir_fn(ty, spec, block=16):
     vir.shuffle requires it)."""
     m, h, kvh, d = spec["m"], spec["heads"], spec["kv_heads"], spec["dim"]
     hd, B = d // 2, block
-    G = _decode_heads_per_item(spec)
+    baseline_heads = _decode_heads_per_item(spec)
+    G = baseline_heads
     # Score the visible keys before the V accumulators become live. Bound
     # scratch per worker for long-context configurations.
     prescore = d >= 128 and spec["ctx"] <= 1024
@@ -2689,7 +2798,50 @@ def _attn_decode_vir_fn(ty, spec, block=16):
     # the start of each score: -0.0 + s == s
     fz = fn.const(ty.f32, -0.0)
     c0 = fn.idx(0)
-    with ir.InsertionPoint(fn.entry):
+
+    adaptive = (m, h, kvh, d, spec["ctx"], G, baseline_heads) == (
+        1,
+        32,
+        4,
+        128,
+        1024,
+        2,
+        4,
+    )
+
+    if adaptive:
+        exp_name = spec["name"] + "__softmax_exp"
+        # A scalar helper keeps the conditional outside the VIR dialect.
+        helper = llvm.LLVMFuncOp(
+            exp_name,
+            ir.TypeAttr.get(ir.Type.parse("!llvm.func<f32 (f32)>")),
+            linkage=ir.Attribute.parse("#llvm.linkage<internal>"),
+            passthrough=[ir.StringAttr.get("alwaysinline")],
+        )
+        entry = helper.body.blocks.append(ty.f32)
+        with ir.InsertionPoint(entry):
+            x = entry.arguments[0]
+            zero = arith.ConstantOp(ty.f32, ir.FloatAttr.get(ty.f32, 0.0))
+            equal = arith.CmpFOp(arith.CmpFPredicate.OEQ, x, zero).result
+            branch = scf.IfOp(equal, [ty.f32], has_else=True)
+            with ir.InsertionPoint(branch.then_block):
+                one = arith.ConstantOp(ty.f32, ir.FloatAttr.get(ty.f32, 1.0))
+                scf.YieldOp([one])
+            with ir.InsertionPoint(branch.else_block):
+                scf.YieldOp([math.ExpOp(x).result])
+            llvm.ReturnOp(arg=branch.results[0])
+
+    def emit_heads(G, prescore):
+        def exp_delta(x, maximum):
+            delta = _subf(x, maximum)
+            if adaptive and not prescore:
+                # The running maximum commonly survives an entire block.
+                # Its exponential rescaling factor is then exactly one.
+                return llvm.CallOp(
+                    ty.f32, [delta], [], [], callee=exp_name
+                ).result
+            return math.ExpOp(delta).result
+
         # the heads as rows of their two halves
         qr = _rows_view(a["q"], 2 * h, hd)
         kr = _rows_view(a["kc"], 2, hd)
@@ -2809,7 +2961,7 @@ def _attn_decode_vir_fn(ty, spec, block=16):
                         mn = arith.MaximumFOp(
                             mx, _reduce(ty.f32, "maximumf", ss[g])
                         ).result
-                        alpha = math.ExpOp(_subf(mx, mn)).result
+                        alpha = exp_delta(mx, mn)
                         p = _exp(fn, ty, _subf(ss[g], _bcast(vb, mn)), B)
                         accs.append(_mulf(acc, vir.broadcast(dv, alpha)))
                         ps.append(p)
@@ -2860,8 +3012,8 @@ def _attn_decode_vir_fn(ty, spec, block=16):
                             else score(qss[g], kv)
                         )
                         mn = arith.MaximumFOp(mx, s).result
-                        alpha = math.ExpOp(_subf(mx, mn)).result
-                        beta = math.ExpOp(_subf(s, mn)).result
+                        alpha = exp_delta(mx, mn)
+                        beta = exp_delta(s, mn)
                         acc = vir.fma(
                             vv,
                             vir.broadcast(dv, beta),
@@ -2881,6 +3033,23 @@ def _attn_decode_vir_fn(ty, spec, block=16):
                 lse = _addf(math.LogOp(l).result, mx)
                 memref.StoreOp(lse, a["lse"], [c0, hh, i])
             scf.ReduceOp([], 0)
+
+    with ir.InsertionPoint(fn.entry):
+        if adaptive:
+            # start is zero-based. The long-context group shares each KV
+            # load across four query heads and scores one block at a time.
+            short = arith.CmpIOp(
+                arith.CmpIPredicate.ult, a["start"], fn.idx(384)
+            ).result
+            dispatch = scf.IfOp(short, has_else=True)
+            with ir.InsertionPoint(dispatch.then_block):
+                emit_heads(G, True)
+                scf.YieldOp([])
+            with ir.InsertionPoint(dispatch.else_block):
+                emit_heads(baseline_heads, False)
+                scf.YieldOp([])
+        else:
+            emit_heads(G, prescore)
         _attn_epilogue(fn, a, outs)
 
 
@@ -3872,7 +4041,11 @@ def _declare(ty, name, types, results=()):
 
 
 def build_kernels(
-    specs, part: str = "main", emulate_ime=False, fixed_vlen=False
+    specs,
+    part: str = "main",
+    emulate_ime=False,
+    fixed_vlen=False,
+    route_b_ime_experts=False,
 ) -> ir.Module:
     """The module of the kernels `specs` (k3_w4_rewrite) describe, in the
     active context; verified. part "main": the kernels, with the RVV tiles
@@ -3906,12 +4079,25 @@ def build_kernels(
             else:
                 for name in (ATTN_QK_FN, ATTN_PV_FN):
                     _declare(ty, name, [ty.i64] * 5)
+        expert_tile_declared = False
         for s in specs:
             ime = bool(s.get("ime"))
             if part == "ime":
                 if ime and s["kind"] in ("plain", "multi", "glu"):
                     _ime_tile_fn(ty, s)
             elif s["kind"] == "moe":
+                if route_b_ime_experts and (
+                    s["m"],
+                    s["k"],
+                    s["inter"],
+                    s["topk"],
+                    s["experts"],
+                    s["threads"],
+                ) == (64, 2048, 768, 8, 128, 8):
+                    if not expert_tile_declared:
+                        _declare(ty, IME_EXPERT_TILE, [ty.i64] * 8)
+                        expert_tile_declared = True
+                    s = dict(s, ime_experts=True)
                 _moe_fn(ty, s)
             elif s["kind"] == "attn":
                 if s["m"] == 1:
@@ -3940,8 +4126,16 @@ def build_kernels(
 
 
 def gen_kernels(
-    specs, part: str = "main", emulate_ime=False, fixed_vlen=False
+    specs,
+    part: str = "main",
+    emulate_ime=False,
+    fixed_vlen=False,
+    route_b_ime_experts=False,
 ) -> str:
     """build_kernels() in a context of its own, as MLIR text."""
     with ir.Context(), ir.Location.unknown():
-        return str(build_kernels(specs, part, emulate_ime, fixed_vlen))
+        return str(
+            build_kernels(
+                specs, part, emulate_ime, fixed_vlen, route_b_ime_experts
+            )
+        )

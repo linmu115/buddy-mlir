@@ -56,7 +56,7 @@ foreach(role embed decoder_layer lm_head)
       --buddy-opt "${BJ47_BUDDY_OPT}" --llvm "${BJ47_LLVM_TOOLS}" --cxx "${CMAKE_CXX_COMPILER}" --crunner "${BJ47_CRUNNER}" ${shim_flags}
     DEPENDS bj47_kernel_runtime ${mlir} "${BJ47_ROUTE_B_BUNDLE}/components.json"
       "${codegen}/build_route_b.py" "${codegen}/route_b_lower.py" "${codegen}/compile_pipeline.py"
-      Shim.h "${repo}/runtime/include/buddy/runtime/pipeline/RouteB.h"
+      K3ExpertDot.s K3ExpertTile.cpp Shim.h "${repo}/runtime/include/buddy/runtime/pipeline/RouteB.h"
     VERBATIM)
   list(APPEND component_outputs "${out}" "${receipt}")
 endforeach()

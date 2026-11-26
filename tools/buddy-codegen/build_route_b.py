@@ -95,6 +95,10 @@ def compile_ir(a, name, source, pipeline, cfg):
                 raise ValueError(
                     f"unexpected residual copy after destination binding: {post}"
                 )
+        # Inline the scalar softmax fast path into the long-context workers.
+        # opt reads LLVM assembly and emits the bitcode otherwise made by llvm-as.
+        if tool == "llvm-as" and "__softmax_exp(" in source:
+            tool, flags = "opt", ["-passes=always-inline"]
         suffix = (
             ".o"
             if tool == "llc"
@@ -213,6 +217,36 @@ def build(a):
         kernels["k3_kernels-w4g32"] = prepared_attention(
             kernels["k3_kernels-w4g32"], chunk, dim
         )
+    if "@buddy_route_b_expert_tile(" in kernels.get("k3_kernels-w4g32", ""):
+        transpose = a.work / "K3ExpertDot.o"
+        subprocess.run(
+            [
+                Path(a.llvm) / "llvm-mc",
+                "-triple=riscv64",
+                "-mcpu=spacemit-a100",
+                "-filetype=obj",
+                SRC / "K3ExpertDot.s",
+                "-o",
+                transpose,
+            ],
+            check=True,
+        )
+        tile = a.work / "K3ExpertTile.o"
+        subprocess.run(
+            [
+                a.cxx,
+                *a.cxx_flag,
+                "-O3",
+                "-fPIC",
+                "-std=c++17",
+                "-c",
+                SRC / "K3ExpertTile.cpp",
+                "-o",
+                tile,
+            ],
+            check=True,
+        )
+        objs.extend([transpose, tile])
     for phase in ("prefill", "decode"):
         rows = chunk if phase == "prefill" else 1
         captured = "subgraph0_" + phase
