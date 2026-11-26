@@ -978,7 +978,7 @@ class _Rewriter:
 
     def fuse_residual(self):
         """add(h, view(call(...))) -> view(call(..., view(h))) for the
-        one-row "plain" and "moe" kernels (decode: the o projection and the
+        "plain" and "moe" kernels (the output projection and the
         MoE block before the residual adds): the kernel writes h + its
         result, the same sum, on all threads instead of a serial loop of
         the graph. The K3 kernels only (the residual argument)."""
@@ -1007,8 +1007,6 @@ class _Rewriter:
                 spec = self.kernels[call.call_func_name]
                 if (
                     spec["kind"] not in ("plain", "moe")
-                    or spec["m"] != 1
-                    or spec.get("ime")
                     or spec.get("prefill_logits")
                     or spec.get("residual")
                     or list(self.g.node_table[res].tensor_meta["shape"])
@@ -1017,7 +1015,14 @@ class _Rewriter:
                 ):
                     continue
                 cols = list(call.tensor_meta["shape"])
-                spec = dict(spec, name=spec["name"] + "_res", residual=True)
+                residual_rhs = res == str(node.args[1])
+                spec = dict(
+                    spec,
+                    name=spec["name"]
+                    + ("_res_rhs" if residual_rhs else "_res"),
+                    residual=True,
+                    residual_rhs=residual_rhs,
+                )
                 self.kernels[spec["name"]] = spec
                 rv = self._view(res, cols, call)
                 call._arguments = list(call.args) + [rv.name]
@@ -1160,6 +1165,7 @@ class _Fn:
         self.entry = self.op.add_entry_block()
         self.args = list(self.entry.arguments)
         self._consts = {}
+        self.accumulators = set()
 
     def const(self, t, value):
         """A scalar constant, or a splat if `t` is a vector type."""
@@ -1327,11 +1333,11 @@ def _tile_types(ty, spec):
     return t
 
 
-def _accumulate(fn, ty, spec, a, wtile, rows):
+def _accumulate(fn, ty, spec, a, wtile, rows, lanes=NB, column=None):
     """f32 accumulators (vector<NB x f32>) of `rows` over all groups of
     weight tile `wtile`."""
     k = spec["k"]
-    vf, v8, v16, v32 = (_vec(NB, t) for t in (ty.f32, ty.i8, ty.i16, ty.i32))
+    vf, v8, v16, v32 = (_vec(lanes, t) for t in (ty.f32, ty.i8, ty.i16, ty.i32))
     four = fn.const(v8, 4)
     tbase = _muli(wtile, fn.idx(tile_bytes(k)))
     zero = fn.const(vf, 0.0)
@@ -1346,13 +1352,17 @@ def _accumulate(fn, ty, spec, a, wtile, rows):
             # costs about the same whatever its size on the A100, and with
             # the exact VLEN given to llc the 128-byte slices are register
             # halves of one vl4r.
-            if p % 4 == 0:
+            if lanes == NB and p % 4 == 0:
                 wide = vector.LoadOp(
                     _vec(4 * NB, ty.i8), a["w"], [_addi(gbase, fn.idx(p * NB))]
                 ).result
-            w = vector.ExtractStridedSliceOp(
-                v8, wide, [(p % 4) * NB], [NB], [1]
-            ).result
+            if lanes == NB:
+                w = vector.ExtractStridedSliceOp(
+                    v8, wide, [(p % 4) * NB], [NB], [1]
+                ).result
+            else:
+                at = _addi(_addi(gbase, fn.idx(p * NB)), column)
+                w = vector.LoadOp(v8, a["w"], [at]).result
             lo = arith.ShRSIOp(arith.ShLIOp(w, four).result, four).result
             hi = arith.ShRSIOp(w, four).result
             halves = [arith.ExtSIOp(v16, h).result for h in (lo, hi)]
@@ -1363,11 +1373,12 @@ def _accumulate(fn, ty, spec, a, wtile, rows):
                     ).result
                     xv = _bcast(v16, arith.ExtSIOp(ty.i16, xb).result)
                     acc16[i] = _addi(acc16[i], _muli(half, xv))
-        raw = vector.LoadOp(
-            _vec(2 * NB, ty.i8), a["w"], [_addi(gbase, fn.idx(G // 2 * NB))]
-        ).result
+        scale_at = _addi(gbase, fn.idx(G // 2 * NB))
+        if column is not None:
+            scale_at = _addi(scale_at, _muli(column, fn.idx(2)))
+        raw = vector.LoadOp(_vec(2 * lanes, ty.i8), a["w"], [scale_at]).result
         scale = arith.ExtFOp(
-            vf, vector.BitCastOp(_vec(NB, ty.f16), raw).result
+            vf, vector.BitCastOp(_vec(lanes, ty.f16), raw).result
         ).result
         outs = []
         for i, row in enumerate(rows):
@@ -1382,6 +1393,61 @@ def _accumulate(fn, ty, spec, a, wtile, rows):
             outs.append(_fma(prod, sx, loop.inner_iter_args[i]))
         scf.YieldOp(outs)
     return list(loop.results)
+
+
+def _tile_accumulator(fn, ty, k, a, tile, rows, suffix):
+    """Keep the K loop independent of live gate and outer accumulators.
+    Rows of an expert continue to share every packed weight load.
+    Each lane retains the original group order and f32 FMA."""
+    count = len(rows)
+    lanes = NB if count == 1 else NB // 2
+    symbol = f"{fn.op.name.value}__{suffix}_{count}"
+    args = [a["w"], a["xq"], a["xs"], tile, *rows]
+    results = [_vec(lanes, ty.f32)] * count
+    if symbol not in fn.accumulators:
+        types = [v.type for v in args] + ([ty.index] if lanes < NB else [])
+        with ir.InsertionPoint(fn.op):
+            helper = _Fn(symbol, types, results, public=False)
+            helper.op.attributes["no_inline"] = ir.UnitAttr.get()
+            helper.op.attributes["passthrough"] = ir.ArrayAttr.get(
+                [ir.StringAttr.get("noinline")]
+            )
+        with ir.InsertionPoint(helper.entry):
+            w, q, scales, t, *rest = helper.args
+            col = rest.pop() if lanes < NB else None
+            sums = _accumulate(
+                helper,
+                ty,
+                {"k": k},
+                {"w": w, "xq": q, "xs": scales},
+                t,
+                rest,
+                lanes,
+                col,
+            )
+            func.ReturnOp(sums)
+        fn.accumulators.add(symbol)
+    if lanes == NB:
+        return list(func.CallOp(results, symbol, args).results)
+    # Each sub-tile reads its own columns of the same packed tile. Rows
+    # still share weights, while their combined f32 sums fit in registers.
+    sums = [fn.const(_vec(NB, ty.f32), 0.0)] * count
+    for col in range(0, NB, lanes):
+        partial = func.CallOp(results, symbol, [*args, fn.idx(col)])
+        for i, value in enumerate(partial.results):
+            sums[i] = vector.InsertStridedSliceOp(
+                value, sums[i], [col], [1]
+            ).result
+    return sums
+
+
+def _residual_sum(fn, ty, spec, val, mem, at):
+    residual = _read(val.type, mem, at, fn.const(ty.f32, 0.0))
+    return (
+        _addf(val, residual)
+        if spec.get("residual_rhs")
+        else _addf(residual, val)
+    )
 
 
 def _tile_fn(ty, spec):
@@ -1407,8 +1473,10 @@ def _tile_fn(ty, spec):
             ]
             if spec["kind"] == "glu":
                 tg = _muli(a["wt"], fn.idx(2))
-                gate = _accumulate(fn, ty, spec, a, tg, rows)
-                up = _accumulate(fn, ty, spec, a, _addi(tg, fn.idx(1)), rows)
+                gate = _tile_accumulator(fn, ty, spec["k"], a, tg, rows, "glu")
+                up = _tile_accumulator(
+                    fn, ty, spec["k"], a, _addi(tg, fn.idx(1)), rows, "glu"
+                )
                 vals = [_silu_mul(fn, ty, g, u, NB) for g, u in zip(gate, up)]
             else:
                 vals = _accumulate(fn, ty, spec, a, a["wt"], rows)
@@ -1419,8 +1487,9 @@ def _tile_fn(ty, spec):
                     vals = [_addf(v, bias) for v in vals]
             for row, v in zip(rows, vals):
                 if spec.get("residual"):
-                    f0 = fn.const(ty.f32, 0.0)
-                    v = _addf(_read(vf, a["res"], [row, a["ocol"]], f0), v)
+                    v = _residual_sum(
+                        fn, ty, spec, v, a["res"], [row, a["ocol"]]
+                    )
                 vector.StoreOp(v, a["out"], [row, a["ocol"]])
             scf.YieldOp([])
         func.ReturnOp([])
@@ -1890,8 +1959,10 @@ def _moe_decode(fn, ty, spec, items, quantize, expert, wgu, wd, bufs, y):
         t = arith.RemUIOp(it, fn.idx(ti)).result
         tg = _addi(_muli(expert(r, j), fn.idx(2 * ti)), _muli(t, fn.idx(2)))
         a = {"w": wgu, "xq": xq, "xs": xs}
-        (g,) = _accumulate(fn, ty, {"k": k}, a, tg, [r])
-        (u,) = _accumulate(fn, ty, {"k": k}, a, _addi(tg, fn.idx(1)), [r])
+        (g,) = _tile_accumulator(fn, ty, k, a, tg, [r], "expert_gu")
+        (u,) = _tile_accumulator(
+            fn, ty, k, a, _addi(tg, fn.idx(1)), [r], "expert_gu"
+        )
         vector.StoreOp(
             _silu_mul(fn, ty, g, u, NB), h, [j, _muli(t, fn.idx(NB))]
         )
@@ -1912,7 +1983,7 @@ def _moe_decode(fn, ty, spec, items, quantize, expert, wgu, wd, bufs, y):
         val = jl.results[0]
         if spec.get("residual"):
             res = fn.args[-1]
-            val = _addf(_read(vf, res, [r, col], fn.const(ty.f32, 0.0)), val)
+            val = _residual_sum(fn, ty, spec, val, res, [r, col])
         vector.StoreOp(val, y, [r, col])
 
     items(th, down)
@@ -2050,8 +2121,10 @@ def _moe_prefill(fn, ty, spec, items, quantize, wgu, wd, bufs, y):
         tg = _addi(_muli(e, fn.idx(2 * ti)), _muli(t, fn.idx(2)))
         rows = [_divui(p, fn.idx(kk)) for p in pairs]
         a = {"w": wgu, "xq": xq, "xs": xs}
-        gs = _accumulate(fn, ty, {"k": k}, a, tg, rows)
-        us = _accumulate(fn, ty, {"k": k}, a, _addi(tg, fn.idx(1)), rows)
+        gs = _tile_accumulator(fn, ty, k, a, tg, rows, "expert_gu")
+        us = _tile_accumulator(
+            fn, ty, k, a, _addi(tg, fn.idx(1)), rows, "expert_gu"
+        )
         for p, g, u in zip(pairs, gs, us):
             vector.StoreOp(
                 _silu_mul(fn, ty, g, u, NB), h, [p, _muli(t, fn.idx(NB))]
@@ -2067,7 +2140,7 @@ def _moe_prefill(fn, ty, spec, items, quantize, wgu, wd, bufs, y):
     def down(e, t, pairs):
         wt = _addi(_muli(e, fn.idx(th)), t)
         a = {"w": wd, "xq": hq, "xs": hs}
-        vs = _accumulate(fn, ty, {"k": inter}, a, wt, pairs)
+        vs = _tile_accumulator(fn, ty, inter, a, wt, pairs, "expert_down")
         for p, v in zip(pairs, vs):
             vector.StoreOp(v, z, [p, _muli(t, fn.idx(NB))])
 
@@ -2084,6 +2157,8 @@ def _moe_prefill(fn, ty, spec, items, quantize, wgu, wd, bufs, y):
             p = _addi(_muli(r, fn.idx(kk)), fn.idx(j))
             wj = _bcast(vf, memref.LoadOp(wts, [r, fn.idx(j)]).result)
             acc = _fma(vector.LoadOp(vf, z, [p, col]).result, wj, acc)
+        if spec.get("residual"):
+            acc = _residual_sum(fn, ty, spec, acc, fn.args[-1], [r, col])
         vector.StoreOp(acc, y, [r, col])
 
     items(m * th, combine)
@@ -2451,6 +2526,12 @@ def _attn_decode_vir_fn(ty, spec, block=16):
     m, h, kvh, d = spec["m"], spec["heads"], spec["kv_heads"], spec["dim"]
     hd, B = d // 2, block
     G = _decode_heads_per_item(spec)
+    # Score the visible keys before the V accumulators become live. Bound
+    # scratch per worker for long-context configurations.
+    prescore = d >= 128 and spec["ctx"] <= 1024
+    if prescore:
+        cap = max(1, 256 // d)
+        G = max(g for g in range(1, min(G, cap) + 1) if (h // kvh) % g == 0)
     fn, a, outs = _attn_fn(ty, spec, q_norm=False, rope_rows=2)
     qk_norm = spec.get("qk_norm_eps") is not None
     vb = _vec(B, ty.f32)
@@ -2476,6 +2557,13 @@ def _attn_decode_vir_fn(ty, spec, block=16):
             buf = memref.AllocaOp(
                 _memref([G, B], ty.f32), [], [], alignment=128
             ).result
+            scores = (
+                memref.AllocaOp(
+                    _memref([G, spec["ctx"]], ty.f32), [], [], alignment=128
+                ).result
+                if prescore
+                else buf
+            )
             heads = [_addi(_muli(hg, fn.idx(G)), fn.idx(g)) for g in range(G)]
             # row 2 hh of qr: the first half of head hh
             q_at = [[i, _muli(hh, fn.idx(2)), c0] for hh in heads]
@@ -2540,23 +2628,32 @@ def _attn_decode_vir_fn(ty, spec, block=16):
                         ty.f32, _mulf(qs, kv), fz, "add", reassoc=True
                     )
 
+                def fill_scores(first, count):
+                    sl = scf.ForOp(c0, count, fn.idx(1))
+                    with ir.InsertionPoint(sl.body):
+                        u = sl.induction_variable
+                        kv = key(_addi(first, u))
+                        for g in range(G):
+                            memref.StoreOp(
+                                score(qss[g], kv), scores, [fn.idx(g), u]
+                            )
+                        scf.YieldOp([])
+
+                if prescore:
+                    fill_scores(c0, length)
+
                 # blocks of B keys; per head (max, sum, acc)
                 init = [ninf, f0, vir.broadcast(dv, f0)] * G
                 bl = scf.ForOp(c0, nblk, fn.idx(1), init)
                 with ir.InsertionPoint(bl.body):
                     state = list(bl.inner_iter_args)
                     j0 = _muli(bl.induction_variable, fn.idx(B))
-                    sl = scf.ForOp(c0, fn.idx(B), fn.idx(1))
-                    with ir.InsertionPoint(sl.body):
-                        u = sl.induction_variable
-                        kv = key(_addi(j0, u))
-                        for g in range(G):
-                            memref.StoreOp(
-                                score(qss[g], kv), buf, [fn.idx(g), u]
-                            )
-                        scf.YieldOp([])
+                    if not prescore:
+                        fill_scores(j0, fn.idx(B))
                     ss = [
-                        vector.LoadOp(vb, buf, [fn.idx(g), c0]).result
+                        vector.LoadOp(
+                            vb, scores, [fn.idx(g), j0 if prescore else c0]
+                        ).result
                         for g in range(G)
                     ]
                     news, ps, accs = [], [], []
@@ -2605,11 +2702,16 @@ def _attn_decode_vir_fn(ty, spec, block=16):
                 with ir.InsertionPoint(tl.body):
                     state = list(tl.inner_iter_args)
                     j = tl.induction_variable
-                    kv, vv = key(j), value(j)
+                    kv = None if prescore else key(j)
+                    vv = value(j)
                     out = []
                     for g in range(G):
                         mx, l, acc = state[3 * g : 3 * g + 3]
-                        s = score(qss[g], kv)
+                        s = (
+                            memref.LoadOp(scores, [fn.idx(g), j]).result
+                            if prescore
+                            else score(qss[g], kv)
+                        )
                         mn = arith.MaximumFOp(mx, s).result
                         alpha = math.ExpOp(_subf(mx, mn)).result
                         beta = math.ExpOp(_subf(s, mn)).result
@@ -3032,6 +3134,8 @@ def _ime_tile_fn(ty, spec):
         names.append("out2")
     if spec["bias"]:
         names += ["bias", "bcol"]
+    if spec.get("residual"):
+        names.append("res")
     names.append("g0")
     fn = _Fn(f"{spec['name']}__tile", _tile_types(ty, spec), [], public=False)
     a = dict(zip(names, fn.args))
@@ -3205,6 +3309,27 @@ def _ime_tile_fn(ty, spec):
                         fn.const(ty.f32, 0.0),
                     )
                     val = _addf(val, bias)
+                if spec.get("residual"):
+                    if gp == groups:
+                        val = _residual_sum(
+                            fn, ty, spec, val, a["res"], [row, col]
+                        )
+                    else:
+                        last = arith.CmpIOp(
+                            arith.CmpIPredicate.eq, a["g0"], fn.idx(groups - gp)
+                        ).result
+                        final = scf.IfOp(last, [v8f], has_else=True)
+                        with ir.InsertionPoint(final.then_block):
+                            scf.YieldOp(
+                                [
+                                    _residual_sum(
+                                        fn, ty, spec, val, a["res"], [row, col]
+                                    )
+                                ]
+                            )
+                        with ir.InsertionPoint(final.else_block):
+                            scf.YieldOp([val])
+                        val = final.results[0]
                 vector.StoreOp(val, a["out"], [row, col])
 
             rows_of_blocks(store)

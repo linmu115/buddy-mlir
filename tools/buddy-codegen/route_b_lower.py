@@ -216,18 +216,18 @@ def prepared_attention(ir, chunk, dim):
     return ir
 
 
-def final_projection(graph, kernels):
-    """Bind the last external matmul allocation to the caller's single-row output."""
+def final_projection(graph, kernels, rows=1):
+    """Bind the last external matmul allocation to the caller's output."""
     calls = list(
         re.finditer(
-            r"^    (%\w+) = call @(k3_(?:q4_plain|moe)_m1_\w+)\(([^)]*)\) : \(([^)]*)\) -> tensor<1x(\d+)xf32>$",
+            rf"^    (%\w+) = call @(k3_(?:q4_plain|moe)_m{rows}_\w+)\(([^)]*)\) : \(([^)]*)\) -> tensor<{rows}x(\d+)xf32>$",
             graph,
             re.M,
         )
     )
     last = calls[-1]
     value, sym, args, types, width = last.groups()
-    dest = f"memref<1x1x{width}xf32>"
+    dest = f"memref<1x{rows}x{width}xf32>"
     # Only reshapes of this projection may follow; all math must be preserved.
     tail = graph[last.end() :].split("    return\n")[0]
     ops = [l.strip() for l in tail.splitlines() if l.strip()]
@@ -246,7 +246,9 @@ def final_projection(graph, kernels):
         + graph[last.end() + len(tail) :]
     )
     graph, n = re.subn(
-        r"(func.func private @" + sym + r"\([^\n]+?)\) -> tensor<1x\d+xf32>",
+        r"(func.func private @"
+        + sym
+        + rf"\([^\n]+?)\) -> tensor<{rows}x\d+xf32>",
         r"\1, " + dest + ")",
         graph,
     )
@@ -255,8 +257,8 @@ def final_projection(graph, kernels):
 
     def bind(m):
         body = m[0]
-        mem = one(r"^    return (%\w+) : memref<1x\d+xf32>$", body)
-        ty = f"memref<1x{width}xf32>"
+        mem = one(rf"^    return (%\w+) : memref<{rows}x\d+xf32>$", body)
+        ty = f"memref<{rows}x{width}xf32>"
         body = body.replace(
             ") -> " + ty + " attributes", ", %dest: " + dest + ") attributes", 1
         )

@@ -134,8 +134,22 @@ second half of each scored, `buddy-cli --perplexity`): 7.98.
   residual add, bit-identical to the add after it.
 - `tests/Python/test_k3_w4_moe_import.py`: a tiny random Qwen3-MoE through
   `import_model.py`: `buddy::moe_experts` gives HF's logits; both graphs get
-  the MoE kernels with the RMSNorm (and in decode the residual add) fused and
+  the MoE kernels with RMSNorm and residual addition fused in both phases and
   the same packed experts, on which the kernels give HF's MoE blocks; a
   routing other than the kernel's (`norm_topk_prob` false) is refused.
-- `tests/Python/test_k3_w4_import.py`: the residual adds of decode fused,
+- `tests/Python/test_k3_w4_import.py`: the residual adds of prefill and decode fused,
   and not a residual computed after the kernel's call.
+
+
+The RVV gate and up projections use an out-of-line K-group loop. For two to
+four routed rows the helper computes narrower column slices of the same packed
+tile, sharing every weight load across the active rows. The prefill down
+projection uses the same schedule. Dense RVV GLU uses the gate/up helper too.
+The IME output projection adds the residual on its last K pass. Each worker
+writes its own output tile, and the caller supplies a separate output buffer.
+
+For decode with head dimension at least 128 and capacity at most 1024, each
+worker computes the visible Q/K scores before the value accumulation starts.
+This keeps Q out of the online softmax loop. The group size divides the GQA
+ratio and limits live Q lanes. The existing block softmax, tail updates and
+per-head reduction order are preserved.
