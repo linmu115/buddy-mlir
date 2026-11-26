@@ -104,26 +104,15 @@ inline void appendUniqueStopToken(std::vector<int> &stopTokenIds, int tokenId) {
     stopTokenIds.push_back(tokenId);
 }
 
-inline void runDistributedStage(Stage &stage, const StageManifest &spec,
-                                const std::string &modelName,
-                                const std::string &vocabPath,
-                                const RunConfig &cfg, MPI_Comm comm, int rank,
-                                int size) {
-  checkLocalConfig(spec, stage.configuration());
-
-  pipeline::StageCheckOptions checkOpts;
-  checkOpts.modelName = modelName;
-  checkOpts.requireModelName = true;
-  checkOpts.wireDtype = spec.wireDtype;
-  checkOpts.transport = spec.transport;
-  pipeline::checkAllStages(comm, rank, size, stage.configuration(), checkOpts);
-
+inline pipeline::DistributedGenerateOptions
+makeGenerateOptions(const StageManifest &spec, const std::string &vocabPath,
+                    const RunConfig &cfg, const StageConfig &config, int rank,
+                    int size) {
   pipeline::DistributedGenerateOptions genOpts;
   genOpts.transport = spec.transport;
   genOpts.wireDtype = spec.wireDtype;
   if (rank == 0) {
-    const auto wire =
-        resolveWireSpec(stage.configuration().dtype, spec.wireDtype);
+    const auto wire = resolveWireSpec(config.dtype, spec.wireDtype);
     std::cerr << "pipeline transport="
               << (spec.transport == pipeline::Transport::Async ? "async"
                                                                : "blocking")
@@ -155,7 +144,10 @@ inline void runDistributedStage(Stage &stage, const StageManifest &spec,
 
   if (rank == 0 && std::getenv("BUDDY_PP_OBSERVE"))
     std::fprintf(stderr, "pp_ready rank=0\n");
-  pipeline::generateDistributed(genOpts, stage, comm, rank, size);
+  return genOpts;
+}
+
+inline void reportPipelineMemory(int rank) {
   if (std::getenv("BUDDY_PP_OBSERVE")) {
     std::ifstream status("/proc/self/status");
     std::string line;
@@ -163,5 +155,33 @@ inline void runDistributedStage(Stage &stage, const StageManifest &spec,
       if (line.rfind("VmHWM:", 0) == 0)
         std::fprintf(stderr, "pp_memory rank=%d %s\n", rank, line.c_str());
   }
+}
+inline void runDistributedStage(Stage &stage, const StageManifest &spec,
+                                const std::string &modelName,
+                                const std::string &vocabPath,
+                                const RunConfig &cfg, MPI_Comm comm, int rank,
+                                int size) {
+  checkLocalConfig(spec, stage.configuration());
+  pipeline::checkAllStages(comm, rank, size, stage.configuration(),
+                           {modelName, true, spec.wireDtype, spec.transport});
+  const auto opts = makeGenerateOptions(spec, vocabPath, cfg,
+                                        stage.configuration(), rank, size);
+  pipeline::generateDistributed(opts, stage, comm, rank, size);
+  reportPipelineMemory(rank);
+}
+
+inline void runDistributedBatch(Stage &stage, const StageManifest &spec,
+                                const std::string &modelName,
+                                const std::string &vocabPath,
+                                const RunConfig &cfg,
+                                const std::vector<std::string> &prompts,
+                                MPI_Comm comm, int rank, int size) {
+  checkLocalConfig(spec, stage.configuration());
+  pipeline::checkAllStages(comm, rank, size, stage.configuration(),
+                           {modelName, true, spec.wireDtype, spec.transport});
+  const auto opts = makeGenerateOptions(spec, vocabPath, cfg,
+                                        stage.configuration(), rank, size);
+  pipeline::generateDistributedBatch(opts, prompts, stage, comm, rank, size);
+  reportPipelineMemory(rank);
 }
 } // namespace buddy::runtime

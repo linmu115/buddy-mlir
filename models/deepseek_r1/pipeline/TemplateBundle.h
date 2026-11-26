@@ -37,5 +37,6 @@ std::vector<LayerRange> parseRanges(const std::string &text, int total,
                                     bool full);
 void validateChain(const std::vector<LayerRange> &ranges, int total);
 std::unique_ptr<Stage> makeTemplateStage(const TemplateBundle &, LayerRange,
-                                         bool verifyWeights = false);
+                                         bool verifyWeights = false,
+                                         int slots = 1);
 } // namespace buddy::runtime

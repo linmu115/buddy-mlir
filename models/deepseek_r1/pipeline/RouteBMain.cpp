@@ -9,6 +9,7 @@ void run(int argc, char **argv, int rank, int size) {
   RunConfig cfg;
   cfg.maxNewTokens = 0;
   std::string bundle;
+  std::vector<std::string> prompts;
   auto wire = pipeline::WireDtype::Native; // Route B computes in f32.
   auto transport = pipeline::Transport::Blocking;
   bool verify = false;
@@ -29,7 +30,7 @@ void run(int argc, char **argv, int rank, int size) {
     else if (opt == "--stage-range")
       single = val;
     else if (opt == "--prompt")
-      cfg.prompt = val;
+      prompts.push_back(std::move(val));
     else if (opt == "--wire") {
       if (val == "f32")
         wire = pipeline::WireDtype::Native;
@@ -53,10 +54,14 @@ void run(int argc, char **argv, int rank, int size) {
     } else
       throw std::invalid_argument("unknown option " + opt);
   }
+  if (prompts.empty() || prompts.size() > pipeline::kMaxBatchStreams)
+    throw std::invalid_argument("expected 1 to 8 --prompt arguments");
+  const int streamCount = static_cast<int>(prompts.size());
   auto b = TemplateBundle::load(bundle);
   auto total = b.config.totalLayers;
   LayerRange range{0, total};
-  std::string planIdentity = b.id;
+  std::string planIdentity =
+      b.id + ",streamCount=" + std::to_string(streamCount);
   if (list && single)
     throw std::invalid_argument("conflicting range options");
   if (list) {
@@ -78,9 +83,15 @@ void run(int argc, char **argv, int rank, int size) {
   check.modelName = planIdentity;
   check.requireModelName = true;
   pipeline::checkAllStages(MPI_COMM_WORLD, rank, size, b.config, check);
-  auto stage = makeTemplateStage(b, range, verify);
-  runDistributedStage(*stage, b.spec, b.model, b.vocab.string(), cfg,
-                      MPI_COMM_WORLD, rank, size);
+  auto stage = makeTemplateStage(b, range, verify, streamCount);
+  if (streamCount == 1) {
+    cfg.prompt = std::move(prompts.front());
+    runDistributedStage(*stage, b.spec, b.model, b.vocab.string(), cfg,
+                        MPI_COMM_WORLD, rank, size);
+  } else {
+    runDistributedBatch(*stage, b.spec, b.model, b.vocab.string(), cfg, prompts,
+                        MPI_COMM_WORLD, rank, size);
+  }
 }
 } // namespace
 int main(int argc, char **argv) {

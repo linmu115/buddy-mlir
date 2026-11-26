@@ -62,6 +62,13 @@ public:
     (void)computeLogits;
     throw std::logic_error("prefillChunk is not supported by this stage");
   }
+
+  // Append slot operations after the existing stage entry points.
+  virtual int maxSlots() const { return 1; }
+  virtual void setActiveSlot(int slot) {
+    if (slot != 0)
+      throw std::out_of_range("single-slot stage");
+  }
 };
 
 extern "C" {

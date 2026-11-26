@@ -38,12 +38,15 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
+#include <deque>
 #include <fstream>
 #include <iostream>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace buddy::runtime::pipeline {
@@ -446,13 +449,24 @@ inline void traceStageCall(const std::string &prefix, int rank,
       << '\n';
   out.flush();
 }
+struct BatchPrefillState {
+  int token = 0;
+  int stop = 0;
+  int64_t ttftUs = 0;
+  std::optional<buddy::Sampler> sampler;
+  std::ofstream raw;
+};
 } // namespace detail
 
+// Capture the first sample and sampler state for batch decode. Both callers
+// use the same PromptFramePlan, chunk transport and first-token sampling.
+template <bool CapturePrefill = false>
 inline void generateTokenized(const DistributedGenerateOptions &opts,
                               Stage &stage, MPI_Comm comm, int rank, int ranks,
                               int promptRows, int resolvedNewTokens,
                               std::vector<int64_t> &tokenInput,
-                              AsyncActivation *async) {
+                              AsyncActivation *async,
+                              detail::BatchPrefillState *prefill = nullptr) {
   const auto &config = stage.configuration();
   const bool first = rank == 0, last = rank == ranks - 1;
   const int version = resolveWireSpec(config.dtype, opts.wireDtype).version;
@@ -566,8 +580,9 @@ inline void generateTokenized(const DistributedGenerateOptions &opts,
         async->postReceive(plan[i].header, rank - 1);
 
     const bool observe = first && std::getenv("BUDDY_PP_OBSERVE");
-    auto firstFrame = observe ? std::chrono::steady_clock::now()
-                              : std::chrono::steady_clock::time_point{};
+    auto firstFrame = (observe || (CapturePrefill && first))
+                          ? std::chrono::steady_clock::now()
+                          : std::chrono::steady_clock::time_point{};
     for (int i = 0; i < plan.size(); ++i) {
       const auto frame = plan[i];
       const auto &header = frame.header;
@@ -611,14 +626,26 @@ inline void generateTokenized(const DistributedGenerateOptions &opts,
       mpiCheck(MPI_Recv(&token, 1, MPI_INT, ranks - 1, kTokenTag, comm,
                         MPI_STATUS_IGNORE));
     }
-    if (observe) {
+    if (observe || (CapturePrefill && first)) {
       auto us = std::chrono::duration_cast<std::chrono::microseconds>(
                     std::chrono::steady_clock::now() - firstFrame)
                     .count();
-      std::fprintf(stderr, "pp_first rank=0 ttft_us=%lld\n", (long long)us);
+      if constexpr (CapturePrefill)
+        prefill->ttftUs = us;
+      else
+        std::fprintf(stderr, "pp_first rank=0 ttft_us=%lld\n", (long long)us);
     }
     if (ranks > 1)
       mpiCheck(MPI_Bcast(&stop, 1, MPI_INT, ranks - 1, comm));
+    if constexpr (CapturePrefill) {
+      prefill->token = token;
+      prefill->stop = stop;
+      if (last) {
+        prefill->sampler.emplace(std::move(sampler));
+        prefill->raw = std::move(raw);
+      }
+      return;
+    }
 
     if (!stop) {
       int64_t nextToken = token;
@@ -717,18 +744,21 @@ inline void generateTokenized(const DistributedGenerateOptions &opts,
   }
 }
 
+template <bool CapturePrefill = false>
 inline void generatePrepared(const DistributedGenerateOptions &opts,
                              Stage &stage, MPI_Comm comm, int rank, int ranks,
                              int promptRows, int resolvedNewTokens,
-                             std::vector<int64_t> &tokenInput) {
+                             std::vector<int64_t> &tokenInput,
+                             detail::BatchPrefillState *prefill = nullptr) {
   const auto &config = stage.configuration();
   std::optional<AsyncActivation> async;
   if (ranks > 1 && opts.transport == Transport::Async)
     async.emplace(config, comm, opts.wireDtype, rank > 0, rank < ranks - 1,
                   config.prefillChunk ? 2 : 1);
   try {
-    generateTokenized(opts, stage, comm, rank, ranks, promptRows,
-                      resolvedNewTokens, tokenInput, async ? &*async : nullptr);
+    generateTokenized<CapturePrefill>(opts, stage, comm, rank, ranks,
+                                      promptRows, resolvedNewTokens, tokenInput,
+                                      async ? &*async : nullptr, prefill);
     if (async)
       async->drain();
   } catch (const std::exception &e) {
@@ -798,6 +828,404 @@ inline void generateDistributed(const DistributedGenerateOptions &opts,
 
   generatePrepared(opts, stage, comm, rank, ranks, promptRows,
                    resolvedNewTokens, tokenInput);
+}
+
+inline constexpr size_t kMaxBatchStreams = 8;
+
+namespace detail {
+using BatchClock = std::chrono::steady_clock;
+enum class BatchActKind : uint32_t { Decode = 1, Shutdown = 2 };
+inline constexpr uint32_t kBatchActMagic = 0x424A3437;
+inline constexpr int kTagBatchAct = 3;
+inline constexpr int kTagBatchCtrl = 4;
+struct BatchActHeader {
+  uint32_t magic;
+  BatchActKind kind;
+  int32_t slot;
+  int32_t pos;
+  uint32_t wireDtype;
+  uint32_t payloadBytes;
+};
+struct BatchCtrlReply {
+  int32_t slot;
+  int32_t token;
+  int32_t stop;
+  int32_t reserved;
+};
+static_assert(sizeof(BatchActHeader) == 24);
+static_assert(sizeof(BatchCtrlReply) == 16);
+
+struct BatchStream {
+  BatchPrefillState prefill;
+  std::vector<int> generated;
+  int promptRows = 0;
+  int limit = 0;
+  int pos = 0;
+  int64_t token = 0;
+  bool done = false;
+  bool inFlight = false;
+  int64_t decodeUs = 0;
+};
+
+// Each MPI buffer stays owned by its slot until its request completes.
+// The typed backing vectors also give encode/decode a correctly typed payload
+// immediately after the header, without aliasing an array of bytes as floats.
+template <typename WireElement> class BatchLink {
+  static constexpr bool Half = std::is_same_v<WireElement, uint16_t>;
+  static constexpr auto Dtype =
+      static_cast<uint32_t>(Half ? ActivationType::F16 : ActivationType::F32);
+  static constexpr size_t HeaderElements =
+      sizeof(BatchActHeader) / sizeof(WireElement);
+  const size_t width;
+  const int frameBytes;
+  MPI_Comm comm;
+  int rank, last;
+  std::vector<std::vector<WireElement>> sendSlots;
+  std::vector<MPI_Request> requests;
+  std::vector<BatchCtrlReply> ctrlSlots;
+  std::vector<WireElement> recvBuffer;
+  std::vector<float> decoded;
+
+  static int checkedFrameBytes(size_t width) {
+    if (width > (std::numeric_limits<int>::max() - sizeof(BatchActHeader)) /
+                    sizeof(WireElement))
+      throw std::length_error("batch activation exceeds MPI message size");
+    return static_cast<int>(sizeof(BatchActHeader) +
+                            width * sizeof(WireElement));
+  }
+
+  static void requireSize(MPI_Status &status, int expected) {
+    int received;
+    mpiCheck(MPI_Get_count(&status, MPI_BYTE, &received));
+    if (received != expected)
+      throw std::runtime_error("invalid batch MPI message size");
+  }
+
+public:
+  BatchLink(int activationWidth, size_t slots, MPI_Comm comm, int rank,
+            int last)
+      : width(activationWidth), frameBytes(checkedFrameBytes(width)),
+        comm(comm), rank(rank), last(last), sendSlots(rank < last ? slots : 0),
+        requests(slots, MPI_REQUEST_NULL), ctrlSlots(rank == last ? slots : 0),
+        recvBuffer(rank > 0 ? HeaderElements + width : 0),
+        decoded(rank > 0 && Half ? width : 0) {
+    for (auto &buffer : sendSlots)
+      buffer.resize(HeaderElements + width);
+  }
+
+  void sendActivation(int slot, int pos, const void *output) {
+    mpiCheck(MPI_Wait(&requests[slot], MPI_STATUS_IGNORE));
+    auto &buffer = sendSlots[slot];
+    const BatchActHeader header{
+        kBatchActMagic, BatchActKind::Decode,
+        slot,           pos,
+        Dtype,          uint32_t(width * sizeof(WireElement))};
+    std::memcpy(buffer.data(), &header, sizeof(header));
+    auto *payload = buffer.data() + HeaderElements;
+    const auto *floats = static_cast<const float *>(output);
+    if constexpr (Half)
+      encodeInto(floats, width, payload, width);
+    else
+      std::copy_n(floats, width, payload);
+    mpiCheck(MPI_Isend(buffer.data(), frameBytes, MPI_BYTE, rank + 1,
+                       kTagBatchAct, comm, &requests[slot]));
+  }
+
+  BatchActHeader receiveActivation(size_t slots) {
+    MPI_Status status;
+    mpiCheck(MPI_Recv(recvBuffer.data(), frameBytes, MPI_BYTE, rank - 1,
+                      kTagBatchAct, comm, &status));
+    int bytes;
+    mpiCheck(MPI_Get_count(&status, MPI_BYTE, &bytes));
+    if (bytes < static_cast<int>(sizeof(BatchActHeader)))
+      throw std::runtime_error("truncated batch activation header");
+    BatchActHeader header;
+    std::memcpy(&header, recvBuffer.data(), sizeof(header));
+    if (header.magic != kBatchActMagic || header.wireDtype != Dtype)
+      throw std::runtime_error("invalid batch activation header");
+    if (header.kind == BatchActKind::Shutdown) {
+      if (bytes != static_cast<int>(sizeof(header)) || header.payloadBytes != 0)
+        throw std::runtime_error("invalid batch shutdown frame");
+    } else if (header.kind != BatchActKind::Decode || header.slot < 0 ||
+               size_t(header.slot) >= slots || bytes != frameBytes ||
+               header.payloadBytes != width * sizeof(WireElement)) {
+      throw std::runtime_error("invalid batch decode frame");
+    }
+    return header;
+  }
+
+  void *activationData() {
+    auto *payload = recvBuffer.data() + HeaderElements;
+    if constexpr (Half) {
+      decodeInto(payload, width, decoded.data(), width);
+      return decoded.data();
+    } else {
+      // TemplateStage copies unaligned input into its aligned scratch buffer.
+      return payload;
+    }
+  }
+
+  void sendReply(const BatchCtrlReply &reply) {
+    const int slot = reply.slot;
+    mpiCheck(MPI_Wait(&requests[slot], MPI_STATUS_IGNORE));
+    ctrlSlots[slot] = reply;
+    mpiCheck(MPI_Isend(&ctrlSlots[slot], sizeof(reply), MPI_BYTE, 0,
+                       kTagBatchCtrl, comm, &requests[slot]));
+  }
+
+  bool replyAvailable() {
+    int ready;
+    mpiCheck(MPI_Iprobe(last, kTagBatchCtrl, comm, &ready, MPI_STATUS_IGNORE));
+    return ready != 0;
+  }
+
+  BatchCtrlReply receiveReply() {
+    BatchCtrlReply reply;
+    MPI_Status status;
+    mpiCheck(MPI_Recv(&reply, sizeof(reply), MPI_BYTE, last, kTagBatchCtrl,
+                      comm, &status));
+    requireSize(status, sizeof(reply));
+    return reply;
+  }
+
+  void drainAndShutdown() {
+    mpiCheck(MPI_Waitall(static_cast<int>(requests.size()), requests.data(),
+                         MPI_STATUSES_IGNORE));
+    if (rank < last) {
+      const BatchActHeader header{
+          kBatchActMagic, BatchActKind::Shutdown, -1, 0, Dtype, 0};
+      mpiCheck(MPI_Send(&header, sizeof(header), MPI_BYTE, rank + 1,
+                        kTagBatchAct, comm));
+    }
+  }
+};
+
+inline BatchCtrlReply sampleBatchToken(const DistributedGenerateOptions &opts,
+                                       const StageConfig &config, int slot,
+                                       BatchStream &stream,
+                                       const void *output) {
+  auto &raw = stream.prefill.raw;
+  if (raw.is_open() &&
+      !raw.write(static_cast<const char *>(output),
+                 static_cast<std::streamsize>(config.vocabSize) *
+                     sizeof(float)))
+    throw std::runtime_error("error writing batch logits");
+  const int token = stream.prefill.sampler->sample(
+      static_cast<const float *>(output), config.vocabSize, stream.generated);
+  stream.generated.push_back(token);
+  const size_t count = stream.generated.size();
+  const bool stop =
+      count == size_t(stream.limit) ||
+      isStopToken(token, config.eosId, opts.stopTokenIds) ||
+      (opts.testEosAtStep > 0 && count == size_t(opts.testEosAtStep));
+  return {slot, token, stop, 0};
+}
+
+inline const void *decodeBatchSlot(const DistributedGenerateOptions &opts,
+                                   Stage &stage, int rank, int slot,
+                                   const BatchStream &stream, void *input) {
+  stage.setActiveSlot(slot);
+  if (!opts.traceStagePrefix.empty()) {
+    const auto &config = stage.configuration();
+    const auto header = makeChunkDecodeHeader(
+        stream.pos - stream.promptRows + 1, stream.pos, config.context,
+        resolveWireSpec(config.dtype, opts.wireDtype).version);
+    traceStageCall(opts.traceStagePrefix + ".slot" + std::to_string(slot), rank,
+                   "decode", header, true);
+  }
+  return stage.decodeData(input, stream.pos);
+}
+
+inline int64_t batchElapsedUs(BatchClock::time_point start) {
+  return std::chrono::duration_cast<std::chrono::microseconds>(
+             BatchClock::now() - start)
+      .count();
+}
+
+template <typename WireElement>
+int64_t decodeBatch(const DistributedGenerateOptions &opts, Stage &stage,
+                    MPI_Comm comm, int rank, int ranks,
+                    std::vector<BatchStream> &streams) {
+  const auto &config = stage.configuration();
+  const int last = ranks - 1;
+  BatchLink<WireElement> link(config.activationWidth, streams.size(), comm,
+                              rank, last);
+  try {
+    if (rank != 0) {
+      for (;;) {
+        const auto frame = link.receiveActivation(streams.size());
+        if (frame.kind == BatchActKind::Shutdown)
+          break;
+        auto &stream = streams[frame.slot];
+        if (stream.done || frame.pos != stream.pos ||
+            stream.pos >= config.context)
+          throw std::runtime_error("unexpected batch slot position");
+        const auto *output = decodeBatchSlot(opts, stage, rank, frame.slot,
+                                             stream, link.activationData());
+        if (rank == last) {
+          const auto reply =
+              sampleBatchToken(opts, config, frame.slot, stream, output);
+          stream.done = reply.stop;
+          link.sendReply(reply);
+        } else {
+          link.sendActivation(frame.slot, stream.pos, output);
+        }
+        ++stream.pos;
+      }
+      link.drainAndShutdown();
+      return 0;
+    }
+
+    std::deque<int> ready;
+    for (size_t slot = 0; slot < streams.size(); ++slot)
+      if (!streams[slot].done)
+        ready.push_back(static_cast<int>(slot));
+    int active = static_cast<int>(ready.size());
+    int inFlight = 0;
+    const auto start = BatchClock::now();
+    auto complete = [&](const BatchCtrlReply &reply) {
+      if (reply.slot < 0 || size_t(reply.slot) >= streams.size() ||
+          !streams[reply.slot].inFlight || reply.token < 0 ||
+          reply.token >= config.vocabSize ||
+          (reply.stop != 0 && reply.stop != 1) || reply.reserved)
+        throw std::runtime_error("unexpected batch control reply");
+      auto &stream = streams[reply.slot];
+      if (ranks > 1)
+        stream.generated.push_back(reply.token);
+      stream.token = reply.token;
+      ++stream.pos;
+      stream.inFlight = false;
+      --inFlight;
+      if (reply.stop) {
+        stream.done = true;
+        stream.decodeUs = batchElapsedUs(start);
+        --active;
+      } else {
+        ready.push_back(reply.slot);
+      }
+    };
+
+    while (active > 0) {
+      while (inFlight > 0 && link.replyAvailable())
+        complete(link.receiveReply());
+      if (ready.empty() && active > 0) {
+        if (inFlight == 0)
+          throw std::logic_error("active batch streams have no work");
+        complete(link.receiveReply());
+      }
+      if (ready.empty())
+        continue;
+
+      const int slot = ready.front();
+      ready.pop_front();
+      auto &stream = streams[slot];
+      const void *output =
+          decodeBatchSlot(opts, stage, rank, slot, stream, &stream.token);
+      stream.inFlight = true;
+      ++inFlight;
+      if (ranks == 1)
+        complete(sampleBatchToken(opts, config, slot, stream, output));
+      else
+        link.sendActivation(slot, stream.pos, output);
+    }
+    const auto elapsed = batchElapsedUs(start);
+    link.drainAndShutdown();
+    return elapsed;
+  } catch (const std::exception &e) {
+    // Abort before destroying buffers which MPI may still own.
+    std::fprintf(stderr, "rank %d batch decode: %s\n", rank, e.what());
+    MPI_Abort(comm, 1);
+    std::abort();
+  }
+}
+
+inline void printBatchResult(const std::vector<BatchStream> &streams,
+                             int64_t decodeUs) {
+  size_t totalSteps = 0;
+  for (const auto &stream : streams)
+    totalSteps += stream.generated.size() - 1;
+  auto rate = [](size_t tokens, int64_t us) {
+    return us > 0 ? 1e6 * tokens / us : 0.0;
+  };
+  std::ostringstream result;
+  result.precision(12);
+  result << "{\"decode_wall_us\":" << decodeUs
+         << ",\"aggregate_decode_tokens\":" << totalSteps
+         << ",\"aggregate_decode_tok_s\":" << rate(totalSteps, decodeUs)
+         << ",\"streams\":[";
+  for (size_t slot = 0; slot < streams.size(); ++slot) {
+    const auto &stream = streams[slot];
+    const size_t steps = stream.generated.size() - 1;
+    result << (slot ? "," : "") << "{\"slot\":" << slot
+           << ",\"prompt_tokens\":" << stream.promptRows
+           << ",\"ttft_us\":" << stream.prefill.ttftUs
+           << ",\"decode_steps\":" << steps
+           << ",\"stream_decode_us\":" << stream.decodeUs
+           << ",\"stream_decode_tok_s\":" << rate(steps, stream.decodeUs)
+           << ",\"token_ids\":[";
+    for (size_t i = 0; i < stream.generated.size(); ++i)
+      result << (i ? "," : "") << stream.generated[i];
+    result << "]}";
+  }
+  std::cout << result.str() << "]}\n" << std::flush;
+}
+} // namespace detail
+
+inline void generateDistributedBatch(const DistributedGenerateOptions &opts,
+                                     const std::vector<std::string> &prompts,
+                                     Stage &stage, MPI_Comm comm, int rank,
+                                     int ranks) {
+  const auto &config = stage.configuration();
+  if (prompts.size() < 2 || prompts.size() > kMaxBatchStreams ||
+      prompts.size() > size_t(stage.maxSlots()))
+    throw std::invalid_argument("invalid batch stream count for stage");
+  if (config.dtype != ActivationType::F32 || config.prefillChunk <= 0)
+    throw std::invalid_argument("batch decode requires a chunked f32 stage");
+
+  std::vector<detail::BatchStream> streams(prompts.size());
+  for (size_t slot = 0; slot < streams.size(); ++slot) {
+    auto &stream = streams[slot];
+    std::vector<int64_t> input;
+    std::array<int, 2> meta{};
+    if (rank == 0) {
+      meta[0] = tokenizePrompt(prompts[slot], opts.vocabPath, config.context,
+                               opts.tokenizer, input);
+      meta[1] = resolveGeneratedTokenLimit(opts.maxTokens, opts.tokenLimitMode,
+                                           opts.allowZeroTokenLimit, meta[0],
+                                           config.context);
+    }
+    mpiCheck(MPI_Bcast(meta.data(), 2, MPI_INT, 0, comm));
+    stream.promptRows = stream.pos = meta[0];
+    stream.limit = meta[1];
+
+    auto prefillOpts = opts;
+    if (!opts.traceStagePrefix.empty())
+      prefillOpts.traceStagePrefix += ".slot" + std::to_string(slot);
+    if (!opts.logitsDumpPath.empty() && opts.logitsDumpPath != "-")
+      prefillOpts.logitsDumpPath += ".slot" + std::to_string(slot);
+
+    stage.setActiveSlot(static_cast<int>(slot));
+    generatePrepared<true>(prefillOpts, stage, comm, rank, ranks,
+                           stream.promptRows, 1, input, &stream.prefill);
+    stream.done = stream.prefill.stop || stream.limit == 1;
+    if (rank == 0 || rank == ranks - 1) {
+      stream.token = stream.prefill.token;
+      stream.generated.reserve(stream.limit);
+      stream.generated.push_back(stream.prefill.token);
+    }
+  }
+  const auto decodeUs =
+      ranks > 1 && opts.wireDtype == WireDtype::F16
+          ? detail::decodeBatch<uint16_t>(opts, stage, comm, rank, ranks,
+                                          streams)
+          : detail::decodeBatch<float>(opts, stage, comm, rank, ranks, streams);
+  for (auto &stream : streams) {
+    auto &raw = stream.prefill.raw;
+    if (raw.is_open() && !raw.flush())
+      throw std::runtime_error("error flushing batch logits");
+  }
+  if (rank == 0)
+    detail::printBatchResult(streams, decodeUs);
 }
 
 } // namespace buddy::runtime::pipeline

@@ -104,7 +104,7 @@ struct Phase {
 };
 struct Layer {
   BJ47WeightsV1 weights;
-  Buffer k, v;
+  std::vector<Buffer> k, v;
 };
 class TemplateStage final : public Stage {
   StageConfig cfg;
@@ -118,6 +118,8 @@ class TemplateStage final : public Stage {
   std::vector<int64_t> tokenStorage;
   size_t mapped = 0;
   bool verifyWeights;
+  const int slots;
+  int activeSlot = 0;
 
   const void *map(const WeightEntry &e, size_t count) {
     if (e.elements != count)
@@ -165,8 +167,9 @@ class TemplateStage final : public Stage {
     }
     for (int i = cfg.startLayer; i < cfg.endLayer; ++i) {
       auto &l = layers[i - cfg.startLayer];
-      checked(p.layer(&l.weights, in, l.k.data(), l.v.data(), &frame, out), i,
-              "layer");
+      checked(p.layer(&l.weights, in, l.k[activeSlot].data(),
+                      l.v[activeSlot].data(), &frame, out),
+              i, "layer");
       in = out;
       out = (out == a.data() ? b.data() : a.data());
     }
@@ -180,8 +183,11 @@ class TemplateStage final : public Stage {
   }
 
 public:
-  TemplateStage(const TemplateBundle &bundle, LayerRange range, bool verify)
-      : cfg(bundle.config), verifyWeights(verify) {
+  TemplateStage(const TemplateBundle &bundle, LayerRange range, bool verify,
+                int slotCount)
+      : cfg(bundle.config), verifyWeights(verify), slots(slotCount) {
+    if (slots < 1)
+      throw std::invalid_argument("Route B requires at least one KV slot");
     auto [start, end] = range;
     if (start < 0 || start >= end || end > cfg.totalLayers)
       throw std::invalid_argument("invalid local layer range");
@@ -222,8 +228,12 @@ public:
     for (int i = start; i < end; ++i) {
       auto &l = layers[i - start];
       l.weights = weights("decoder", i, decoder);
-      l.k.allocate(kv, true);
-      l.v.allocate(kv, true);
+      l.k.resize(slots);
+      l.v.resize(slots);
+      for (int slot = 0; slot < slots; ++slot) {
+        l.k[slot].allocate(kv, true);
+        l.v[slot].allocate(kv, true);
+      }
     }
     auto hidden =
         product({size_t(cfg.prefillChunk), size_t(cfg.activationWidth)});
@@ -232,12 +242,19 @@ public:
     auto frame = product({size_t(cfg.prefillChunk), size_t(bundle.headDim)});
     cosine.allocate(frame);
     sine.allocate(frame);
-    if (std::getenv("BUDDY_PP_TIMING"))
-      std::fprintf(stderr,
-                   "pp_storage start=%d end=%d mapped_bytes=%zu kv_bytes=%zu\n",
-                   start, end, mapped, product({kv, 8, layers.size()}));
+    if (std::getenv("BUDDY_PP_TIMING") || std::getenv("BUDDY_PP_STORAGE"))
+      std::fprintf(
+          stderr, "pp_storage start=%d end=%d mapped_bytes=%zu kv_bytes=%zu\n",
+          start, end, mapped,
+          product({kv, 2 * sizeof(float), layers.size(), size_t(slots)}));
   }
   const StageConfig &configuration() const override { return cfg; }
+  int maxSlots() const override { return slots; }
+  void setActiveSlot(int slot) override {
+    if (slot < 0 || slot >= slots)
+      throw std::out_of_range("Route B KV slot");
+    activeSlot = slot;
+  }
   const uint16_t *prefill(void *) override {
     throw std::logic_error("Route B requires f32");
   }
@@ -254,7 +271,8 @@ public:
 };
 } // namespace
 std::unique_ptr<Stage> makeTemplateStage(const TemplateBundle &b,
-                                         LayerRange range, bool verify) {
-  return std::make_unique<TemplateStage>(b, range, verify);
+                                         LayerRange range, bool verify,
+                                         int slots) {
+  return std::make_unique<TemplateStage>(b, range, verify, slots);
 }
 } // namespace buddy::runtime

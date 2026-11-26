@@ -207,6 +207,141 @@ with tempfile.TemporaryDirectory() as directory:
                 limit,
             ]
 
+        if TEST == "mpi_batch":
+            prompts = [
+                "hello",
+                "hello" + " x" * 20,
+                "hello" + " x" * 67,
+                "hello" + " x" * 92,
+            ]
+            for ranks in (1, 2, 4, 8):
+                ranges = ",".join(
+                    f"{i * 28 // ranks}:{(i + 1) * 28 // ranks}"
+                    for i in range(ranks)
+                )
+                for wire in ("f32", "f16"):
+                    for transport in ("blocking", "async"):
+                        env = dict(
+                            os.environ,
+                            CHECK_ROUTE_B_BATCH="1",
+                            CHECK_ROUTE_B_FRAME="1",
+                        )
+                        base = [
+                            MPI,
+                            "-n",
+                            str(ranks),
+                            BUILD / "buddy-pp-route-b",
+                            "--bundle",
+                            manifest,
+                            "--ranges",
+                            ranges,
+                            "--wire",
+                            wire,
+                            "--transport",
+                            transport,
+                            "--total-tokens",
+                            "109",
+                        ]
+                        refs = [
+                            json.loads(
+                                run([*base, "--prompt", prompt], env=env)
+                            )
+                            for prompt in prompts
+                        ]
+                        assert refs[0]["token_ids"][-1] == 151643
+                        assert len(refs[1]["token_ids"]) > len(
+                            refs[0]["token_ids"]
+                        )
+                        for count in (2, 4):
+                            trace = root / "batch-trace"
+                            args = [
+                                arg
+                                for prompt in prompts[:count]
+                                for arg in ("--prompt", prompt)
+                            ]
+                            result = json.loads(
+                                run(
+                                    [*base, *args],
+                                    env=dict(
+                                        env, BUDDY_PP_TRACE_STAGE=str(trace)
+                                    ),
+                                )
+                            )
+                            assert len(result["streams"]) == count
+                            total = 0
+                            for slot, (stream, ref) in enumerate(
+                                zip(result["streams"], refs)
+                            ):
+                                assert stream["slot"] == slot
+                                assert stream["token_ids"] == ref["token_ids"]
+                                rows = ref["prompt_tokens"]
+                                assert stream["prompt_tokens"] == rows
+                                steps = len(ref["token_ids"]) - 1
+                                assert stream["decode_steps"] == steps
+                                assert stream["ttft_us"] >= 0
+                                assert (
+                                    stream["stream_decode_us"]
+                                    <= result["decode_wall_us"]
+                                )
+                                total += steps
+                                for rank in range(ranks):
+                                    log = Path(
+                                        f"{trace}.slot{slot}.rank{rank}.log"
+                                    )
+                                    events = [
+                                        dict(
+                                            field.split("=")
+                                            for field in line.split()
+                                        )
+                                        for line in log.read_text().splitlines()
+                                    ]
+                                    assert [
+                                        int(e["pos"])
+                                        for e in events
+                                        if int(e["pos"]) >= rows
+                                    ] == list(range(rows, rows + steps))
+                                    log.unlink()
+                            assert result["aggregate_decode_tokens"] == total
+                        # Both streams finish in prefill. Shutdown still traverses all ranks.
+                        result = json.loads(
+                            run(
+                                [
+                                    *base,
+                                    "--total-tokens",
+                                    "1",
+                                    "--prompt",
+                                    prompts[0],
+                                    "--prompt",
+                                    prompts[2],
+                                ],
+                                env=env,
+                            )
+                        )
+                        assert result["aggregate_decode_tokens"] == 0
+                        assert all(
+                            s["decode_steps"] == 0 for s in result["streams"]
+                        )
+            run(
+                [
+                    MPI,
+                    "-n",
+                    "1",
+                    *cli(),
+                    "--stage-range",
+                    "0:14",
+                    ":",
+                    "-n",
+                    "1",
+                    *cli(),
+                    "--stage-range",
+                    "14:28",
+                    "--prompt",
+                    "a second stream",
+                ],
+                "streamCount",
+            )
+            sys.exit(0)
+
         if TEST == "mpi_wire":
             for ranks in (1, 2, 4, 8):
                 ranges = ",".join(

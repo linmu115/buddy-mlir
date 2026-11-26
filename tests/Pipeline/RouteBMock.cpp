@@ -43,6 +43,11 @@ int layer(const BJ47WeightsV1 *w, const float *in, float *k, float *v,
   int global = *w->q4;
   if (*w->f32 != global || in[0] != global)
     return -2;
+  // Each KV position starts empty and retains the first prefill write.
+  const int pos = frame->cache_position;
+  if (std::getenv("CHECK_ROUTE_B_BATCH") &&
+      (k[pos] || v[pos] || (pos && (k[0] != global + 1 || v[0] != global + 2))))
+    return -6;
   // The local-stage probe alternates phases, keeping earlier KV intact.
   if (std::getenv("CHECK_ROUTE_B_KV") && frame->cache_position &&
       (k[0] != global + 1 || v[0] != global + 2))
@@ -64,6 +69,13 @@ int head(const float *in, float *out, int token) {
   if (in[0] != 28)
     return -1;
   std::fill_n(out, 151936, 0.f);
+  if (std::getenv("CHECK_ROUTE_B_BATCH")) {
+    const int pos = static_cast<int>(in[15]);
+    if (pos == 12)
+      token = 151643;
+    else
+      token = 100 + pos;
+  }
   out[token] = 1.f;
   return 0;
 }

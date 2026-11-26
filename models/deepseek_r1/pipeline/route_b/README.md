@@ -116,6 +116,35 @@ and per-stage logical mapping/KV byte counts. Set `BUDDY_PP_OBSERVE=1`
 to also emit READY, actual prompt IDs, rank-0 first-frame-to-token time and
 per-rank Linux VmHWM for either route. READY precedes tokenization.
 
+### Multi-stream decode
+
+Repeat `--prompt` to run two to eight independent requests in one MPI job.
+Every rank must use the same prompt count, ranges, wire precision and
+transport. Rank 0 tokenizes the prompts and resolves `--total-tokens`
+against each prompt length separately.
+
+```sh
+mpiexec -n 2 buddy-pp-route-b --bundle "$BUNDLE/route-b.json" \
+  --ranges 0:16,16:28 --wire f16 --total-tokens 128 \
+  --prompt "Explain why ice floats." --prompt "Explain why the sky looks blue."
+```
+
+Prefill runs in prompt order and initializes a separate, zeroed KV slot for
+each request. All slots share the loaded templates, mapped weights and
+operator scratch storage. Decode uses one nonblocking activation message per
+stage hop and one nonblocking sample reply from the last rank to rank 0.
+A slot gets its next step after its own reply. EOS and the token limit retire
+each slot independently. In multi-stream mode `--transport` selects the
+Prefill transport. Decode uses the same nonblocking protocol in either case.
+
+Rank 0 writes one JSON object with aggregate Decode wall time, token count,
+and throughput, plus each stream's prompt length, token IDs, TTFT and Decode
+rate. Decode counts exclude the first token produced by Prefill. TTFT starts
+at each stream's first Prefill frame. Per-stream Decode rate spans batch
+Decode start through that stream's last reply. Set `BUDDY_PP_STORAGE=1` to
+emit mapped weight and total KV byte counts without per-frame logging.
+`BUDDY_PP_OBSERVE=1` reports each rank's Linux VmHWM.
+
 Kernel files are small enough to check their complete SHA-256 before
 dlopen on every launch. To recheck the contents of every local weight
 mapping, add `--verify-weights`. This touches all its pages and is excluded
