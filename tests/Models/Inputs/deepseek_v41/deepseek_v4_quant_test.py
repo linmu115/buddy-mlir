@@ -107,6 +107,85 @@ def main():
             sc.tofile(args.out / "scales")
             expected.tofile(args.out / "decoded")
             rng.normal(size=k).astype(np.float32).tofile(args.out / "x")
+    # Exercise the CLI on native F4 safetensors. Their JSON shape is
+    # [N,K] even though two nibbles occupy each physical byte.
+    import subprocess
+
+    from safetensors.torch import save_file as save_torch
+
+    gate = np.fromfile(args.out / "codes", np.uint8).reshape(n, k // 2)
+    gs = np.fromfile(args.out / "scales", np.uint8).reshape(n, k // 32)
+    flags = []
+    for name, weight, scale in (
+        ("gate", gate, gs),
+        ("up", gate[::-1], gs[::-1]),
+    ):
+        wp, sp = (
+            args.out / (name + ".safetensors"),
+            args.out / (name + "-scale.safetensors"),
+        )
+        save_torch(
+            {"w": torch.from_numpy(weight.copy()).view(torch.float4_e2m1fn_x2)},
+            wp,
+        )
+        save_torch(
+            {"s": torch.from_numpy(scale.copy()).view(torch.float8_e8m0fnu)}, sp
+        )
+        flags.extend(["--matrix", str(wp), "w", str(sp), "s"])
+    f32 = np.fromfile(args.out / "decoded", np.float32).reshape(n, k)
+    for ime, layout in enumerate(k3_w4.pack_glu_both(f32.T, f32[::-1].T)):
+        output = args.out / ("cli-ime" if ime else "cli-tile")
+        subprocess.run(
+            [
+                sys.executable,
+                quant.__file__,
+                str(output),
+                "--format",
+                "fp4",
+                *flags,
+                *(["--ime"] if ime else []),
+            ],
+            check=True,
+        )
+        assert output.read_bytes() == layout.tobytes()
+    for block in (32, 128):
+        # Distinct scales across both dimensions catch accidental row-local
+        # lookup and partial slab origins in native FP8 headers.
+        w8 = torch.from_numpy(
+            np.fromfile(args.out / "decoded", np.float32).reshape(n, k)
+        ).to(torch.float8_e4m3fn)
+        exp8 = (
+            torch.arange(n // block * k // block, dtype=torch.uint8).reshape(
+                n // block, k // block
+            )
+            % 8
+            + 121
+        )
+        packed_scale = exp8.view(torch.float8_e8m0fnu)
+        shard = args.out / f"native-fp8-{block}.safetensors"
+        save_torch({"weight": w8, "scale": packed_scale}, shard)
+        out = args.out / f"cli-fp8-{block}"
+        subprocess.run(
+            [
+                sys.executable,
+                quant.__file__,
+                str(out),
+                "--format",
+                "fp8",
+                "--block",
+                str(block),
+                "--matrix",
+                str(shard),
+                "weight",
+                str(shard),
+                "scale",
+            ],
+            check=True,
+        )
+        decoded = w8.float() * packed_scale.float().repeat_interleave(
+            block, 0
+        ).repeat_interleave(block, 1)
+        assert out.read_bytes() == k3_w4.pack_q4(decoded.numpy().T).tobytes()
     # A second oracle exercises the complete routed + shared FFN through
     # f32 and K3 Q8-activation / w4g32-weight projections.
     h, n_expert = 128, 4
@@ -158,6 +237,8 @@ def main():
             {
                 "slab_max_abs": 0,
                 "layout_comparisons": 12,
+                "native_f4_four_shard_cli_checks": 2,
+                "native_fp8_cli_checks": 2,
                 "layout_byte_diff": 0,
                 "seed": 4106,
             }

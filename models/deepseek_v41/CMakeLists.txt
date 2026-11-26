@@ -17,4 +17,13 @@ if(BUDDY_ENABLE_TESTS AND BUDDY_DEEPSEEK_V41_SPEC_DIR)
   add_test(NAME buddy-v41-differential COMMAND buddy-v41-differential "${fixture}")
   set_tests_properties(buddy-v41-differential PROPERTIES FIXTURES_REQUIRED v41_weights)
   set_tests_properties(buddy-v41-fixture buddy-v41-reference PROPERTIES ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
+  if(BUDDY_MLIR_ENABLE_PYTHON_PACKAGES)
+    add_dependencies(buddy-v41-differential python-package-buddy python-package-buddy-mlir)
+    add_test(NAME buddy-v41-quant-import COMMAND "${Python3_EXECUTABLE}"
+      "${driver}/deepseek_v4_quant_test.py" "${BUDDY_DEEPSEEK_V41_SPEC_DIR}"
+      "${CMAKE_CURRENT_BINARY_DIR}/quant")
+    set_tests_properties(buddy-v41-quant-import PROPERTIES
+      ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1"
+      ENVIRONMENT_MODIFICATION "PYTHONPATH=path_list_prepend:${BUDDY_MLIR_PYTHON_PACKAGES_DIR}")
+  endif()
 endif()

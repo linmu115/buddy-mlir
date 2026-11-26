@@ -1,5 +1,9 @@
 """Decode checkpoint row slabs and emit Route B K3 projection layouts."""
 
+import json
+import os
+from pathlib import Path
+
 import numpy as np
 
 MAG = np.array([0, 0.5, 1, 1.5, 2, 3, 4, 6], dtype=np.float32)
@@ -103,13 +107,55 @@ def repack(out, tensors, fmt, block=32, slab=128, ime=False):
     out.seek(base + len(tensors) * length)
 
 
+class CheckpointShard:
+    """Map encoded bytes using safetensors offsets without creating a full torch tensor."""
+
+    def __init__(self, file):
+        self.file = file
+        self.size = os.fstat(file.fileno()).st_size
+        length = int.from_bytes(file.read(8), "little")
+        if not 0 < length <= min(self.size - 8, 100_000_000):
+            raise ValueError("invalid safetensors header length")
+        self.header = json.loads(file.read(length))
+        self.base = 8 + length
+
+    def matrix(self, key, encoding):
+        item = self.header[key]
+        dtype = item["dtype"]
+        allowed = {
+            "fp4": {"F4", "I8", "U8"},
+            "fp8": {"F8_E4M3", "I8", "U8"},
+            "scale": {"F8_E8M0", "U8"},
+        }
+        if dtype not in allowed[encoding]:
+            raise ValueError(f"{key}: incompatible {dtype} for {encoding}")
+        rows, width = item["shape"]
+        if rows <= 0 or width <= 0 or (dtype == "F4" and width % 2):
+            raise ValueError(f"{key}: invalid matrix shape")
+        # Native F4 headers carry logical K. Byte-carrier I8/U8 headers
+        # already carry K/2. Both expose the same packed row layout here.
+        if dtype == "F4":
+            width //= 2
+        begin, end = item["data_offsets"]
+        if (
+            begin < 0
+            or end - begin != rows * width
+            or self.base + end > self.size
+        ):
+            raise ValueError(f"{key}: inconsistent tensor bounds")
+        return np.memmap(
+            self.file,
+            mode="r",
+            dtype=np.uint8,
+            offset=self.base + begin,
+            shape=(rows, width),
+        )
+
+
 def main():
     import argparse
     from contextlib import ExitStack
-    from pathlib import Path
     from tempfile import NamedTemporaryFile
-
-    from safetensors import safe_open
 
     parser = argparse.ArgumentParser(
         description="Stream one K3 projection or fused gate/up pair from safetensors."
@@ -130,14 +176,20 @@ def main():
     with ExitStack() as stack:
         shards = {}
 
-        def get(path, key):
+        def get(path, key, encoding):
+            path = Path(path).resolve()
+            if path == args.output.resolve():
+                raise ValueError("output would replace an input shard")
             if path not in shards:
-                shards[path] = stack.enter_context(
-                    safe_open(path, framework="pt")
+                shards[path] = CheckpointShard(
+                    stack.enter_context(path.open("rb"))
                 )
-            return shards[path].get_slice(key)
+            return shards[path].matrix(key, encoding)
 
-        tensors = [(get(p, k), get(s, v)) for p, k, s, v in args.matrix]
+        tensors = [
+            (get(p, k, args.format), get(s, v, "scale"))
+            for p, k, s, v in args.matrix
+        ]
         with NamedTemporaryFile(dir=args.output.parent, delete=False) as out:
             tmp = Path(out.name)
             stack.callback(tmp.unlink, missing_ok=True)
