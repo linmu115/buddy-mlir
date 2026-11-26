@@ -202,3 +202,42 @@ incomplete codepoint at the output limit is omitted. Set
 `"route_b_metrics": true` to include a Route B event with each step, even
 when the UTF-8 decoder is waiting for a complete character. For a streaming
 terminal session, run `python3 tools/route_b_serve/stream_chat.py`.
+
+## Qwen3.5 text hybrid bundles
+
+The hybrid manifest carries one layer type per layer. The host binds the
+corresponding `gdn_layer.so` or `full_attn_layer.so` at each local layer and
+allocates the state sizes advertised by that template for each slot. Hybrid
+templates extend the descriptor returned by `bj47_kernel_info_v1` and preserve
+the six-argument layer entry points. `BJ47FrameRowsV2` supplies the logical row
+count independently of the fixed wire capacity. Hybrid prefill appends each
+prompt position once and uses the last valid row for the head.
+
+Build a bundle from an indexed safetensors checkpoint and a line-indexed BPE
+vocabulary (one token per ID). The f32 validation path accepts an f16 or f32
+embedding table and uses f32 activations, projections and state. The exporter
+reads only the text tensors required by the manifest. It retains lowered
+MLIR, LLVM IR, the benchmark-independent build timings and the DSO hashes
+under `--work`. Choose a new output directory for each build.
+
+```sh
+python3 tools/buddy-codegen/build_route_b_hybrid.py \
+  --checkpoint "$CHECKPOINT" --vocab "$VOCAB" --model-id tiny-qwen3_8 \
+  --embed-dtype f16 --output "$BUNDLE" --work "$WORK" \
+  --buddy-opt "$BUDDY_OPT" --llvm-bin "$LLVM_BIN"
+buddy-pp-route-b --bundle "$BUNDLE/route-b.json" --ranges 0:4 \
+  --prompt 'Hello' --total-tokens 24
+```
+
+For K3, append the Clang target, sysroot, GCC toolchain and
+`--cxx-flag=-march=rv64gcv_zfh_zvfh`. The f32 path uses RVV and an in-place,
+per-token recurrence in prefill and decode. Projections, embedding lookup and
+the GDN state update are destination-passing MLIR. The C++ template supplies
+frame handling, convolution, normalization, attention and residual ordering.
+
+The B1 scripts in `tests/Pipeline` generate the 4-layer fixture using the
+locked checkpoint config and index, run the locked HF source as a CPU
+oracle, and compare tensor traces from `RouteBHybridProbe.cpp`. The service
+test switches all documented stage cuts against the same DSO hashes and
+checks a staggered two-slot run with slot reuse. The hybrid tokenizer checks
+the Qwen3.5 special token IDs and rejects an unencodable prompt.

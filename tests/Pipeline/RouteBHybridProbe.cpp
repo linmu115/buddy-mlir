@@ -1,0 +1,196 @@
+// Exercise the exact DSO ABI on native or RISC-V and dump every numerical
+// boundary. The Python oracle owns fixture creation and comparison.
+#include "buddy/runtime/pipeline/RouteB.h"
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cstdlib>
+#include <dlfcn.h>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <memory>
+#include <stdexcept>
+#include <vector>
+
+namespace {
+namespace fs = std::filesystem;
+
+template <typename T> struct Buffer {
+  std::unique_ptr<T, decltype(&free)> ptr{nullptr, free};
+  size_t size;
+
+  explicit Buffer(size_t count) : size(count) {
+    void *p = nullptr;
+    if (posix_memalign(&p, 64, count * sizeof(T)))
+      throw std::bad_alloc();
+    ptr.reset(static_cast<T *>(p));
+    std::fill_n(data(), size, T{});
+  }
+  T *data() const { return ptr.get(); }
+  void read(fs::path path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in.read(reinterpret_cast<char *>(data()), size * sizeof(T)) ||
+        in.peek() != EOF)
+      throw std::runtime_error("weight size: " + path.string());
+  }
+};
+
+struct Kernel {
+  std::unique_ptr<void, decltype(&dlclose)> handle;
+  const BJ47KernelInfoV2 *info;
+  explicit Kernel(const fs::path &path)
+      : handle(dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL), dlclose) {
+    if (!handle)
+      throw std::runtime_error(dlerror());
+    auto *prefix =
+        symbol<decltype(&bj47_kernel_info_v1)>("bj47_kernel_info_v1")();
+    if (!prefix || prefix->struct_bytes != sizeof(BJ47KernelInfoV2))
+      throw std::runtime_error("expected hybrid descriptor");
+    info = reinterpret_cast<const BJ47KernelInfoV2 *>(prefix);
+  }
+
+  template <typename T> T symbol(const char *name) {
+    auto *fn = dlsym(handle.get(), name);
+    if (!fn)
+      throw std::runtime_error(dlerror());
+    return reinterpret_cast<T>(fn);
+  }
+};
+
+struct Layer {
+  Buffer<float> w, a, b;
+  decltype(&layer_prefill) prefill, decode;
+  Layer(Kernel &kernel, const fs::path &weights)
+      : w(kernel.info->base.f32_elements), a(kernel.info->state_a_elements),
+        b(kernel.info->state_b_elements),
+        prefill(kernel.symbol<decltype(prefill)>("layer_prefill")),
+        decode(kernel.symbol<decltype(decode)>("layer_decode")) {
+    w.read(weights);
+  }
+
+  void run(bool pre, const float *in, const BJ47FrameV1 &frame, float *out) {
+    BJ47WeightsV1 weights{w.data(), nullptr};
+    if ((pre ? prefill : decode)(&weights, in, a.data(), b.data(), &frame, out))
+      throw std::runtime_error("layer failed");
+  }
+};
+
+template <typename T> void dump(std::ostream &out, const T *p, size_t count) {
+  if (!out.write(reinterpret_cast<const char *>(p), count * sizeof(T)))
+    throw std::runtime_error("write failed");
+}
+
+void probe(const fs::path &dir, const fs::path &input, const fs::path &output,
+           int rows, int steps, int64_t padding) {
+  Kernel embed(dir / "embed.so"), gdn(dir / "gdn_layer.so"),
+      full(dir / "full_attn_layer.so"), head(dir / "lm_head.so");
+  const auto &config = full.info->base;
+  const int chunk = config.chunk, width = config.width,
+            vocab = config.vocab_size;
+  if (rows <= 0 || steps <= 0 || rows + steps > int(config.context) + 1)
+    throw std::runtime_error("invalid probe dimensions");
+  auto &descriptor = *embed.info;
+  const bool half = descriptor.embed_dtype == 2;
+  Buffer<float> table(half ? 1 : descriptor.base.f32_elements);
+  Buffer<uint16_t> tableHalf(half ? descriptor.f16_elements : 1);
+  if (half)
+    tableHalf.read(dir / "embed.f16");
+  else
+    table.read(dir / "embed.f32");
+
+  auto embedFloatPre =
+      half ? nullptr : embed.symbol<decltype(&embed_prefill)>("embed_prefill");
+  auto embedFloatDec =
+      half ? nullptr : embed.symbol<decltype(&embed_decode)>("embed_decode");
+  auto embedHalfPre =
+      half ? embed.symbol<decltype(&embed_prefill_f16)>("embed_prefill_f16")
+           : nullptr;
+  auto embedHalfDec =
+      half ? embed.symbol<decltype(&embed_decode_f16)>("embed_decode_f16")
+           : nullptr;
+  auto prepPre = full.symbol<decltype(&prepare_prefill)>("prepare_prefill");
+  auto prepDec = full.symbol<decltype(&prepare_decode)>("prepare_decode");
+  auto headPre = head.symbol<decltype(&lm_head_prefill)>("lm_head_prefill");
+  auto headDec = head.symbol<decltype(&lm_head_decode)>("lm_head_decode");
+  Buffer<float> projection(head.info->base.f32_elements),
+      inv(config.rope_elements);
+  projection.read(dir / "head.f32");
+  inv.read(dir / "rope.f32");
+  BJ47WeightsV1 weight{projection.data(), nullptr};
+
+  std::array<Layer, 4> layers{{{gdn, dir / "gdn-0.f32"},
+                               {gdn, dir / "gdn-1.f32"},
+                               {gdn, dir / "gdn-2.f32"},
+                               {full, dir / "full_attn-3.f32"}}};
+  Buffer<float> a(chunk * width), b(chunk * width), logits(vocab);
+  Buffer<float> cos(chunk * full.info->rotary_dim), sin(cos.size);
+  Buffer<int64_t> tokens(rows), ids(chunk);
+  tokens.read(input);
+  std::ofstream out(output, std::ios::binary);
+  std::vector<int64_t> generated;
+  const bool timings = std::getenv("BUDDY_HYBRID_PROBE_TIMINGS");
+  auto step = [&](int pos, int validRows, bool pre, bool sample) {
+    const int rc = half ? (pre ? embedHalfPre : embedHalfDec)(
+                              tableHalf.data(), ids.data(), a.data())
+                        : (pre ? embedFloatPre : embedFloatDec)(
+                              table.data(), ids.data(), a.data());
+    if (rc || (pre ? prepPre : prepDec)(inv.data(), pos, cos.data(), sin.data(),
+                                        nullptr))
+      throw std::runtime_error("embed/prepare failed");
+    BJ47FrameRowsV2 aux{validRows};
+    BJ47FrameV1 frame{pos, cos.data(), sin.data(), &aux};
+    float *in = a.data(), *hidden = b.data();
+    for (size_t i = 0; i < layers.size(); ++i) {
+      auto &layer = layers[i];
+      const auto start = std::chrono::steady_clock::now();
+      layer.run(pre, in, frame, hidden);
+      if (timings) {
+        const auto elapsed = std::chrono::steady_clock::now() - start;
+        const auto us =
+            std::chrono::duration_cast<std::chrono::microseconds>(elapsed);
+        std::cerr << "layer_us " << pos << ' ' << validRows << ' ' << i << ' '
+                  << us.count() << '\n';
+      }
+      dump(out, hidden, size_t(validRows) * width);
+      dump(out, layer.a.data(), layer.a.size);
+      dump(out, layer.b.data(), layer.b.size);
+      std::swap(in, hidden);
+    }
+    if (sample) {
+      if ((pre ? headPre : headDec)(&weight, in + (validRows - 1) * width,
+                                    logits.data()))
+        throw std::runtime_error("head failed");
+      dump(out, logits.data(), logits.size);
+      generated.push_back(
+          std::max_element(logits.data(), logits.data() + vocab) -
+          logits.data());
+    }
+  };
+
+  for (int pos = 0; pos < rows; pos += chunk) {
+    const int validRows = std::min(rows - pos, chunk);
+    std::copy_n(tokens.data() + pos, validRows, ids.data());
+    std::fill(ids.data() + validRows, ids.data() + chunk, padding);
+    step(pos, validRows, true, pos + chunk >= rows);
+  }
+  for (int i = 0; i < steps - 1; ++i) {
+    ids.data()[0] = generated.back();
+    step(rows + i, 1, false, true);
+  }
+  dump(out, generated.data(), generated.size());
+}
+} // namespace
+
+int main(int argc, char **argv) {
+  try {
+    if (argc != 7)
+      throw std::runtime_error(
+          "probe BUNDLE IDS DUMP PROMPT_ROWS STEPS PAD_ID");
+    probe(argv[1], argv[2], argv[3], std::stoi(argv[4]), std::stoi(argv[5]),
+          std::stoll(argv[6]));
+  } catch (const std::exception &e) {
+    std::cerr << e.what() << '\n';
+    return 1;
+  }
+}

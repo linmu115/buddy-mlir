@@ -70,6 +70,11 @@ public:
       throw std::out_of_range("single-slot stage");
   }
   virtual void clearSlot(int slot) { (void)slot; }
+
+  // Called only for template stages with append-only prompt chunking.
+  virtual const void *prefillValidRows(void *, int, bool, int) {
+    throw std::logic_error("partial prefill is not supported by this stage");
+  }
 };
 
 extern "C" {

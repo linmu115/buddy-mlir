@@ -88,7 +88,11 @@ public:
   // Reuse a vocabulary previously read by loadVocab() across prompts.
   void tokenizeDeepSeekR1WithLoadedVocab(const std::string &prompt,
                                          size_t length);
-  void tokenizeQwen3WithLoadedVocab(const std::string &prompt, size_t length);
+  void tokenizeQwen3WithLoadedVocab(const std::string &prompt, size_t length,
+                                    bool qwen35 = false);
+  void tokenizeQwen35WithLoadedVocab(const std::string &prompt, size_t length) {
+    tokenizeQwen3WithLoadedVocab(prompt, length, true);
+  }
   // Qwen3-VL Tokenizer
   // Tokenizes the free-form prompt text with the same byte-level BPE encoder
   // as tokenizeQwen3(), and wraps it in the fixed single-image chat-template
@@ -567,19 +571,36 @@ void Text<T, N>::tokenizeQwen3(const std::string &vocab, size_t length) {
 
 template <typename T, size_t N>
 void Text<T, N>::tokenizeQwen3WithLoadedVocab(const std::string &prompt,
-                                              size_t length) {
+                                              size_t length, bool qwen35) {
+  if (length < 8)
+    throw std::invalid_argument(
+        "Qwen chat template requires at least eight tokens");
   prepareTokenBuffer(length);
 
-  // Standard Special Token IDs for the Qwen series
-  this->bos = 151644;
-  this->eos = 151645;
-  this->pad = 151643;
-  const int userToken = 872;
-  const int assistantToken = 77091;
-  const int newlineToken = 198;
+  const auto turnStart = qwen35 ? 248045 : 151644;
+  const auto turnEnd = qwen35 ? 248046 : 151645;
+  this->bos = qwen35 ? 248044 : turnStart;
+  this->eos = qwen35 ? 248044 : turnEnd;
+  this->pad = qwen35 ? 248044 : 151643;
+  const auto lookupToken = [&](const char *token) {
+    auto it = tokenToIdMap.find(token);
+    if (it == tokenToIdMap.end())
+      throw std::runtime_error(std::string("missing Qwen3.5 token: ") + token);
+    return it->second;
+  };
+  if (qwen35 &&
+      (lookupToken("<|endoftext|>") != 248044 ||
+       lookupToken("<|im_start|>") != 248045 ||
+       lookupToken("<|im_end|>") != 248046 ||
+       lookupToken("<think>") != 248068 || lookupToken("</think>") != 248069))
+    throw std::runtime_error(
+        "Qwen3.5 special token IDs do not match vocabulary");
+  const auto userToken = qwen35 ? lookupToken("user") : 872;
+  const auto assistantToken = qwen35 ? lookupToken("assistant") : 77091;
+  const auto newlineToken = qwen35 ? lookupToken("Ċ") : 198;
 
   tokenCnt = 0;
-  this->aligned[tokenCnt++] = bos;
+  this->aligned[tokenCnt++] = turnStart;
   this->aligned[tokenCnt++] = userToken;
   this->aligned[tokenCnt++] = newlineToken;
 
@@ -620,6 +641,11 @@ void Text<T, N>::tokenizeQwen3WithLoadedVocab(const std::string &prompt,
     }
   }
 
+  // A hybrid prompt must be matched end to end. The legacy tokenizer keeps
+  // its historical handling of an incomplete vocabulary.
+  if (qwen35 && score[n] < -1e9)
+    throw std::runtime_error(
+        "Qwen3.5 vocabulary cannot encode the full prompt");
   // 5. Backtracking (Backward Pass)
   std::vector<size_t> res;
   int curr = n;
@@ -642,9 +668,9 @@ void Text<T, N>::tokenizeQwen3WithLoadedVocab(const std::string &prompt,
   }
 
   // 7. Append Assistant Prompt tokens
-  this->aligned[tokenCnt++] = eos;
+  this->aligned[tokenCnt++] = turnEnd;
   this->aligned[tokenCnt++] = newlineToken;
-  this->aligned[tokenCnt++] = bos;
+  this->aligned[tokenCnt++] = turnStart;
   this->aligned[tokenCnt++] = assistantToken;
   this->aligned[tokenCnt++] = newlineToken;
 

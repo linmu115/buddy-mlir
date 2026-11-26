@@ -102,13 +102,20 @@ TemplateBundle TemplateBundle::load(const std::filesystem::path &index) {
   auto canonical = j.dump();
   require(contentDigest(canonical.data(), canonical.size()) == b.id,
           "bundle_id digest");
-  require(
-      j.at("format") == "bj47.route-b/1" && j.at("activation_type") == "f32" &&
-          (j.at("architecture") == "Qwen2ForCausalLM" ||
-           j.at("architecture") == "Qwen3MoeForCausalLM") &&
-          j.at("variant") == "w4g32" && j.at("kernels") == "k3" &&
-          j.at("prefill_ime") == true && j.at("pack_version") == "k3-w4g32/1",
-      "format or model type");
+  const auto &arch = j.at("architecture");
+  b.hybrid =
+      arch == "Qwen3_5ForConditionalGeneration" || arch == "Qwen3_5ForCausalLM";
+  const bool hybridFormat =
+      b.hybrid && j.contains("layer_types") && j.at("variant") == "f32" &&
+      j.at("prefill_ime") == false && j.at("pack_version") == "qwen3_5-f32/1";
+  const bool legacyFormat =
+      (arch == "Qwen2ForCausalLM" || arch == "Qwen3MoeForCausalLM") &&
+      !j.contains("layer_types") && j.at("variant") == "w4g32" &&
+      j.at("prefill_ime") == true && j.at("pack_version") == "k3-w4g32/1";
+  require(j.at("format") == "bj47.route-b/1" &&
+              j.at("activation_type") == "f32" && j.at("kernels") == "k3" &&
+              (hybridFormat || legacyFormat),
+          "format or model type");
   b.shape = digestField(j, "shape_id");
   b.model = j.at("model_id");
   auto &c = b.config;
@@ -129,8 +136,20 @@ TemplateBundle TemplateBundle::load(const std::filesystem::path &index) {
   b.spec = {0,     c.endLayer,        c.totalLayers,
             "f32", c.activationWidth, c.prefillChunk};
   b.spec.tokenizer = j.at("tokenizer");
-  require(b.spec.tokenizer == "deepseek_r1" || b.spec.tokenizer == "qwen3",
-          "tokenizer");
+  if (b.hybrid) {
+    require((b.spec.tokenizer == "qwen3_5" || b.spec.tokenizer == "qwen3_8") &&
+                c.vocabSize > 248069 && c.eosId == 248044 &&
+                c.context % c.prefillChunk == 0,
+            "hybrid tokenizer/shape");
+    b.layerTypes = j.at("layer_types").get<std::vector<std::string>>();
+    require(b.layerTypes.size() == size_t(c.totalLayers), "layer_types size");
+    for (const auto &type : b.layerTypes)
+      require(type == "gdn" || type == "full_attn", "layer_types entry");
+  } else {
+    require(b.spec.tokenizer == "deepseek_r1" || b.spec.tokenizer == "qwen3",
+            "tokenizer");
+    b.layerTypes.assign(c.totalLayers, "decoder_layer");
+  }
   require(j.at("stop_token_ids").is_array(), "stop_token_ids");
   for (const auto &v : j.at("stop_token_ids")) {
     require(v.is_number_integer() && v >= 0 && v < c.vocabSize,
@@ -146,8 +165,11 @@ TemplateBundle TemplateBundle::load(const std::filesystem::path &index) {
     b.runtime = std::filesystem::absolute(root / "libbj47_kernel_runtime.so");
   }
   const auto &layouts = j.at("layouts");
-  const std::map<std::string, std::string> owners{
-      {"embed", "embed"}, {"decoder_layer", "decoder"}, {"lm_head", "head"}};
+  std::map<std::string, std::string> owners{{"embed", "embed"},
+                                            {"lm_head", "head"}};
+  for (const auto &type : b.layerTypes)
+    owners.emplace(type == "decoder_layer" ? type : type + "_layer",
+                   b.hybrid ? type : "decoder");
   std::set<std::filesystem::path> paths;
   for (const auto &k : j.at("templates")) {
     std::string role = k.at("role");
@@ -157,28 +179,38 @@ TemplateBundle TemplateBundle::load(const std::filesystem::path &index) {
     require(owners.count(role) &&
                 e.layout == digestField(layouts, owners.at(role)) &&
                 digestField(k, "shape_id") == b.shape &&
-                e.abi == (role == "lm_head" ? 2 : 1) &&
+                e.abi == (b.hybrid || role == "lm_head" ? 2 : 1) &&
                 paths.insert(e.path).second &&
                 b.kernels.emplace(role, e).second,
             role + " template");
   }
-  require(b.kernels.size() == 3, "template count");
+  require(b.kernels.size() == owners.size(), "template count");
   for (const auto &w : j.at("weights")) {
     std::string owner = w.at("owner"), bucket = w.at("bucket");
-    bool layer = owner == "decoder", f32 = bucket == "f32";
+    const bool layer =
+        b.hybrid ? owner == "gdn" || owner == "full_attn" : owner == "decoder";
+    const bool f32 = bucket == "f32", f16 = bucket == "f16";
     require(layer || owner == "head" || owner == "rope" || owner == "embed",
             "owner");
-    require((f32 || ((layer || owner == "head") && bucket == "q4")) &&
-                w.at("dtype") == (f32 ? "f32" : "i8") &&
+    const bool validBucket =
+        f32 || (b.hybrid && owner == "embed" && f16) ||
+        (!b.hybrid && (layer || owner == "head") && bucket == "q4");
+    require(validBucket &&
+                w.at("dtype") == (f32   ? "f32"
+                                  : f16 ? "f16"
+                                        : "i8") &&
                 layer == w.contains("global_layer_id") &&
                 digestField(w, "layout_id") == digestField(layouts, owner),
             "weight bucket/layout");
     int id = layer ? number(w, "global_layer_id", 0) : -1;
-    require(id < c.totalLayers, "global_layer_id");
+    require(id < c.totalLayers &&
+                (!b.hybrid || !layer || b.layerTypes[id] == owner),
+            "global_layer_id/type");
+    const size_t elementBytes = f32 ? 4 : f16 ? 2 : 1;
     const auto &el = w.at("elements");
-    require(el.is_number_unsigned() && el > 0 && el <= SIZE_MAX / (f32 ? 4 : 1),
+    require(el.is_number_unsigned() && el > 0 && el <= SIZE_MAX / elementBytes,
             "elements");
-    size_t elements = el.get<size_t>(), bytes = elements * (f32 ? 4 : 1);
+    size_t elements = el.get<size_t>(), bytes = elements * elementBytes;
     require(w.at("nbytes").is_number_unsigned() && w.at("nbytes") == bytes,
             "nbytes");
     WeightEntry e{file(root, w.at("path")), elements, bytes,
@@ -187,7 +219,18 @@ TemplateBundle TemplateBundle::load(const std::filesystem::path &index) {
                 b.weights.emplace(std::make_tuple(owner, id, bucket), e).second,
             "duplicate weight");
   }
-  require(b.weights.size() == 2ULL * c.totalLayers + 4, "weight count");
+  if (b.hybrid) {
+    const bool rope = owners.count("full_attn_layer");
+    require(b.weights.size() == size_t(c.totalLayers) + 2 + rope &&
+                b.weights.count({"embed", -1, "f32"}) +
+                        b.weights.count({"embed", -1, "f16"}) ==
+                    1 &&
+                b.weights.count({"head", -1, "f32"}) == 1 &&
+                b.weights.count({"rope", -1, "f32"}) == size_t(rope),
+            "hybrid weight count");
+  } else {
+    require(b.weights.size() == 2ULL * c.totalLayers + 4, "weight count");
+  }
   return b;
 }
 void validateChain(const std::vector<LayerRange> &ranges, int total) {

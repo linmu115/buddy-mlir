@@ -99,7 +99,8 @@ BatchCtrlReply residentPrefill(const DistributedGenerateOptions &opts,
   const auto &config = stage.configuration();
   const PromptFramePlan plan(
       stream.promptRows, config.prefillChunk, config.context,
-      resolveWireSpec(config.dtype, opts.wireDtype).version);
+      resolveWireSpec(config.dtype, opts.wireDtype).version,
+      opts.appendOnlyPrefill);
   if (chunks != 0 && chunks != plan.size())
     throw std::runtime_error("unexpected resident prefill chunk count");
 
@@ -135,9 +136,7 @@ BatchCtrlReply residentPrefill(const DistributedGenerateOptions &opts,
       input = link.activationData(incoming.rows);
     }
     const auto *output =
-        frame.prefill
-            ? stage.prefillChunk(input, frame.header.pos, frame.needLogits)
-            : stage.decodeData(input, frame.header.pos);
+        runPromptFrame(stage, input, frame, opts.appendOnlyPrefill);
     if (rank < last)
       link.sendActivation(slot, frame.header.pos, output, frame.header.rows,
                           BatchActKind::PrefillChunk);

@@ -25,6 +25,8 @@ struct TemplateBundle {
   StageConfig config{};
   std::string id, shape, model;
   int kvHeads, headDim;
+  bool hybrid = false;
+  std::vector<std::string> layerTypes;
   StageManifest spec{};
   std::filesystem::path vocab, runtime;
   std::string vocabDigest, runtimeDigest;

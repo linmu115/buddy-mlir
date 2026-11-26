@@ -12,6 +12,19 @@ typedef struct {
   uint8_t layout_id[32], shape_id[32]; /* SHA-256 */
 } BJ47KernelInfoV1;
 
+/* Hybrid DSOs return this prefix from bj47_kernel_info_v1. The legacy
+ * ABI-2 head still returns a descriptor of exactly sizeof(BJ47KernelInfoV1).
+ * Roles 4 and 5 are Gated DeltaNet and gated full attention, respectively. */
+typedef struct {
+  BJ47KernelInfoV1 base;
+  uint64_t state_a_elements, state_b_elements, f16_elements;
+  uint32_t rotary_dim, embed_dtype; /* 0=not embed, 1=f32, 2=f16 */
+} BJ47KernelInfoV2;
+
+typedef struct {
+  int64_t valid_rows;
+} BJ47FrameRowsV2;
+
 typedef struct {
   const float *f32;
   const int8_t *q4;
@@ -30,6 +43,9 @@ const BJ47KernelInfoV1 *bj47_kernel_info_v1(void);
 /* embed.so: rows fixed to chunk or 1 by the entry */
 int32_t embed_prefill(const float *table, const int64_t *ids, float *out);
 int32_t embed_decode(const float *table, const int64_t *ids, float *out);
+int32_t embed_prefill_f16(const uint16_t *table, const int64_t *ids,
+                          float *out);
+int32_t embed_decode_f16(const uint16_t *table, const int64_t *ids, float *out);
 
 /* decoder_layer.so: caller owns cos, sin, aux, K, V and out */
 int32_t prepare_prefill(const float *inv_freq, int64_t pos, float *cos_rows,

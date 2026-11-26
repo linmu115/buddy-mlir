@@ -94,8 +94,9 @@ inline pipeline::TokenizerKind resolveTokenizerKind(const std::string &name) {
     return pipeline::TokenizerKind::DeepSeekR1;
   if (name == "qwen3")
     return pipeline::TokenizerKind::Qwen3;
-  throw std::runtime_error("unsupported stage tokenizer '" + name +
-                           "' (expected 'deepseek_r1' or 'qwen3')");
+  if (name == "qwen3_5" || name == "qwen3_8")
+    return pipeline::TokenizerKind::Qwen35;
+  throw std::runtime_error("unsupported stage tokenizer '" + name + "'");
 }
 
 inline void appendUniqueStopToken(std::vector<int> &stopTokenIds, int tokenId) {
@@ -126,11 +127,17 @@ makeGenerateOptions(const StageManifest &spec, const std::string &vocabPath,
   genOpts.vocabPath = vocabPath;
   genOpts.tokenizer = resolveTokenizerKind(spec.tokenizer);
   genOpts.stopTokenIds = spec.stopTokenIds;
+  genOpts.appendOnlyPrefill =
+      genOpts.tokenizer == pipeline::TokenizerKind::Qwen35;
   if (genOpts.tokenizer == pipeline::TokenizerKind::Qwen3) {
     // Match whole-model Qwen3VLMoeRunner stop tokens: <|im_end|> and
     // <|endoftext|>.
     appendUniqueStopToken(genOpts.stopTokenIds, 151645);
     appendUniqueStopToken(genOpts.stopTokenIds, 151643);
+  }
+  if (genOpts.tokenizer == pipeline::TokenizerKind::Qwen35) {
+    appendUniqueStopToken(genOpts.stopTokenIds, 248044);
+    appendUniqueStopToken(genOpts.stopTokenIds, 248046);
   }
   genOpts.tokenLimitMode = pipeline::TokenLimitMode::TotalSequenceLength;
   genOpts.maxTokens = cfg.maxNewTokens;

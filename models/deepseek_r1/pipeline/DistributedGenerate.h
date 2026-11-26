@@ -86,6 +86,7 @@ enum class TokenLimitMode {
 enum class TokenizerKind {
   DeepSeekR1,
   Qwen3,
+  Qwen35,
 };
 
 struct DistributedGenerateOptions {
@@ -118,6 +119,7 @@ struct DistributedGenerateOptions {
   std::string traceStagePrefix;
   Transport transport = Transport::Blocking;
   WireDtype wireDtype = WireDtype::Native;
+  bool appendOnlyPrefill = false;
 };
 
 inline bool isStopToken(int token, int eosId,
@@ -136,7 +138,7 @@ inline int tokenizePrompt(const std::string &prompt,
                              std::to_string(context) + ")");
   if (vocabPath.empty())
     throw std::runtime_error("field vocab_uri missing on first stage");
-  if (tokenizer == TokenizerKind::Qwen3 && prompt.empty())
+  if (tokenizer != TokenizerKind::DeepSeekR1 && prompt.empty())
     throw std::runtime_error("field prompt must be non-empty");
   if (tokenizer == TokenizerKind::DeepSeekR1 &&
       (prompt.empty() || prompt.front() == ' '))
@@ -155,6 +157,8 @@ inline int tokenizePrompt(const std::string &prompt,
   const size_t capacity = std::max<size_t>(context, 2 * prompt.size() + 8);
   if (tokenizer == TokenizerKind::Qwen3)
     text->tokenizeQwen3WithLoadedVocab(prompt, capacity);
+  else if (tokenizer == TokenizerKind::Qwen35)
+    text->tokenizeQwen35WithLoadedVocab(prompt, capacity);
   else
     text->tokenizeDeepSeekR1WithLoadedVocab(prompt, capacity);
 
@@ -574,7 +578,8 @@ inline void generateTokenized(const DistributedGenerateOptions &opts,
   if (config.prefillChunk > 0) {
     // Chunked prefill + decode (matches ModelSession::_emit_chunked_prefill).
     const int C = config.prefillChunk;
-    const PromptFramePlan plan(promptRows, C, config.context, version);
+    const PromptFramePlan plan(promptRows, C, config.context, version,
+                               opts.appendOnlyPrefill);
     const void *prefillFinalOut = nullptr;
     std::vector<int64_t> chunkTokens(first && plan.prefillTokens() ? C : 0);
     if (!first && async)
@@ -606,9 +611,7 @@ inline void generateTokenized(const DistributedGenerateOptions &opts,
       const void *output;
       {
         FrameInterval interval(rank, header.step, "compute");
-        output = frame.prefill
-                     ? stage.prefillChunk(input, header.pos, frame.needLogits)
-                     : stage.decodeData(input, header.pos);
+        output = runPromptFrame(stage, input, frame, opts.appendOnlyPrefill);
       }
       if (!last) {
         send(header, output);
