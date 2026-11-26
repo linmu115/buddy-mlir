@@ -57,6 +57,20 @@ int32_t layer_prefill(const BJ47WeightsV1 *w, const float *in, float *k,
 int32_t layer_decode(const BJ47WeightsV1 *w, const float *in, float *k,
                      float *v, const BJ47FrameV1 *frame, float *out);
 
+/* B4 hybrid templates. GDN verifies both rows in one projection pass and
+ * saves state after the first token. Attention only needs a logical rewind. */
+typedef struct {
+  BJ47FrameRowsV2 rows;
+  float *conv_snapshot, *ssm_snapshot;
+} BJ47VerifyRows;
+int32_t layer_verify_2(const BJ47WeightsV1 *, const float *, float *, float *,
+                       const BJ47FrameV1 *, float *);
+int32_t lm_head_normalize(const BJ47WeightsV1 *, const float *, float *, int);
+int32_t lm_head_linear(const BJ47WeightsV1 *, const float *, float *, int);
+int32_t mtp_forward(const BJ47WeightsV1 *, const float *embedding,
+                    const float *normalized_hidden, float *keys, float *values,
+                    const BJ47FrameV1 *, float *, int rows);
+
 /* lm_head.so: row points at one contiguous H-vector; logits has V floats */
 int32_t lm_head(const BJ47WeightsV1 *w, const float *row, float *logits);
 

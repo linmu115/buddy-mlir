@@ -238,14 +238,17 @@ def reference(
         weights.update(load_file(shard))
     if dequantize:
         from buddy.compiler.graph.transform import k3_w4
-        from route_b_hybrid_w4 import quantized_fields
+        from route_b_hybrid_w4 import Q4_PROJECTIONS
 
         _, dims, types = read_config(checkpoint / "config.json", 256, 64)
         fields = schemas(dims)
         for owner, prefix in [("head", "")] + [
             (kind, f"{PREFIX}layers.{i}.") for i, kind in enumerate(types)
         ]:
-            for field, (n, k) in quantized_fields(fields[owner]).values():
+            for name, (field, dims) in fields[owner].items():
+                if name not in Q4_PROJECTIONS:
+                    continue
+                n, k = dims
                 tensor = weights[prefix + field]
                 for start in range(0, n, 1024):
                     slab = tensor[start : start + 1024]

@@ -25,7 +25,7 @@ struct TemplateBundle {
   StageConfig config{};
   std::string id, shape, model;
   int kvHeads, headDim;
-  bool hybrid = false;
+  bool hybrid = false, hasMtp = false;
   std::vector<std::string> layerTypes;
   StageManifest spec{};
   std::filesystem::path vocab, runtime;
@@ -43,7 +43,18 @@ std::string hexDigest(const uint8_t *bytes);
 std::vector<LayerRange> parseRanges(const std::string &text, int total,
                                     bool full);
 void validateChain(const std::vector<LayerRange> &ranges, int total);
-std::unique_ptr<Stage> makeTemplateStage(const TemplateBundle &, LayerRange,
-                                         bool verifyWeights = false,
-                                         int slots = 1);
+class MtpStage : public Stage {
+public:
+  virtual const float *backbone(void *input, int pos, int rows, int valid) = 0;
+  virtual void rewindOne() = 0;
+  virtual void gatherShifted(const int64_t *ids, int rows, void *packed) = 0;
+  virtual const float *draftHidden(const void *packed, bool half,
+                                   const float *hidden, int pos, int rows,
+                                   int valid) = 0;
+  virtual const float *linear(const float *hidden, int rows) = 0;
+};
+std::unique_ptr<MtpStage> makeTemplateStage(const TemplateBundle &, LayerRange,
+                                            bool verifyWeights = false,
+                                            int slots = 1,
+                                            bool enableMtp = false);
 } // namespace buddy::runtime

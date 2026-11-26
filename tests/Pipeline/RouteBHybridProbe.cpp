@@ -5,6 +5,7 @@
 #include <array>
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <dlfcn.h>
 #include <filesystem>
 #include <fstream>
@@ -78,6 +79,57 @@ struct Layer {
       throw std::runtime_error("layer failed");
   }
 };
+
+// Compare both rows and recurrent snapshots at the DSO boundary, before
+// argmax can conceal rounding or a state transition error.
+void verifyRows(const fs::path &dir) {
+  Kernel full(dir / "full_attn_layer.so"), gdn(dir / "gdn_layer.so");
+  size_t width = full.info->base.width, rotary = full.info->rotary_dim;
+  Buffer<float> x(2 * width), one(2 * width), both(2 * width);
+  for (size_t i = 0; i < x.size; ++i)
+    x.data()[i] = float(int(i * 17 % 47) - 23) / 19;
+  Buffer<float> inv(full.info->base.rope_elements), cos(2 * rotary),
+      sin(2 * rotary);
+  inv.read(dir / "rope.f32");
+  auto prepare = full.symbol<decltype(&prepare_decode)>("prepare_decode");
+  for (int i = 0; i < 2; ++i)
+    if (prepare(inv.data(), 13 + i, cos.data() + i * rotary,
+                sin.data() + i * rotary, nullptr))
+      throw std::runtime_error("prepare verify failed");
+  auto equal = [](const float *x, const float *y, size_t n) {
+    if (std::memcmp(x, y, n * sizeof(float)))
+      throw std::runtime_error("verify differs from decode");
+  };
+  for (Kernel *kernel : {&gdn, &full}) {
+    auto path = dir / (kernel == &gdn ? "gdn-0.f32" : "full_attn-3.f32");
+    Layer ref(*kernel, path), test(*kernel, path);
+    for (size_t i = 0; i < ref.a.size; ++i)
+      ref.a.data()[i] = test.a.data()[i] = float(i % 13) / 17;
+    for (size_t i = 0; i < ref.b.size; ++i)
+      ref.b.data()[i] = test.b.data()[i] = float(i % 11) / 19;
+    Buffer<float> sa(ref.a.size), sb(ref.b.size);
+    BJ47VerifyRows aux{{2}, sa.data(), sb.data()};
+    BJ47FrameV1 frame{13, cos.data(), sin.data(), &aux};
+    BJ47WeightsV1 w{test.w.data(), test.q4.data()};
+    auto fn = kernel->symbol<decltype(&layer_verify_2)>("layer_verify_2");
+    if (fn(&w, x.data(), test.a.data(), test.b.data(), &frame, both.data()))
+      throw std::runtime_error("verify failed");
+    BJ47FrameRowsV2 single{1};
+    for (int i = 0; i < 2; ++i) {
+      BJ47FrameV1 row{13 + i, cos.data() + i * rotary, sin.data() + i * rotary,
+                      &single};
+      ref.run(false, x.data() + i * width, row, one.data() + i * width);
+      equal(one.data() + i * width, both.data() + i * width, width);
+      if (!i && kernel == &gdn) {
+        equal(ref.a.data(), sa.data(), sa.size);
+        equal(ref.b.data(), sb.data(), sb.size);
+      }
+    }
+    equal(ref.a.data(), test.a.data(), ref.a.size);
+    equal(ref.b.data(), test.b.data(), ref.b.size);
+  }
+  std::cout << "verify rows 0/1, GDN snapshot and final GDN/KV: bit_diff=0\n";
+}
 
 template <typename T> void dump(std::ostream &out, const T *p, size_t count) {
   if (!out.write(reinterpret_cast<const char *>(p), count * sizeof(T)))
@@ -191,6 +243,10 @@ void probe(const fs::path &dir, const fs::path &input, const fs::path &output,
 
 int main(int argc, char **argv) {
   try {
+    if (argc == 3 && std::string(argv[1]) == "--verify-rows") {
+      verifyRows(argv[2]);
+      return 0;
+    }
     if (argc != 7)
       throw std::runtime_error(
           "probe BUNDLE IDS DUMP PROMPT_ROWS STEPS PAD_ID");

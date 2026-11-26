@@ -108,7 +108,8 @@ TemplateBundle TemplateBundle::load(const std::filesystem::path &index) {
   b.hybrid =
       arch == "Qwen3_5ForConditionalGeneration" || arch == "Qwen3_5ForCausalLM";
   const bool hybridQ4 = b.hybrid && j.at("variant") == "w4g32" &&
-                        j.at("pack_version") == "qwen3_5-w4g32/1" &&
+                        (j.at("pack_version") == "qwen3_5-w4g32/1" ||
+                         j.at("pack_version") == "qwen3_5-w4g32/2") &&
                         j.at("prefill_ime").is_boolean() &&
                         j.contains("runtime_sha256");
   const bool hybridFormat =
@@ -123,6 +124,8 @@ TemplateBundle TemplateBundle::load(const std::filesystem::path &index) {
               ((hybridQ4 && j.contains("layer_types")) || hybridFormat ||
                legacyFormat),
           "format or model type");
+  b.hasMtp = j.value("has_mtp", false);
+  require(!b.hasMtp || b.hybrid, "MTP architecture");
   b.shape = digestField(j, "shape_id");
   b.model = j.at("model_id");
   auto &c = b.config;
@@ -186,6 +189,8 @@ TemplateBundle TemplateBundle::load(const std::filesystem::path &index) {
   for (const auto &type : b.layerTypes)
     owners.emplace(type == "decoder_layer" ? type : type + "_layer",
                    b.hybrid ? type : "decoder");
+  if (b.hasMtp)
+    owners.emplace("mtp_layer", "mtp");
   std::set<std::filesystem::path> paths;
   for (const auto &k : j.at("templates")) {
     std::string role = k.at("role");
@@ -206,11 +211,14 @@ TemplateBundle TemplateBundle::load(const std::filesystem::path &index) {
     const bool layer =
         b.hybrid ? owner == "gdn" || owner == "full_attn" : owner == "decoder";
     const bool f32 = bucket == "f32", f16 = bucket == "f16";
-    require(layer || owner == "head" || owner == "rope" || owner == "embed",
+    const bool mtp = b.hasMtp && owner == "mtp";
+    require(layer || mtp || owner == "head" || owner == "rope" ||
+                owner == "embed",
             "owner");
-    const bool validBucket = f32 || (b.hybrid && owner == "embed" && f16) ||
-                             ((!b.hybrid || hybridQ4) &&
-                              (layer || owner == "head") && bucket == "q4");
+    const bool validBucket =
+        f32 || (b.hybrid && owner == "embed" && f16) ||
+        ((!b.hybrid || hybridQ4) && (layer || mtp || owner == "head") &&
+         bucket == "q4");
     require(validBucket &&
                 w.at("dtype") == (f32   ? "f32"
                                   : f16 ? "f16"
@@ -243,8 +251,13 @@ TemplateBundle TemplateBundle::load(const std::filesystem::path &index) {
               "layer weight buckets");
     require(b.weights.count({"head", -1, "q4"}) == size_t(hybridQ4),
             "head weight buckets");
-    const bool rope = owners.count("full_attn_layer");
+    if (b.hasMtp)
+      require(b.weights.count({"mtp", -1, "f32"}) &&
+                  b.weights.count({"mtp", -1, "q4"}) == size_t(hybridQ4),
+              "MTP buckets");
+    const bool rope = owners.count("full_attn_layer") || b.hasMtp;
     require(b.weights.size() == size_t(c.totalLayers) + 2 + rope +
+                                    b.hasMtp * (1 + hybridQ4) +
                                     (hybridQ4 ? c.totalLayers + 1 : 0) &&
                 b.weights.count({"embed", -1, "f32"}) +
                         b.weights.count({"embed", -1, "f16"}) ==

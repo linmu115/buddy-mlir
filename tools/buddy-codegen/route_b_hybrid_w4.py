@@ -2,8 +2,8 @@
 
 import re
 import subprocess
+from contextlib import ExitStack
 
-import torch
 from build_route_b import ATTRS
 from compile_pipeline import build_stages, run_pipeline
 from safetensors import safe_open
@@ -22,14 +22,22 @@ Q4_PROJECTIONS = frozenset(
         "upProj",
         "downProj",
         "lmHead",
+        "mtpFC",
     }
 )
 
 
 def quantized_fields(schema):
-    return {
+    fields = {
         name: field for name, field in schema.items() if name in Q4_PROJECTIONS
     }
+    if "gateProj" in fields:
+        gate, shape = fields.pop("gateProj")
+        up, up_shape = fields.pop("upProj")
+        if shape != up_shape:
+            raise ValueError("incompatible GLU projections")
+        fields["glu"] = ((gate, up), shape)
+    return fields
 
 
 def offsets(schema, dual):
@@ -39,7 +47,7 @@ def offsets(schema, dual):
     for name, (_, (n, k)) in schema.items():
         if k % k3_w4.G or n % k3_w4.NB:
             raise ValueError(f"{name} [{n}, {k}] violates K3 tile dimensions")
-        length = k3_w4.packed_bytes(k, n)
+        length = k3_w4.packed_bytes(k, n) * (2 if name == "glu" else 1)
         result[name] = (size, size + length if dual else size, length)
         size += length * (2 if dual else 1)
     return result, size
@@ -51,23 +59,42 @@ def pack(path, checkpoint, index, prefix, schema, positions):
     with path.open("wb") as out:
         for name, (field, (n, k)) in schema.items():
             base, ime, _ = positions[name]
-            key = prefix + field
-            with safe_open(checkpoint / index[key], framework="pt") as shard:
-                source = shard.get_slice(key)
-                if tuple(source.get_shape()) != (n, k):
-                    raise ValueError(f"{key}: expected {(n, k)}")
-                # The tile index is outermost in both layouts. Export bounded
-                # output-column slabs, including for the 248K-row head.
-                slab = max(128, (1 << 22) // (k * 128) * 128)
+            fused = name == "glu"
+            with ExitStack() as files:
+                slices = []
+                for suffix in field if fused else (field,):
+                    key = prefix + suffix
+                    shard = files.enter_context(
+                        safe_open(checkpoint / index[key], framework="pt")
+                    )
+                    source = shard.get_slice(key)
+                    if tuple(source.get_shape()) != (n, k):
+                        raise ValueError(f"{key}: expected {(n, k)}")
+                    slices.append(source)
+                slab = max(128, (1 << 22) // (k * 128 * len(slices)) * 128)
                 for i in range(0, n, slab):
-                    weights = source[i : i + slab].to(torch.float32).numpy().T
+                    arrays = [
+                        src[i : i + slab].float().numpy().T for src in slices
+                    ]
+                    offset = k3_w4.packed_bytes(k, i)
                     if base == ime:
-                        tiles = k3_w4.pack_q4(weights)
+                        tiles = (k3_w4.pack_glu if fused else k3_w4.pack_q4)(
+                            *arrays
+                        )
                     else:
-                        tiles, matrix = k3_w4.pack_q4_both(weights)
-                        out.seek(ime + k3_w4.packed_bytes(k, i))
+                        tiles, matrix = (
+                            k3_w4.pack_glu_both if fused else k3_w4.pack_q4_both
+                        )(*arrays)
+                        # IME keeps all gate blocks before all up blocks, even
+                        # when the exporter reads them from different shards.
+                        out.seek(ime + offset)
+                        if fused:
+                            half = len(matrix) // 2
+                            out.write(matrix[:half])
+                            out.seek(ime + k3_w4.packed_bytes(k, n) + offset)
+                            matrix = matrix[half:]
                         out.write(matrix)
-                    out.seek(base + k3_w4.packed_bytes(k, i))
+                    out.seek(base + len(slices) * offset)
                     out.write(tiles)
 
 
@@ -79,10 +106,16 @@ def projection_code(args, owner, schema, positions):
     for name, (_, (n, k)) in schema.items():
         tiles, ime, size = positions[name]
         branches = []
-        for rows in [1] if owner == "head" else [1, args.chunk]:
+        for rows in [1, 2] if owner == "head" else [1, 2, args.chunk]:
             matrix = tiles != ime and rows == args.chunk
             spec = k3_w4.kernel_spec(
-                "plain", rows, k, [n], False, args.threads, matrix
+                "glu" if name == "glu" else "plain",
+                rows,
+                k,
+                [n, n] if name == "glu" else [n],
+                False,
+                args.threads,
+                matrix,
             )
             symbol = spec["name"]
             if symbol not in specs:
@@ -104,6 +137,8 @@ def projection_code(args, owner, schema, positions):
             + "".join(branches)
             + "\n}"
         )
+    if "glu" in schema:
+        code.insert(0, "#define HYBRID_FUSED_GLU 1")
     return "\n".join(code), list(specs.values())
 
 

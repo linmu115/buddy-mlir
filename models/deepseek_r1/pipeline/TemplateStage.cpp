@@ -1,4 +1,5 @@
 #include "TemplateBundle.h"
+#include "buddy/runtime/pipeline/ActivationWire.h"
 #include "buddy/runtime/pipeline/RouteB.h"
 #include <algorithm>
 #include <cstdio>
@@ -108,7 +109,7 @@ struct Library {
     const auto dtype = hybrid->embed_dtype;
     const bool validState =
         id == 4 ? hybrid->state_a_elements && hybrid->state_b_elements
-        : id == 5
+        : (id == 5 || id == 6)
             ? hybrid->state_a_elements == kv && hybrid->state_b_elements == kv
             : !hybrid->state_a_elements && !hybrid->state_b_elements;
     const auto tableSize =
@@ -120,9 +121,9 @@ struct Library {
                        !info->f32_elements)
                 : dtype == 0 && !hybrid->f16_elements && info->f32_elements;
     if (!validState || !validWeights ||
-        (id == 5 ? !rope || rope > unsigned(b.headDim) || rope % 2 ||
-                       info->rope_elements != rope / 2
-                 : rope || info->rope_elements))
+        ((id == 5 || id == 6) ? !rope || rope > unsigned(b.headDim) ||
+                                    rope % 2 || info->rope_elements != rope / 2
+                              : rope || info->rope_elements))
       throw std::runtime_error("incompatible hybrid kernel descriptor: " +
                                role);
   }
@@ -137,13 +138,20 @@ struct Layer {
   BJ47WeightsV1 weights;
   decltype(&layer_prefill) prefill;
   decltype(&layer_decode) decode;
-  std::vector<Buffer> k, v;
+  decltype(&layer_verify_2) verify{};
+  std::vector<Buffer> k, v, savedK, savedV;
 };
-class TemplateStage final : public Stage {
+class TemplateStage final : public MtpStage {
   StageConfig cfg;
   Library::Handle runtime{nullptr, dlclose};
   std::map<std::string, Library> templates;
-  Library embed, head;
+  Library embed, head, mtp;
+  Layer predictor{};
+  decltype(&mtp_forward) predict{};
+  decltype(&lm_head_normalize) normalize{};
+  decltype(&lm_head_linear) project{};
+  Buffer normalized, embeddings, predicted;
+  decltype(&prepare_decode) ropeOne{};
   Phase pre{}, dec{};
   std::vector<std::unique_ptr<Mapping>> mappings;
   std::vector<Layer> layers;
@@ -170,9 +178,9 @@ class TemplateStage final : public Stage {
     return mappings.back()->addr;
   }
   const void *run(void *input, int pos, bool prefill, bool needLogits,
-                  int validRows) {
+                  int validRows, int rows, bool returnHidden = false) {
     auto &p = prefill ? pre : dec;
-    int rows = prefill ? cfg.prefillChunk : 1;
+
     if (!input || validRows < 1 || validRows > rows || pos < 0 ||
         pos > cfg.context - rows)
       throw std::out_of_range("invalid stage input/position");
@@ -186,7 +194,14 @@ class TemplateStage final : public Stage {
     BJ47FrameRowsV2 rowInfo{validRows};
     BJ47FrameV1 frame{pos, cosine.data(), sine.data(),
                       hybrid ? &rowInfo : nullptr};
-    if (p.prepare)
+    if (rows == 2 && p.prepare) {
+      int stride =
+          static_cast<int>(cosine.bytes / (cfg.prefillChunk * sizeof(float)));
+      for (int i = 0; i < 2; ++i)
+        checked(ropeOne(rope, pos + i, cosine.data() + i * stride,
+                        sine.data() + i * stride, nullptr),
+                cfg.startLayer, "prepare verify");
+    } else if (p.prepare)
       checked(p.prepare(rope, pos, cosine.data(), sine.data(), nullptr),
               cfg.startLayer, "prepare");
     auto in = static_cast<const float *>(input);
@@ -198,10 +213,13 @@ class TemplateStage final : public Stage {
       auto ids = static_cast<int64_t *>(
           std::align(64, rows * sizeof(int64_t), aligned, space));
       std::copy_n(static_cast<const int64_t *>(input), rows, ids);
-      checked(p.embedF16
-                  ? p.embedF16(static_cast<const uint16_t *>(table), ids, out)
-                  : p.embed(static_cast<const float *>(table), ids, out),
-              0, "embed");
+      int calls = rows == 2 ? 2 : 1;
+      for (int i = 0; i < calls; ++i)
+        checked(p.embedF16 ? p.embedF16(static_cast<const uint16_t *>(table),
+                                        ids + i, out + i * cfg.activationWidth)
+                           : p.embed(static_cast<const float *>(table), ids + i,
+                                     out + i * cfg.activationWidth),
+                0, "embed");
       in = out;
       out = b.data();
     } else if (reinterpret_cast<uintptr_t>(in) % inputAlignment) {
@@ -213,6 +231,15 @@ class TemplateStage final : public Stage {
     for (int i = cfg.startLayer; i < cfg.endLayer; ++i) {
       auto &l = layers[i - cfg.startLayer];
       auto kernel = prefill ? l.prefill : l.decode;
+      BJ47VerifyRows snapshot{{2}, nullptr, nullptr};
+      if (rows == 2) {
+        kernel = l.verify;
+        if (!l.savedK.empty()) {
+          snapshot.conv_snapshot = l.savedK[activeSlot].data();
+          snapshot.ssm_snapshot = l.savedV[activeSlot].data();
+        }
+        frame.aux = &snapshot;
+      }
       checked(kernel(&l.weights, in, l.k[activeSlot].data(),
                      l.v[activeSlot].data(), &frame, out),
               i, "layer");
@@ -221,6 +248,11 @@ class TemplateStage final : public Stage {
     }
     if (!p.head)
       return in;
+    if (returnHidden) {
+      checked(normalize(&projection, in, normalized.data(), validRows),
+              cfg.endLayer, "final norm");
+      return normalized.data();
+    }
     if (needLogits)
       checked(p.head(&projection,
                      in + size_t(validRows - 1) * cfg.activationWidth,
@@ -231,7 +263,7 @@ class TemplateStage final : public Stage {
 
 public:
   TemplateStage(const TemplateBundle &bundle, LayerRange range, bool verify,
-                int slotCount)
+                int slotCount, bool enableMtp)
       : cfg(bundle.config), verifyWeights(verify), slots(slotCount),
         hybrid(bundle.hybrid) {
     if (slots < 1)
@@ -280,7 +312,21 @@ public:
       projection = weights("head", -1, head);
       pre.head = head.symbol<decltype(pre.head)>("lm_head_prefill");
       dec.head = head.symbol<decltype(dec.head)>("lm_head_decode");
-      logits.allocate(cfg.vocabSize);
+      logits.allocate(size_t(cfg.vocabSize) * (enableMtp ? 2 : 1));
+      if (enableMtp) {
+        normalize = head.symbol<decltype(normalize)>("lm_head_normalize");
+        project = head.symbol<decltype(project)>("lm_head_linear");
+        mtp.open(bundle, "mtp_layer", 6);
+        predictor.weights = weights("mtp", -1, mtp);
+        predict = mtp.symbol<decltype(predict)>("mtp_forward");
+        predictor.k.resize(slots);
+        predictor.v.resize(slots);
+        for (int i = 0; i < slots; ++i) {
+          predictor.k[i].allocate(mtp.hybrid->state_a_elements, true);
+          predictor.v[i].allocate(mtp.hybrid->state_b_elements, true);
+          stateBytes += predictor.k[i].bytes + predictor.v[i].bytes;
+        }
+      }
     }
     size_t kv = product(
         {size_t(bundle.kvHeads), size_t(bundle.headDim), size_t(cfg.context)});
@@ -308,8 +354,19 @@ public:
       l.weights = weights(bundle.hybrid ? type : "decoder", i, lib);
       l.prefill = lib.symbol<decltype(l.prefill)>("layer_prefill");
       l.decode = lib.symbol<decltype(l.decode)>("layer_decode");
+      if (enableMtp)
+        l.verify = lib.symbol<decltype(l.verify)>("layer_verify_2");
       const size_t stateA = lib.hybrid ? lib.hybrid->state_a_elements : kv;
       const size_t stateB = lib.hybrid ? lib.hybrid->state_b_elements : kv;
+      if (enableMtp && type == "gdn") {
+        l.savedK.resize(slots);
+        l.savedV.resize(slots);
+        for (int slot = 0; slot < slots; ++slot) {
+          l.savedK[slot].allocate(stateA, true);
+          l.savedV[slot].allocate(stateB, true);
+          stateBytes += l.savedK[slot].bytes + l.savedV[slot].bytes;
+        }
+      }
       l.k.resize(slots);
       l.v.resize(slots);
       for (int slot = 0; slot < slots; ++slot) {
@@ -325,6 +382,18 @@ public:
     }
     auto hidden =
         product({size_t(cfg.prefillChunk), size_t(cfg.activationWidth)});
+    if (predict) {
+      normalized.allocate(hidden);
+      embeddings.allocate(hidden);
+      predicted.allocate(hidden);
+      if (!rope) {
+        rope = static_cast<const float *>(map(
+            bundle.weights.at({"rope", -1, "f32"}), mtp.info->rope_elements));
+        rotary = mtp.hybrid->rotary_dim;
+      }
+      ropeOne = mtp.symbol<decltype(ropeOne)>("prepare_decode");
+    } else
+      ropeOne = dec.prepare;
     a.allocate(hidden);
     b.allocate(hidden);
     if (rope) {
@@ -352,7 +421,65 @@ public:
     for (auto &layer : layers) {
       layer.k[slot].clear();
       layer.v[slot].clear();
+      if (!layer.savedK.empty()) {
+        layer.savedK[slot].clear();
+        layer.savedV[slot].clear();
+      }
     }
+    if (predict) {
+      predictor.k[slot].clear();
+      predictor.v[slot].clear();
+    }
+  }
+  const float *backbone(void *input, int pos, int rows, int valid) override {
+    if (rows != 1 && rows != 2 && rows != cfg.prefillChunk)
+      throw std::invalid_argument("invalid speculative frame capacity");
+    return static_cast<const float *>(
+        run(input, pos, rows == cfg.prefillChunk, false, valid, rows, true));
+  }
+  void rewindOne() override {
+    for (auto &l : layers)
+      if (!l.savedK.empty()) {
+        std::memcpy(l.k[activeSlot].data(), l.savedK[activeSlot].data(),
+                    l.k[activeSlot].bytes);
+        std::memcpy(l.v[activeSlot].data(), l.savedV[activeSlot].data(),
+                    l.v[activeSlot].bytes);
+      }
+  }
+  void gatherShifted(const int64_t *ids, int rows, void *packed) override {
+    size_t bytes = size_t(cfg.activationWidth) * (pre.embedF16 ? 2 : 4);
+    for (int i = 0; i < rows; ++i) {
+      if (ids[i] < 0 || ids[i] >= cfg.vocabSize)
+        throw std::out_of_range("MTP token");
+      std::memcpy(static_cast<char *>(packed) + bytes * i,
+                  static_cast<const char *>(table) + bytes * ids[i], bytes);
+    }
+  }
+  const float *draftHidden(const void *packed, bool half, const float *hidden,
+                           int pos, int rows, int valid) override {
+    auto n = size_t(valid) * cfg.activationWidth;
+    if (half) {
+      auto src = static_cast<const uint16_t *>(packed);
+      pipeline::decodeInto(src, n, embeddings.data(), n);
+    } else
+      std::memcpy(embeddings.data(), packed, n * sizeof(float));
+    int stride = mtp.hybrid->rotary_dim;
+    for (int i = 0; i < valid; ++i)
+      if (ropeOne(rope, pos + i, cosine.data() + i * stride,
+                  sine.data() + i * stride, nullptr))
+        throw std::runtime_error("MTP rotary position");
+    BJ47FrameRowsV2 aux{valid};
+    BJ47FrameV1 frame{pos, cosine.data(), sine.data(), &aux};
+    if (predict(&predictor.weights, embeddings.data(), hidden,
+                predictor.k[activeSlot].data(), predictor.v[activeSlot].data(),
+                &frame, predicted.data(), rows))
+      throw std::runtime_error("MTP forward");
+    return predicted.data();
+  }
+  const float *linear(const float *hidden, int rows) override {
+    if (project(&projection, hidden, logits.data(), rows))
+      throw std::runtime_error("MTP shared head");
+    return logits.data();
   }
   const uint16_t *prefill(void *) override {
     throw std::logic_error("Route B requires f32");
@@ -365,16 +492,16 @@ public:
     return prefillValidRows(p, pos, head, cfg.prefillChunk);
   }
   const void *prefillValidRows(void *p, int pos, bool head, int rows) override {
-    return run(p, pos, true, head, rows);
+    return run(p, pos, true, head, rows, cfg.prefillChunk);
   }
   const void *decodeData(void *p, int pos) override {
-    return run(p, pos, false, true, 1);
+    return run(p, pos, false, true, 1, 1);
   }
 };
 } // namespace
-std::unique_ptr<Stage> makeTemplateStage(const TemplateBundle &b,
-                                         LayerRange range, bool verify,
-                                         int slots) {
-  return std::make_unique<TemplateStage>(b, range, verify, slots);
+std::unique_ptr<MtpStage> makeTemplateStage(const TemplateBundle &b,
+                                            LayerRange range, bool verify,
+                                            int slots, bool enableMtp) {
+  return std::make_unique<TemplateStage>(b, range, verify, slots, enableMtp);
 }
 } // namespace buddy::runtime

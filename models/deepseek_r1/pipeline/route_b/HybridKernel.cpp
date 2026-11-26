@@ -8,7 +8,7 @@
 #include "ChunkGDN.h"
 
 namespace {
-constexpr unsigned FullAttention = 5;
+
 constexpr float Eps = normEpsilon;
 
 float sigmoid(float x) { return 1.0f / (1.0f + std::exp(-x)); }
@@ -29,7 +29,7 @@ void zeroCenteredNorm(const float *x, const float *w, int size, float *out) {
 
 #if HYBRID_ROLE == 4
 void mix(const BJ47WeightsV1 &weights, const float *x, float *convState,
-         float *ssmState, const BJ47FrameV1 &, int rows, int valid,
+         float *ssmState, const BJ47FrameV1 &frame, int rows, int valid,
          float *out) {
   const float *w = weights.f32;
   hybrid::Scratch qkvBuffer(rows * convDim), z(rows * valueWidth),
@@ -51,6 +51,10 @@ void mix(const BJ47WeightsV1 &weights, const float *x, float *convState,
       qkv[c] = silu(sum);
     }
 
+    if (rows == 2 && t == 0)
+      std::copy_n(
+          convState, convDim * convKernel,
+          static_cast<const BJ47VerifyRows *>(frame.aux)->conv_snapshot);
     auto *query = qkv;
     auto *key = qkv + keyWidth;
 
@@ -84,15 +88,21 @@ void mix(const BJ47WeightsV1 &weights, const float *x, float *convState,
     const auto *v = qkvBuffer.data() + 2 * keyWidth + h * valueDim;
     float *state = ssmState + h * keyDim * valueDim;
     float *head = core.data() + h * valueDim;
-    if (rows == 1
+    if (rows <= 2
 #ifdef HYBRID_RECURRENT_REFERENCE
         || rows == chunk
 #endif
     ) {
-      for (int t = 0; t < valid; ++t)
+      for (int t = 0; t < valid; ++t) {
         deltaStep(state, q + t * convDim, k + t * convDim, v + t * convDim,
                   head + t * valueWidth, b[t * valueHeads + h],
                   std::exp(a[t * valueHeads + h]));
+        if (rows == 2 && t == 0)
+          std::copy_n(
+              state, keyDim * valueDim,
+              static_cast<const BJ47VerifyRows *>(frame.aux)->ssm_snapshot +
+                  h * keyDim * valueDim);
+      }
     } else
       hybrid::chunkGDN(q, k, v, convDim, a.data() + h, b.data() + h, valueHeads,
                        state, head, valueWidth, valid, keyDim, valueDim);
@@ -106,7 +116,7 @@ void mix(const BJ47WeightsV1 &weights, const float *x, float *convState,
   }
   proj_mixerOut(weights, core.data(), out, rows);
 }
-#elif HYBRID_ROLE == 5
+#elif (HYBRID_ROLE == 5 || HYBRID_ROLE == 6)
 void partialRotary(float *x, const float *cos, const float *sin) {
   for (int i = 0; i < rotaryDim / 2; ++i) {
     const float left = x[i], right = x[i + rotaryDim / 2];
@@ -186,14 +196,13 @@ void mix(const BJ47WeightsV1 &weights, const float *x, float *keys,
 }
 #endif
 
-#if HYBRID_ROLE == 4 || HYBRID_ROLE == 5
+#if HYBRID_ROLE == 4 || (HYBRID_ROLE == 5 || HYBRID_ROLE == 6)
 int32_t layer(const BJ47WeightsV1 *weights, const float *input, float *a,
               float *b, const BJ47FrameV1 *frame, float *out, int rows) {
   if (!weights || !weights->f32 || !input || !a || !b || a == b || !frame ||
       !frame->aux || !out || input == out)
     return -1;
-  if (kernelInfo.base.role == FullAttention &&
-      (!frame->cos_rows || !frame->sin_rows))
+  if (kernelInfo.rotary_dim && (!frame->cos_rows || !frame->sin_rows))
     return -1;
 
   const auto validRows =
@@ -206,7 +215,7 @@ int32_t layer(const BJ47WeightsV1 *weights, const float *input, float *a,
     return -1;
   const auto *w = weights->f32;
   hybrid::Scratch norm(rows * width), residual(rows * width),
-      gate(rows * intermediate), up(rows * intermediate);
+      gate(rows * intermediate);
   for (int t = 0; t < validRows; ++t)
     zeroCenteredNorm(input + t * width, w + inputNorm, width,
                      norm.data() + t * width);
@@ -217,10 +226,15 @@ int32_t layer(const BJ47WeightsV1 *weights, const float *input, float *a,
       r[i] += input[t * width + i];
     zeroCenteredNorm(r, w + postNorm, width, norm.data() + t * width);
   }
+#ifdef HYBRID_FUSED_GLU
+  proj_glu(*weights, norm.data(), gate.data(), rows);
+#else
+  hybrid::Scratch up(rows * intermediate);
   proj_gateProj(*weights, norm.data(), gate.data(), rows);
   proj_upProj(*weights, norm.data(), up.data(), rows);
   for (int i = 0; i < validRows * intermediate; ++i)
     gate[i] = silu(gate[i]) * up[i];
+#endif
   proj_downProj(*weights, gate.data(), out, rows);
   for (int i = 0; i < validRows * width; ++i)
     out[i] += residual[i];
@@ -245,6 +259,23 @@ extern "C" int32_t EMBED_DECODE(const EmbedElement *table, const int64_t *ids,
   return embed<1>(table, ids, out);
 }
 #elif HYBRID_ROLE == 3
+extern "C" int32_t lm_head_normalize(const BJ47WeightsV1 *w, const float *input,
+                                     float *out, int rows) {
+  if (!w || !w->f32 || !input || !out || rows < 1 || rows > chunk)
+    return -1;
+  for (int r = 0; r < rows; ++r)
+    zeroCenteredNorm(input + r * width, w->f32 + finalNorm, width,
+                     out + r * width);
+  return 0;
+}
+extern "C" int32_t lm_head_linear(const BJ47WeightsV1 *w, const float *input,
+                                  float *out, int rows) {
+  if (!w || !input || !out || input == out || (rows != 1 && rows != 2) ||
+      (kernelInfo.base.i8_elements ? !w->q4 : !w->f32))
+    return -1;
+  proj_lmHead(*w, input, out, rows);
+  return 0;
+}
 extern "C" int32_t lm_head(const BJ47WeightsV1 *w, const float *input,
                            float *out) {
   if (!w || !w->f32 || !input || !out || input == out)
@@ -264,7 +295,48 @@ extern "C" int32_t lm_head_decode(const BJ47WeightsV1 *w, const float *input,
                                   float *out) {
   return lm_head(w, input, out);
 }
+#elif HYBRID_ROLE == 6
+extern "C" int32_t mtp_forward(const BJ47WeightsV1 *w, const float *embedding,
+                               const float *hidden, float *k, float *v,
+                               const BJ47FrameV1 *frame, float *out, int rows) {
+  if (!w || !w->f32 || (kernelInfo.base.i8_elements && !w->q4) || !embedding ||
+      !hidden || !frame || !frame->aux || !out ||
+      (rows != 1 && rows != 2 && rows != chunk))
+    return -1;
+  const auto valid =
+      static_cast<const BJ47FrameRowsV2 *>(frame->aux)->valid_rows;
+  if (valid < 1 || valid > rows)
+    return -2;
+  hybrid::Scratch concat(rows * 2 * width), projected(rows * width);
+  for (int r = 0; r < valid; ++r) {
+    auto dst = concat.data() + r * 2 * width;
+    zeroCenteredNorm(embedding + r * width, w->f32 + embeddingNorm, width, dst);
+    zeroCenteredNorm(hidden + r * width, w->f32 + hiddenNorm, width,
+                     dst + width);
+  }
+  proj_mtpFC(*w, concat.data(), projected.data(), rows);
+  int rc = layer(w, projected.data(), k, v, frame, out, rows);
+  if (rc)
+    return rc;
+  for (int r = 0; r < valid; ++r)
+    zeroCenteredNorm(out + r * width, w->f32 + mtpNorm, width, out + r * width);
+  return 0;
+}
 #else
+extern "C" int32_t layer_verify_2(const BJ47WeightsV1 *w, const float *input,
+                                  float *a, float *b, const BJ47FrameV1 *frame,
+                                  float *out) {
+  if (!frame || !frame->aux)
+    return -1;
+  const auto *aux = static_cast<const BJ47VerifyRows *>(frame->aux);
+  if (aux->rows.valid_rows != 2)
+    return -2;
+#if HYBRID_ROLE == 4
+  if (!aux->conv_snapshot || !aux->ssm_snapshot)
+    return -1;
+#endif
+  return layer(w, input, a, b, frame, out, 2);
+}
 extern "C" int32_t layer_prefill(const BJ47WeightsV1 *w, const float *input,
                                  float *a, float *b, const BJ47FrameV1 *frame,
                                  float *out) {
@@ -277,7 +349,7 @@ extern "C" int32_t layer_decode(const BJ47WeightsV1 *w, const float *input,
 }
 #endif
 
-#if HYBRID_ROLE == 5
+#if (HYBRID_ROLE == 5 || HYBRID_ROLE == 6)
 static int32_t prepare(const float *inv, int64_t pos, float *cos, float *sin,
                        int rows) {
   if (!inv || !cos || !sin || cos == sin || pos < 0 || pos > context - rows)

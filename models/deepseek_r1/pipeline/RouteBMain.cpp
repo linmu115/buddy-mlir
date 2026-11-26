@@ -2,6 +2,7 @@
 #include "ResidentGenerate.h"
 #include "TemplateBundle.h"
 #include "route_b/ChatTokenizer.h"
+#include "route_b/MtpGenerate.h"
 #include <optional>
 #include <thread>
 
@@ -14,7 +15,7 @@ void run(int argc, char **argv, int rank, int size) {
   std::vector<std::string> prompts;
   auto wire = pipeline::WireDtype::Native; // Route B computes in f32.
   auto transport = pipeline::Transport::Blocking;
-  bool verify = false, serve = false;
+  bool verify = false, serve = false, mtp = false;
   int slots = 2;
   std::optional<bool> thinking;
   std::optional<std::string> list, single;
@@ -22,6 +23,10 @@ void run(int argc, char **argv, int rank, int size) {
     std::string opt = argv[i];
     if (opt == "--enable-thinking" || opt == "--no-thinking") {
       thinking = opt == "--enable-thinking";
+      continue;
+    }
+    if (opt == "--mtp") {
+      mtp = true;
       continue;
     }
     if (opt == "--serve") {
@@ -80,11 +85,15 @@ void run(int argc, char **argv, int rank, int size) {
   const int streamCount = static_cast<int>(prompts.size());
   const int slotCount = serve ? slots : streamCount;
   auto b = TemplateBundle::load(bundle);
+  if (mtp && !b.hasMtp)
+    throw std::invalid_argument(
+        "--mtp requires a bundle with predictor weights");
   auto total = b.config.totalLayers;
   LayerRange range{0, total};
-  std::string planIdentity =
-      b.id + ",streamCount=" + std::to_string(streamCount) +
-      ",serveMode=" + std::to_string(serve) + ",slots=" + std::to_string(slots);
+  std::string planIdentity = b.id + ",mtp=" + std::to_string(mtp) +
+                             ",streamCount=" + std::to_string(streamCount) +
+                             ",serveMode=" + std::to_string(serve) +
+                             ",slots=" + std::to_string(slots);
   if (list && single)
     throw std::invalid_argument("conflicting range options");
   if (list) {
@@ -108,7 +117,7 @@ void run(int argc, char **argv, int rank, int size) {
   pipeline::checkAllStages(MPI_COMM_WORLD, rank, size, b.config, check);
   if (rank == 0)
     b.verifyVocab();
-  auto stage = makeTemplateStage(b, range, verify, slotCount);
+  auto stage = makeTemplateStage(b, range, verify, slotCount, mtp);
   checkLocalConfig(b.spec, stage->configuration());
   auto opts = makeGenerateOptions(b.spec, b.vocab.string(), cfg,
                                   stage->configuration(), rank, size);
@@ -131,7 +140,12 @@ void run(int argc, char **argv, int rank, int size) {
       return tokenizer->encode(request);
     };
   }
-  if (serve) {
+  if (mtp) {
+    pipeline::mtp::generate(
+        opts, *stage, MPI_COMM_WORLD, rank, size,
+        b.weights.count({"embed", -1, "f16"}), serve, prompts,
+        list.value_or(single.value_or("0:" + std::to_string(total))));
+  } else if (serve) {
     pipeline::generateResident(
         opts, *stage, MPI_COMM_WORLD, rank, size, slots,
         list.value_or(single.value_or("0:" + std::to_string(total))));

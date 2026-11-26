@@ -229,6 +229,10 @@ def kernel_spec(
     one result per part, q / k / v) or "glu" (silu(x Wg) * (x Wu)); with
     `ime`, its tiles run on the matrix engine (IME layout, m == IME_ROWS)."""
     name = f"k3_q4_{kind}_m{m}_k{k}_n{'_'.join(map(str, ns))}"
+    if kind == "glu" and len(ns) == 2:
+        if ns[0] != ns[1]:
+            raise ValueError("GLU gate and up must have equal widths")
+        ns = ns[:1]  # two weight matrices produce one output memref
     if bias:
         name += "_b"
     if ime:
@@ -1383,7 +1387,7 @@ def _accumulate(fn, ty, spec, a, wtile, rows):
 def _tile_fn(ty, spec):
     """One weight tile (NB output columns) for all the rows."""
     m = spec["m"]
-    mb = 1 if m == 1 else PREFILL_MB
+    mb = min(m, PREFILL_MB)
     assert m % mb == 0, (m, mb)
     names = ["w", "xq", "xs", "wt", "out", "ocol"]
     if spec["kind"] == "glu":

@@ -241,3 +241,25 @@ oracle, and compare tensor traces from `RouteBHybridProbe.cpp`. The service
 test switches all documented stage cuts against the same DSO hashes and
 checks a staggered two-slot run with slot reuse. The hybrid tokenizer checks
 the Qwen3.5 special token IDs and rejects an unencodable prompt.
+
+### Native single-layer MTP
+
+The hybrid exporter detects the 15 tensors of the one-layer predictor. Use
+`--no-mtp` to export the backbone alone. Packed hybrid version 2 interleaves
+gate and up RVV tiles and stores the two IME block ranges separately. Version
+1 bundles still load with their original DSOs.
+
+Pass `--mtp` to the CLI or resident server to enable greedy speculation.
+Rank zero gathers shifted embeddings directly from its table in the stored
+dtype. The last rank owns the predictor, its per-slot KV cache and the shared
+head. It applies the backbone final norm before verification and feeds the
+predictor's normalized output directly to the linear head. The first prompt
+sample supplies the final shifted embedding.
+
+A two-row verification saves GDN state after the current token. On rejection,
+each rank restores that state and advances the slot by one position. The next
+attention write overwrites the rejected KV row. Acceptance advances the slot
+by two positions. The service interleaves active slots at step boundaries and
+emits a token event for each committed token. CLI results and resident done
+events include proposal and acceptance counts, their ratio and generated
+decode tokens per verification step. The first prefill token is excluded.

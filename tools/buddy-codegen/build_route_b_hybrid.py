@@ -20,12 +20,19 @@ from safetensors import safe_open
 ROOT = Path(__file__).resolve().parents[2]
 SOURCE = ROOT / "models/deepseek_r1/pipeline/route_b"
 PREFIX = "model.language_model."
-ROLE_IDS = {"embed": 1, "lm_head": 3, "gdn_layer": 4, "full_attn_layer": 5}
+ROLE_IDS = {
+    "embed": 1,
+    "lm_head": 3,
+    "gdn_layer": 4,
+    "full_attn_layer": 5,
+    "mtp_layer": 6,
+}
 OWNERS = {
     "embed": "embed",
     "lm_head": "head",
     "gdn_layer": "gdn",
     "full_attn_layer": "full_attn",
+    "mtp_layer": "mtp",
 }
 LAYER_TYPES = {"linear_attention": "gdn", "full_attention": "full_attn"}
 
@@ -125,7 +132,7 @@ def schemas(d):
         "upProj": ("mlp.up_proj.weight", (m, h)),
         "downProj": ("mlp.down_proj.weight", (h, m)),
     }
-    return {
+    result = {
         "embed": {"table": (PREFIX + "embed_tokens.weight", (d["vocab"], h))},
         "head": {
             "finalNorm": (PREFIX + "norm.weight", (h,)),
@@ -156,6 +163,17 @@ def schemas(d):
             "mixerOut": ("self_attn.o_proj.weight", (h, q)),
         },
     }
+
+    result["mtp"] = {
+        name: ("mtp.layers.0." + field, shape)
+        for name, (field, shape) in result["full_attn"].items()
+    } | {
+        "embeddingNorm": ("mtp.pre_fc_norm_embedding.weight", (h,)),
+        "hiddenNorm": ("mtp.pre_fc_norm_hidden.weight", (h,)),
+        "mtpFC": ("mtp.fc.weight", (h, 2 * h)),
+        "mtpNorm": ("mtp.norm.weight", (h,)),
+    }
+    return result
 
 
 def weights_index(checkpoint):
@@ -220,7 +238,7 @@ def generate(
     if owner == "gdn":
         state_a = d["convDim"] * d["convKernel"]
         state_b = d["valueHeads"] * d["keyDim"] * d["valueDim"]
-    if owner == "full_attn":
+    if owner in ("full_attn", "mtp"):
         state_a = state_b = d["kvHeads"] * d["context"] * d["headDim"]
         rope = d["rotaryDim"]
     half = owner == "embed" and dtype == "f16"
@@ -300,7 +318,7 @@ inline int32_t embed<{rows}>(const EmbedElement *table, const int64_t *ids, floa
             {shape for _, shape in schema.values() if len(shape) == 2}
         )
         for n, k in projections:
-            for rows in [1] if owner == "head" else [1, d["chunk"]]:
+            for rows in [1, 2] if owner == "head" else [1, 2, d["chunk"]]:
                 mlir.append(ir.projection(n, k, rows))
                 header += f"""
 extern "C" void _mlir_ciface_project_{rows}_{n}_{k}(Descriptor<2> *, Descriptor<2> *, Descriptor<2> *);
@@ -317,6 +335,7 @@ inline void project<{rows}, {n}, {k}>(const float *w, const float *x, float *y) 
                 header += f"""
 inline void proj_{name}(const BJ47WeightsV1 &w, const float *x, float *y, int rows) {{
   if (rows == 1) project<1, {n}, {k}>(w.f32 + {name}, x, y);
+  else if (rows == 2) project<2, {n}, {k}>(w.f32 + {name}, x, y);
   {"" if owner == "head" else f"else project<chunk, {n}, {k}>(w.f32 + {name}, x, y);"}
 }}
 """
@@ -333,10 +352,20 @@ inline void deltaStep(float *s, const float *q, const float *k, const float *v,
 }
 """
         if owner == "head":
-            symbols.extend(["lm_head", "lm_head_prefill", "lm_head_decode"])
+            symbols.extend(
+                [
+                    "lm_head",
+                    "lm_head_prefill",
+                    "lm_head_decode",
+                    "lm_head_linear",
+                    "lm_head_normalize",
+                ]
+            )
+        elif owner == "mtp":
+            symbols.append("mtp_forward")
         else:
-            symbols.extend(["layer_prefill", "layer_decode"])
-        if owner == "full_attn":
+            symbols.extend(["layer_prefill", "layer_decode", "layer_verify_2"])
+        if owner in ("full_attn", "mtp"):
             symbols.extend(["prepare_prefill", "prepare_decode"])
     return header, "\n".join(mlir), symbols
 
@@ -492,6 +521,15 @@ def export_bundle(args):
         role for role in ROLE_IDS if OWNERS[role] in {"embed", "head", *types}
     ]
     index = weights_index(args.checkpoint)
+    mtp_keys = {key for key in index if key.startswith("mtp.")}
+    has_mtp = bool(mtp_keys) and not getattr(args, "no_mtp", False)
+    if has_mtp:
+        expected = {field for field, _ in schema["mtp"].values()}
+        if mtp_keys != expected:
+            raise ValueError(
+                f"unexpected MTP schema: {sorted(mtp_keys ^ expected)}"
+            )
+        role_names.append("mtp_layer")
     args.work.mkdir(parents=True, exist_ok=True)
     vocab_path = args.output / "vocab.txt"
     assets = {}
@@ -569,7 +607,7 @@ def export_bundle(args):
             keys = {
                 name: field
                 for name, field in keys.items()
-                if name not in positions
+                if name not in w4.Q4_PROJECTIONS
             }
         offsets, count = {}, 0
         for name, (_, weight_shape) in keys.items():
@@ -623,7 +661,7 @@ def export_bundle(args):
                 "shape_id": shape,
             }
         )
-    if "full_attn" in types:
+    if "full_attn" in types or has_mtp:
         rotary = dims["rotaryDim"]
         freq = 1.0 / (
             rope["rope_theta"]
@@ -656,7 +694,8 @@ def export_bundle(args):
         "stop_token_ids": [248044, 248046],
         "vocab_file": vocab_path.name,
         "vocab_sha256": file_digest(vocab_path),
-        "pack_version": f"qwen3_5-{args.variant}/1",
+        "pack_version": f"qwen3_5-{args.variant}/{2 if quant else 1}",
+        "has_mtp": has_mtp,
         "shape_id": shape,
         "layouts": layouts,
         "templates": kernels,
@@ -719,6 +758,7 @@ if __name__ == "__main__":
     parser.add_argument("--vocab", type=Path)
     parser.add_argument("--variant", choices=["f32", "w4g32"], default="f32")
     parser.add_argument("--threads", type=int, default=8)
+    parser.add_argument("--no-mtp", action="store_true")
     parser.add_argument("--prefill-ime", action="store_true")
     parser.add_argument("--model-id", required=True)
     parser.add_argument("--context", type=int, default=256)
