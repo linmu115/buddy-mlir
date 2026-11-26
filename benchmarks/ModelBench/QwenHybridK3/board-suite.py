@@ -385,6 +385,7 @@ def http_test():
     if dest.exists():
         return
     with socket.socket() as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.bind(("127.0.0.1", port))
     with (OUT / "http.stderr").open("w") as log:
         begin = time.monotonic()
