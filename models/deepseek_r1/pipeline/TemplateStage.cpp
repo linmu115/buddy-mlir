@@ -97,7 +97,7 @@ struct Library {
         64 % info->required_alignment ||
         (!b.hybrid &&
          info->rope_elements != (id == 2 ? unsigned(b.headDim) / 2 : 0)) ||
-        ((id == 1 || b.hybrid) && info->i8_elements))
+        (id == 1 && info->i8_elements))
       throw std::runtime_error("incompatible kernel descriptor: " + role);
     if (!b.hybrid)
       return;
@@ -254,7 +254,7 @@ public:
           static_cast<const float *>(map(bundle.weights.at({owner, id, "f32"}),
                                          lib.info->f32_elements)),
           nullptr};
-      if (!hybrid)
+      if (lib.info->i8_elements || bundle.weights.count({owner, id, "q4"}))
         w.q4 = static_cast<const int8_t *>(
             map(bundle.weights.at({owner, id, "q4"}), lib.info->i8_elements));
       return w;

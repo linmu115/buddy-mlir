@@ -3,30 +3,33 @@
 from textwrap import dedent
 
 
-def projection(output, width):
+def projection(output, width, rows=1):
     weights = f"memref<{output}x{width}xf32>"
-    x = f"memref<{width}xf32>"
-    y = f"memref<{output}xf32>"
+    x = f"memref<{rows}x{width}xf32>"
+    y = f"memref<{rows}x{output}xf32>"
     return dedent(f"""\
-      func.func @project_{output}_{width}(%w: {weights}, %x: {x}, %y: {y})
+      func.func @project_{rows}_{output}_{width}(%w: {weights}, %x: {x}, %y: {y})
           attributes {{llvm.emit_c_interface}} {{
         %c0 = arith.constant 0 : index
         %c1 = arith.constant 1 : index
         %c8 = arith.constant 8 : index
         %width = arith.constant {width} : index
+        %rows = arith.constant {rows} : index
         %output = arith.constant {output} : index
         %zero = arith.constant dense<0.0> : vector<8xf32>
         scf.for %i = %c0 to %output step %c1 {{
+          scf.for %r = %c0 to %rows step %c1 {{
           %partial = scf.for %j = %c0 to %width step %c8
               iter_args(%acc = %zero) -> (vector<8xf32>) {{
             %a = vector.load %w[%i, %j] : {weights}, vector<8xf32>
-            %b = vector.load %x[%j] : {x}, vector<8xf32>
+            %b = vector.load %x[%r, %j] : {x}, vector<8xf32>
             %product = arith.mulf %a, %b : vector<8xf32>
             %sum = arith.addf %acc, %product : vector<8xf32>
             scf.yield %sum : vector<8xf32>
           }}
           %dot = vector.reduction <add>, %partial : vector<8xf32> into f32
-          memref.store %dot, %y[%i] : {y}
+          memref.store %dot, %y[%r, %i] : {y}
+          }}
         }}
         return
       }}

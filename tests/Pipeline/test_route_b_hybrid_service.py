@@ -28,6 +28,14 @@ def run(args):
     launch = shlex.split(args.launcher)
     manifest = json.loads(args.bundle.read_text())
 
+    prompts = PROMPTS
+    rows = ROWS
+    if manifest.get("tokenizer_assets"):
+        # The official default-thinking envelope takes 52 IDs. Each digit
+        # becomes exactly one more ID under Qwen's isolated-number rule.
+        prompts = {"A": "1" * 21, "B": "2" * 12, "C": "3" * 4}
+        rows = {"A": 73, "B": 64, "C": 56}
+
     def hashes():
         return {
             entry["path"]: hashlib.sha256(
@@ -54,8 +62,8 @@ def run(args):
         ]
 
     def invoke(cut, names, total):
-        prompts = [arg for key in names for arg in ("--prompt", PROMPTS[key])]
-        command = [*base(cut), *prompts, "--total-tokens", str(total)]
+        inputs = [arg for key in names for arg in ("--prompt", prompts[key])]
+        command = [*base(cut), *inputs, "--total-tokens", str(total)]
         res = subprocess.run(
             command, text=True, capture_output=True, timeout=240, env=env
         )
@@ -66,46 +74,50 @@ def run(args):
 
     # Token ID 0 is valid data in the fixture. Removing the only match for
     # "a" must raise an encoding error instead of selecting it as a fallback.
-    with tempfile.TemporaryDirectory(dir=args.work) as temp:
-        folder = Path(temp)
-        root = args.bundle.resolve().parent
-        for entry in [*manifest["weights"], *manifest["templates"]]:
-            (folder / entry["path"]).symlink_to(root / entry["path"])
-        vocab = (root / manifest["vocab_file"]).read_text().split("\n")
-        assert vocab[ord("a")] == "a"
-        vocab[ord("a")] = ""
-        bad_vocab = folder / manifest["vocab_file"]
-        bad_vocab.write_text("\n".join(vocab))
-        modified = manifest.copy()
-        modified.pop("bundle_id")
-        modified["vocab_sha256"] = hashlib.sha256(
-            bad_vocab.read_bytes()
-        ).hexdigest()
-        modified["bundle_id"] = hashlib.sha256(
-            json.dumps(modified, sort_keys=True, separators=(",", ":")).encode()
-        ).hexdigest()
-        bad_bundle = folder / args.bundle.name
-        bad_bundle.write_text(json.dumps(modified))
-        broken = base("0:4")
-        broken[broken.index("--bundle") + 1] = str(bad_bundle)
-        rejected = subprocess.run(
-            [*broken, "--prompt", "a", "--total-tokens", "9"],
-            text=True,
-            capture_output=True,
-            timeout=60,
-            env=env,
-        )
-        assert (
-            rejected.returncode
-            and "vocabulary cannot encode the full prompt" in rejected.stderr
-        ), rejected
+    if not manifest.get("tokenizer_assets"):
+        with tempfile.TemporaryDirectory(dir=args.work) as temp:
+            folder = Path(temp)
+            root = args.bundle.resolve().parent
+            for entry in [*manifest["weights"], *manifest["templates"]]:
+                (folder / entry["path"]).symlink_to(root / entry["path"])
+            vocab = (root / manifest["vocab_file"]).read_text().split("\n")
+            assert vocab[ord("a")] == "a"
+            vocab[ord("a")] = ""
+            bad_vocab = folder / manifest["vocab_file"]
+            bad_vocab.write_text("\n".join(vocab))
+            modified = manifest.copy()
+            modified.pop("bundle_id")
+            modified["vocab_sha256"] = hashlib.sha256(
+                bad_vocab.read_bytes()
+            ).hexdigest()
+            modified["bundle_id"] = hashlib.sha256(
+                json.dumps(
+                    modified, sort_keys=True, separators=(",", ":")
+                ).encode()
+            ).hexdigest()
+            bad_bundle = folder / args.bundle.name
+            bad_bundle.write_text(json.dumps(modified))
+            broken = base("0:4")
+            broken[broken.index("--bundle") + 1] = str(bad_bundle)
+            rejected = subprocess.run(
+                [*broken, "--prompt", "a", "--total-tokens", "9"],
+                text=True,
+                capture_output=True,
+                timeout=60,
+                env=env,
+            )
+            assert (
+                rejected.returncode
+                and "vocabulary cannot encode the full prompt"
+                in rejected.stderr
+            ), rejected
 
     refs = {}
-    for key in PROMPTS:
-        total = TOTAL if key != "C" else ROWS["C"] + RESIDENT_LENGTHS["C"] - 1
+    for key in prompts:
+        total = TOTAL if key != "C" else rows["C"] + RESIDENT_LENGTHS["C"] - 1
         ref = invoke("0:4", [key], total)
-        assert ref["prompt_tokens"] == ROWS[key], ref
-        assert len(ref["token_ids"]) == total - ROWS[key] + 1, ref
+        assert ref["prompt_tokens"] == rows[key], ref
+        assert len(ref["token_ids"]) == total - rows[key] + 1, ref
         refs[key] = ref["token_ids"]
 
     if args.oracle:
@@ -114,31 +126,35 @@ def run(args):
             case["prompt_rows"]: case["tokens"] for case in oracle["cases"]
         }
         for key in "AB":
-            assert refs[key][:16] == expected[ROWS[key]], (key, refs[key])
+            assert refs[key][:16] == expected[rows[key]], (key, refs[key])
 
     def verify(cut):
         single = invoke(cut, ["A"], TOTAL)
         assert (
             single["token_ids"] == refs["A"]
-            and single["prompt_tokens"] == ROWS["A"]
+            and single["prompt_tokens"] == rows["A"]
         )
         batch = invoke(cut, ["A", "B"], TOTAL)
         for key, stream in zip("AB", batch["streams"], strict=True):
             assert (
                 stream["token_ids"] == refs[key]
-                and stream["prompt_tokens"] == ROWS[key]
+                and stream["prompt_tokens"] == rows[key]
             )
         wanted = {
             key: refs[key][:length] for key, length in RESIDENT_LENGTHS.items()
         }
-        with Resident([*base(cut), "--serve", "--slots", "2"], env) as server:
+        with Resident(
+            [*base(cut), "--serve", "--slots", "2"],
+            env,
+            event_timeout=90 if launch else 15,
+        ) as server:
             assert server.until(lambda e: e["event"] == "ready")["slots"] == 2
             server.submit(
-                "A", PROMPTS["A"], max_new_tokens=RESIDENT_LENGTHS["A"]
+                "A", prompts["A"], max_new_tokens=RESIDENT_LENGTHS["A"]
             )
             server.until(lambda e: e["event"] == "token" and e["step"] == 2)
             server.submit(
-                "B", PROMPTS["B"], max_new_tokens=RESIDENT_LENGTHS["B"]
+                "B", prompts["B"], max_new_tokens=RESIDENT_LENGTHS["B"]
             )
             first_b = server.until(
                 lambda e: e["event"] == "token" and e["req_id"] == "B"
@@ -149,7 +165,7 @@ def run(args):
             )
             server.done("B")
             server.submit(
-                "C", PROMPTS["C"], max_new_tokens=RESIDENT_LENGTHS["C"]
+                "C", prompts["C"], max_new_tokens=RESIDENT_LENGTHS["C"]
             )
             first_c = server.until(
                 lambda e: e["event"] == "token" and e["req_id"] == "C"
@@ -179,7 +195,9 @@ def run(args):
         "templates_sha256": before,
         "transport": args.transport,
         "oracle_checked": bool(args.oracle),
-        "unencodable_prompt_rejected": True,
+        "unencodable_prompt_rejected": None
+        if manifest.get("tokenizer_assets")
+        else True,
         "single_rank_references": refs,
         "ranges": [],
     }

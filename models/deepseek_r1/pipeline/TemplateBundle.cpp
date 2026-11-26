@@ -87,6 +87,8 @@ void verifyFileDigest(const std::filesystem::path &path,
 }
 
 void TemplateBundle::verifyVocab() const {
+  for (const auto &[path, digest] : tokenizerAssets)
+    verifyFileDigest(path, digest, "tokenizer");
   if (!vocabDigest.empty())
     verifyFileDigest(vocab, vocabDigest, "vocab");
 }
@@ -105,6 +107,10 @@ TemplateBundle TemplateBundle::load(const std::filesystem::path &index) {
   const auto &arch = j.at("architecture");
   b.hybrid =
       arch == "Qwen3_5ForConditionalGeneration" || arch == "Qwen3_5ForCausalLM";
+  const bool hybridQ4 = b.hybrid && j.at("variant") == "w4g32" &&
+                        j.at("pack_version") == "qwen3_5-w4g32/1" &&
+                        j.at("prefill_ime").is_boolean() &&
+                        j.contains("runtime_sha256");
   const bool hybridFormat =
       b.hybrid && j.contains("layer_types") && j.at("variant") == "f32" &&
       j.at("prefill_ime") == false && j.at("pack_version") == "qwen3_5-f32/1";
@@ -114,7 +120,8 @@ TemplateBundle TemplateBundle::load(const std::filesystem::path &index) {
       j.at("prefill_ime") == true && j.at("pack_version") == "k3-w4g32/1";
   require(j.at("format") == "bj47.route-b/1" &&
               j.at("activation_type") == "f32" && j.at("kernels") == "k3" &&
-              (hybridFormat || legacyFormat),
+              ((hybridQ4 && j.contains("layer_types")) || hybridFormat ||
+               legacyFormat),
           "format or model type");
   b.shape = digestField(j, "shape_id");
   b.model = j.at("model_id");
@@ -158,6 +165,15 @@ TemplateBundle TemplateBundle::load(const std::filesystem::path &index) {
   }
   const auto root = std::filesystem::absolute(index).parent_path();
   b.vocab = file(root, j.at("vocab_file"));
+  if (j.contains("tokenizer_assets")) {
+    const auto &assets = j.at("tokenizer_assets");
+    for (const char *name :
+         {"tokenizer.json", "tokenizer_config.json", "chat_template.jinja",
+          "qwen_bpe.py", "unicode.json"})
+      b.tokenizerAssets.emplace(root / name, digestField(assets, name));
+  }
+  if (hybridQ4)
+    require(!b.tokenizerAssets.empty(), "missing BPE assets");
   if (j.contains("vocab_sha256"))
     b.vocabDigest = digestField(j, "vocab_sha256");
   if (j.contains("runtime_sha256")) {
@@ -192,9 +208,9 @@ TemplateBundle TemplateBundle::load(const std::filesystem::path &index) {
     const bool f32 = bucket == "f32", f16 = bucket == "f16";
     require(layer || owner == "head" || owner == "rope" || owner == "embed",
             "owner");
-    const bool validBucket =
-        f32 || (b.hybrid && owner == "embed" && f16) ||
-        (!b.hybrid && (layer || owner == "head") && bucket == "q4");
+    const bool validBucket = f32 || (b.hybrid && owner == "embed" && f16) ||
+                             ((!b.hybrid || hybridQ4) &&
+                              (layer || owner == "head") && bucket == "q4");
     require(validBucket &&
                 w.at("dtype") == (f32   ? "f32"
                                   : f16 ? "f16"
@@ -220,8 +236,16 @@ TemplateBundle TemplateBundle::load(const std::filesystem::path &index) {
             "duplicate weight");
   }
   if (b.hybrid) {
+    for (int i = 0; i < c.totalLayers; ++i)
+      require(b.weights.count({b.layerTypes[i], i, "f32"}) &&
+                  b.weights.count({b.layerTypes[i], i, "q4"}) ==
+                      size_t(hybridQ4),
+              "layer weight buckets");
+    require(b.weights.count({"head", -1, "q4"}) == size_t(hybridQ4),
+            "head weight buckets");
     const bool rope = owners.count("full_attn_layer");
-    require(b.weights.size() == size_t(c.totalLayers) + 2 + rope &&
+    require(b.weights.size() == size_t(c.totalLayers) + 2 + rope +
+                                    (hybridQ4 ? c.totalLayers + 1 : 0) &&
                 b.weights.count({"embed", -1, "f32"}) +
                         b.weights.count({"embed", -1, "f16"}) ==
                     1 &&

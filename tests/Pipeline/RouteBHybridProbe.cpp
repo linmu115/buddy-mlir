@@ -60,17 +60,20 @@ struct Kernel {
 
 struct Layer {
   Buffer<float> w, a, b;
+  Buffer<int8_t> q4;
   decltype(&layer_prefill) prefill, decode;
   Layer(Kernel &kernel, const fs::path &weights)
       : w(kernel.info->base.f32_elements), a(kernel.info->state_a_elements),
-        b(kernel.info->state_b_elements),
+        b(kernel.info->state_b_elements), q4(kernel.info->base.i8_elements),
         prefill(kernel.symbol<decltype(prefill)>("layer_prefill")),
         decode(kernel.symbol<decltype(decode)>("layer_decode")) {
     w.read(weights);
+    if (q4.size)
+      q4.read(fs::path(weights).replace_extension(".q4"));
   }
 
   void run(bool pre, const float *in, const BJ47FrameV1 &frame, float *out) {
-    BJ47WeightsV1 weights{w.data(), nullptr};
+    BJ47WeightsV1 weights{w.data(), q4.size ? q4.data() : nullptr};
     if ((pre ? prefill : decode)(&weights, in, a.data(), b.data(), &frame, out))
       throw std::runtime_error("layer failed");
   }
@@ -117,7 +120,11 @@ void probe(const fs::path &dir, const fs::path &input, const fs::path &output,
       inv(config.rope_elements);
   projection.read(dir / "head.f32");
   inv.read(dir / "rope.f32");
-  BJ47WeightsV1 weight{projection.data(), nullptr};
+  Buffer<int8_t> packed(head.info->base.i8_elements);
+  if (packed.size)
+    packed.read(dir / "head.q4");
+  BJ47WeightsV1 weight{projection.data(),
+                       packed.size ? packed.data() : nullptr};
 
   std::array<Layer, 4> layers{{{gdn, dir / "gdn-0.f32"},
                                {gdn, dir / "gdn-1.f32"},

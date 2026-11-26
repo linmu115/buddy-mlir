@@ -30,6 +30,7 @@ struct TemplateBundle {
   StageManifest spec{};
   std::filesystem::path vocab, runtime;
   std::string vocabDigest, runtimeDigest;
+  std::map<std::filesystem::path, std::string> tokenizerAssets;
   void verifyVocab() const;
   std::map<std::string, TemplateEntry> kernels;
   std::map<std::tuple<std::string, int, std::string>, WeightEntry> weights;

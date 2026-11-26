@@ -45,3 +45,7 @@ core.
   prefill; bit-identical. Microbenchmark first.
 - Accumulator traffic between K chunks of the k 8960 projection and tile
   balance (24 tiles on 8 threads): a few percent.
+
+## Hybrid GDN, 64 tokens
+
+In an eight-thread K3 run with 16 key heads, 48 value heads and 128-wide keys and values, the fp32 chunkwise triangular solve and recurrent update took 175.3 and 264.0 ms respectively (medians of eight alternating warm samples). With all projections and the 5120-wide, 17408-intermediate MLP included, the RVV layer took 2269.3 ms chunkwise and 2290.4 ms recurrent. The dual-layout IME chunkwise layer took 1026.3 ms. These layer measurements use synthetic packed weights, a 4096-token context allocation and eight timed samples per configuration.

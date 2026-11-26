@@ -41,6 +41,7 @@
 #include <cstring>
 #include <deque>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <limits>
 #include <sstream>
@@ -90,6 +91,7 @@ enum class TokenizerKind {
 };
 
 struct DistributedGenerateOptions {
+  std::function<std::vector<int64_t>(const std::string &, bool)> chatEncode;
   std::string prompt;
   std::string vocabPath;
   TokenizerKind tokenizer = TokenizerKind::DeepSeekR1;
@@ -171,6 +173,25 @@ inline int tokenizePrompt(const std::string &prompt,
   const int promptRows = static_cast<int>(text->getTokenCnt());
   tokenInput.assign(text->getData(), text->getData() + context);
   return promptRows;
+}
+
+inline int encodePrompt(const DistributedGenerateOptions &opts,
+                        const StageConfig &config, const std::string &prompt,
+                        std::vector<int64_t> &ids,
+                        buddy::Text<size_t, 2> *legacy = nullptr,
+                        bool structured = false) {
+  if (!opts.chatEncode)
+    return tokenizePrompt(prompt, opts.vocabPath, config.context,
+                          opts.tokenizer, ids, legacy);
+  ids = opts.chatEncode(prompt, structured);
+  if (ids.empty() || ids.size() > size_t(config.context))
+    throw std::invalid_argument("tokenized chat is outside the model context");
+  for (auto id : ids)
+    if (id < 0 || id >= config.vocabSize)
+      throw std::invalid_argument("BPE id outside vocabulary");
+  int rows = static_cast<int>(ids.size());
+  ids.resize(config.context, 0);
+  return rows;
 }
 
 /// Convert the user-facing token limit into the internal generated-token count
@@ -800,8 +821,7 @@ inline void generateDistributed(const DistributedGenerateOptions &opts,
   int resolvedNewTokens = 0;
   std::vector<int64_t> tokenInput;
   if (first) {
-    promptRows = tokenizePrompt(opts.prompt, opts.vocabPath, config.context,
-                                opts.tokenizer, tokenInput);
+    promptRows = encodePrompt(opts, config, opts.prompt, tokenInput);
 
     if (std::getenv("BUDDY_PP_OBSERVE")) {
       std::ostringstream ids;
@@ -1238,8 +1258,7 @@ inline void generateDistributedBatch(const DistributedGenerateOptions &opts,
     std::vector<int64_t> input;
     std::array<int, 2> meta{};
     if (rank == 0) {
-      meta[0] = tokenizePrompt(prompts[slot], opts.vocabPath, config.context,
-                               opts.tokenizer, input);
+      meta[0] = encodePrompt(opts, config, prompts[slot], input);
       meta[1] = resolveGeneratedTokenLimit(opts.maxTokens, opts.tokenLimitMode,
                                            opts.allowZeroTokenLimit, meta[0],
                                            config.context);

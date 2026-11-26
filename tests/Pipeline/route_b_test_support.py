@@ -8,7 +8,8 @@ import threading
 
 
 class Resident:
-    def __init__(self, cmd, env):
+    def __init__(self, cmd, env, event_timeout=15):
+        self.event_timeout = event_timeout
         self.log = []
         self.events = queue.Queue()
         self.stderr = tempfile.TemporaryFile(mode="w+t")  # noqa: SIM115
@@ -38,7 +39,7 @@ class Resident:
 
     def until(self, predicate):
         while True:
-            line = self.events.get(timeout=15)
+            line = self.events.get(timeout=self.event_timeout)
             if line is None:
                 self.stderr.seek(0)
                 raise AssertionError(self.stderr.read())

@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <cmath>
 
+#include "ChunkGDN.h"
+
 namespace {
 constexpr unsigned FullAttention = 5;
 constexpr float Eps = normEpsilon;
@@ -26,62 +28,83 @@ void zeroCenteredNorm(const float *x, const float *w, int size, float *out) {
 }
 
 #if HYBRID_ROLE == 4
-// Qwen3_5GatedDeltaNet: process each real token once. This sequential prefill
-// evaluates the same update used by HF's single-token recurrent fallback.
-void mix(const float *w, const float *x, float *convState, float *ssmState,
-         const BJ47FrameV1 &, int, float *out) {
-  float qkv[convDim], z[valueWidth], b[valueHeads], a[valueHeads];
-  project<convDim, width>(w + inProjQKV, x, qkv);
-  project<valueWidth, width>(w + inProjZ, x, z);
-  project<valueHeads, width>(w + inProjB, x, b);
-  project<valueHeads, width>(w + inProjA, x, a);
+void mix(const BJ47WeightsV1 &weights, const float *x, float *convState,
+         float *ssmState, const BJ47FrameV1 &, int rows, int valid,
+         float *out) {
+  const float *w = weights.f32;
+  hybrid::Scratch qkvBuffer(rows * convDim), z(rows * valueWidth),
+      b(rows * valueHeads), a(rows * valueHeads), core(rows * valueWidth);
+  proj_inProjQKV(weights, x, qkvBuffer.data(), rows);
+  proj_inProjZ(weights, x, z.data(), rows);
+  proj_inProjB(weights, x, b.data(), rows);
+  proj_inProjA(weights, x, a.data(), rows);
+  for (int t = 0; t < valid; ++t) {
+    auto *qkv = qkvBuffer.data() + t * convDim;
+    for (int c = 0; c < convDim; ++c) {
+      auto *history = convState + c * convKernel;
+      for (int j = 1; j < convKernel; ++j)
+        history[j - 1] = history[j];
+      history[convKernel - 1] = qkv[c];
+      float sum = 0;
+      for (int j = 0; j < convKernel; ++j)
+        sum += history[j] * w[convWeight + c * convKernel + j];
+      qkv[c] = silu(sum);
+    }
 
-  for (int c = 0; c < convDim; ++c) {
-    auto *history = convState + c * convKernel;
-    for (int j = 1; j < convKernel; ++j)
-      history[j - 1] = history[j];
-    history[convKernel - 1] = qkv[c];
-    float sum = 0;
-    for (int j = 0; j < convKernel; ++j)
-      sum += history[j] * w[convWeight + c * convKernel + j];
-    qkv[c] = silu(sum);
-  }
+    auto *query = qkv;
+    auto *key = qkv + keyWidth;
 
-  auto *query = qkv;
-  auto *key = qkv + keyWidth;
-  const auto *value = qkv + 2 * keyWidth;
-  const float queryScale = 1.0f / std::sqrt(float(keyDim));
-  for (int h = 0; h < keyHeads; ++h) {
-    auto *q = query + h * keyDim;
-    auto *k = key + h * keyDim;
-    const float normQ = 1.0f / std::sqrt(squareSum(q, keyDim) + 1e-6f);
-    const float normK = 1.0f / std::sqrt(squareSum(k, keyDim) + 1e-6f);
-    for (int j = 0; j < keyDim; ++j) {
-      q[j] = (q[j] * normQ) * queryScale;
-      k[j] *= normK;
+    const float queryScale = 1.0f / std::sqrt(float(keyDim));
+    for (int h = 0; h < keyHeads; ++h) {
+      auto *q = query + h * keyDim;
+      auto *k = key + h * keyDim;
+      const float normQ = 1.0f / std::sqrt(squareSum(q, keyDim) + 1e-6f);
+      const float normK = 1.0f / std::sqrt(squareSum(k, keyDim) + 1e-6f);
+      for (int j = 0; j < keyDim; ++j) {
+        q[j] = (q[j] * normQ) * queryScale;
+        k[j] *= normK;
+      }
+    }
+
+    for (int h = 0; h < valueHeads; ++h) {
+      int i = t * valueHeads + h;
+      b[i] = sigmoid(b[i]);
+      float dt = a[i] + w[dtBias + h];
+      a[i] =
+          -std::exp(w[aLog + h]) * (dt > 20.f ? dt : std::log1p(std::exp(dt)));
     }
   }
-
-  float core[valueWidth];
-  for (int h = 0; h < valueHeads; ++h) {
-    const int keyHead = h / (valueHeads / keyHeads);
-    const auto *q = query + keyHead * keyDim;
-    const auto *k = key + keyHead * keyDim;
-    const auto *v = value + h * valueDim;
-    auto *state = ssmState + h * keyDim * valueDim;
-    auto *row = core + h * valueDim;
-    const float beta = sigmoid(b[h]);
-    const float dt = a[h] + w[dtBias + h];
-    const float softplus = dt > 20.0f ? dt : std::log1p(std::exp(dt));
-    const float alpha = std::exp(-std::exp(w[aLog + h]) * softplus);
-    deltaStep(state, q, k, v, row, beta, alpha);
-
-    const float norm =
-        1.0f / std::sqrt(squareSum(row, valueDim) / valueDim + Eps);
-    for (int j = 0; j < valueDim; ++j)
-      row[j] = (row[j] * norm) * w[gatedNorm + j] * silu(z[h * valueDim + j]);
+#ifdef HYBRID_THREADS
+#pragma omp parallel for schedule(static) num_threads(HYBRID_THREADS)
+#endif
+  for (uint64_t h = 0; h < valueHeads; ++h) {
+    int kh = h / (valueHeads / keyHeads);
+    const auto *q = qkvBuffer.data() + kh * keyDim;
+    const auto *k = q + keyWidth;
+    const auto *v = qkvBuffer.data() + 2 * keyWidth + h * valueDim;
+    float *state = ssmState + h * keyDim * valueDim;
+    float *head = core.data() + h * valueDim;
+    if (rows == 1
+#ifdef HYBRID_RECURRENT_REFERENCE
+        || rows == chunk
+#endif
+    ) {
+      for (int t = 0; t < valid; ++t)
+        deltaStep(state, q + t * convDim, k + t * convDim, v + t * convDim,
+                  head + t * valueWidth, b[t * valueHeads + h],
+                  std::exp(a[t * valueHeads + h]));
+    } else
+      hybrid::chunkGDN(q, k, v, convDim, a.data() + h, b.data() + h, valueHeads,
+                       state, head, valueWidth, valid, keyDim, valueDim);
+    for (int t = 0; t < valid; ++t) {
+      auto *row = head + t * valueWidth;
+      float norm = 1.f / std::sqrt(squareSum(row, valueDim) / valueDim + Eps);
+      for (int j = 0; j < valueDim; ++j)
+        row[j] = row[j] * norm * w[gatedNorm + j] *
+                 silu(z[t * valueWidth + h * valueDim + j]);
+    }
   }
-  project<width, valueWidth>(w + mixerOut, core, out);
+  proj_mixerOut(weights, core.data(), out, rows);
 }
 #elif HYBRID_ROLE == 5
 void partialRotary(float *x, const float *cos, const float *sin) {
@@ -92,65 +115,74 @@ void partialRotary(float *x, const float *cos, const float *sin) {
   }
 }
 
-void mix(const float *w, const float *x, float *keys, float *values,
-         const BJ47FrameV1 &frame, int row, float *out) {
+void mix(const BJ47WeightsV1 &weights, const float *x, float *keys,
+         float *values, const BJ47FrameV1 &frame, int rows, int valid,
+         float *out) {
+  const auto *w = weights.f32;
   constexpr int qWidth = attentionHeads * headDim;
   constexpr int kvWidth = kvHeads * headDim;
-  const int position = frame.cache_position + row;
-  const auto *cos = frame.cos_rows + row * rotaryDim;
-  const auto *sin = frame.sin_rows + row * rotaryDim;
-  float qAndGate[2 * qWidth], k[kvWidth], v[kvWidth], core[qWidth];
-  project<2 * qWidth, width>(w + qProj, x, qAndGate);
-  project<kvWidth, width>(w + kProj, x, k);
-  project<kvWidth, width>(w + vProj, x, v);
+  hybrid::Scratch query(rows * 2 * qWidth), keyRows(rows * kvWidth),
+      valueRows(rows * kvWidth), cores(rows * qWidth),
+      scores(frame.cache_position + valid);
+  proj_qProj(weights, x, query.data(), rows);
+  proj_kProj(weights, x, keyRows.data(), rows);
+  proj_vProj(weights, x, valueRows.data(), rows);
+  for (int row = 0; row < valid; ++row) {
+    const int position = frame.cache_position + row;
+    const auto *cos = frame.cos_rows + row * rotaryDim;
+    const auto *sin = frame.sin_rows + row * rotaryDim;
+    float *qAndGate = query.data() + row * 2 * qWidth;
+    float *k = keyRows.data() + row * kvWidth;
+    float *v = valueRows.data() + row * kvWidth;
+    float *core = cores.data() + row * qWidth;
+    for (int h = 0; h < kvHeads; ++h) {
+      auto *key = k + h * headDim;
+      zeroCenteredNorm(key, w + kNorm, headDim, key);
+      partialRotary(key, cos, sin);
+      const size_t offset = (size_t(h) * context + position) * headDim;
+      for (int i = 0; i < headDim; ++i) {
+        keys[offset + i] = key[i];
+        values[offset + i] = v[h * headDim + i];
+      }
+    }
 
-  for (int h = 0; h < kvHeads; ++h) {
-    auto *key = k + h * headDim;
-    zeroCenteredNorm(key, w + kNorm, headDim, key);
-    partialRotary(key, cos, sin);
-    const size_t offset = (size_t(h) * context + position) * headDim;
-    for (int i = 0; i < headDim; ++i) {
-      keys[offset + i] = key[i];
-      values[offset + i] = v[h * headDim + i];
+    const float scale = 1.0f / std::sqrt(float(headDim));
+    for (int h = 0; h < attentionHeads; ++h) {
+      const int kvHead = h / (attentionHeads / kvHeads);
+      auto *q = qAndGate + h * 2 * headDim;
+      const auto *gate = q + headDim;
+      zeroCenteredNorm(q, w + qNorm, headDim, q);
+      partialRotary(q, cos, sin);
+
+      const auto *headKeys = keys + size_t(kvHead) * context * headDim;
+      const auto *headValues = values + size_t(kvHead) * context * headDim;
+
+      float maxScore = -INFINITY;
+      for (int t = 0; t <= position; ++t) {
+        float dot = 0;
+        for (int i = 0; i < headDim; ++i)
+          dot += q[i] * headKeys[t * headDim + i];
+        scores[t] = dot * scale;
+        maxScore = std::max(maxScore, scores[t]);
+      }
+      float denominator = 0;
+      for (int t = 0; t <= position; ++t) {
+        scores[t] = std::exp(scores[t] - maxScore);
+        denominator += scores[t];
+      }
+
+      auto *result = core + h * headDim;
+      std::fill_n(result, headDim, 0.0f);
+      for (int t = 0; t <= position; ++t) {
+        const float p = scores[t] / denominator;
+        for (int i = 0; i < headDim; ++i)
+          result[i] += p * headValues[t * headDim + i];
+      }
+      for (int i = 0; i < headDim; ++i)
+        result[i] *= sigmoid(gate[i]);
     }
   }
-
-  const float scale = 1.0f / std::sqrt(float(headDim));
-  for (int h = 0; h < attentionHeads; ++h) {
-    const int kvHead = h / (attentionHeads / kvHeads);
-    auto *q = qAndGate + h * 2 * headDim;
-    const auto *gate = q + headDim;
-    zeroCenteredNorm(q, w + qNorm, headDim, q);
-    partialRotary(q, cos, sin);
-
-    const auto *headKeys = keys + size_t(kvHead) * context * headDim;
-    const auto *headValues = values + size_t(kvHead) * context * headDim;
-    float scores[context];
-    float maxScore = -INFINITY;
-    for (int t = 0; t <= position; ++t) {
-      float dot = 0;
-      for (int i = 0; i < headDim; ++i)
-        dot += q[i] * headKeys[t * headDim + i];
-      scores[t] = dot * scale;
-      maxScore = std::max(maxScore, scores[t]);
-    }
-    float denominator = 0;
-    for (int t = 0; t <= position; ++t) {
-      scores[t] = std::exp(scores[t] - maxScore);
-      denominator += scores[t];
-    }
-
-    auto *result = core + h * headDim;
-    std::fill_n(result, headDim, 0.0f);
-    for (int t = 0; t <= position; ++t) {
-      const float p = scores[t] / denominator;
-      for (int i = 0; i < headDim; ++i)
-        result[i] += p * headValues[t * headDim + i];
-    }
-    for (int i = 0; i < headDim; ++i)
-      result[i] *= sigmoid(gate[i]);
-  }
-  project<width, qWidth>(w + mixerOut, core, out);
+  proj_mixerOut(weights, cores.data(), out, rows);
 }
 #endif
 
@@ -170,24 +202,28 @@ int32_t layer(const BJ47WeightsV1 *weights, const float *input, float *a,
       frame->cache_position > context - validRows)
     return -2;
 
+  if (kernelInfo.base.i8_elements && !weights->q4)
+    return -1;
   const auto *w = weights->f32;
+  hybrid::Scratch norm(rows * width), residual(rows * width),
+      gate(rows * intermediate), up(rows * intermediate);
+  for (int t = 0; t < validRows; ++t)
+    zeroCenteredNorm(input + t * width, w + inputNorm, width,
+                     norm.data() + t * width);
+  mix(*weights, norm.data(), a, b, *frame, rows, validRows, residual.data());
   for (int t = 0; t < validRows; ++t) {
-    const auto *x = input + t * width;
-    auto *y = out + t * width;
-    float norm[width], residual[width], gate[intermediate], up[intermediate];
-    zeroCenteredNorm(x, w + inputNorm, width, norm);
-    mix(w, norm, a, b, *frame, t, residual);
+    float *r = residual.data() + t * width;
     for (int i = 0; i < width; ++i)
-      residual[i] += x[i];
-    zeroCenteredNorm(residual, w + postNorm, width, norm);
-    project<intermediate, width>(w + gateProj, norm, gate);
-    project<intermediate, width>(w + upProj, norm, up);
-    for (int i = 0; i < intermediate; ++i)
-      gate[i] = silu(gate[i]) * up[i];
-    project<width, intermediate>(w + downProj, gate, y);
-    for (int i = 0; i < width; ++i)
-      y[i] += residual[i];
+      r[i] += input[t * width + i];
+    zeroCenteredNorm(r, w + postNorm, width, norm.data() + t * width);
   }
+  proj_gateProj(*weights, norm.data(), gate.data(), rows);
+  proj_upProj(*weights, norm.data(), up.data(), rows);
+  for (int i = 0; i < validRows * intermediate; ++i)
+    gate[i] = silu(gate[i]) * up[i];
+  proj_downProj(*weights, gate.data(), out, rows);
+  for (int i = 0; i < validRows * width; ++i)
+    out[i] += residual[i];
   // Wire frames have fixed capacity. Define the tail without touching state.
   std::fill(out + validRows * width, out + rows * width, 0.0f);
   return 0;
@@ -213,9 +249,11 @@ extern "C" int32_t lm_head(const BJ47WeightsV1 *w, const float *input,
                            float *out) {
   if (!w || !w->f32 || !input || !out || input == out)
     return -1;
-  float norm[width];
-  zeroCenteredNorm(input, w->f32 + finalNorm, width, norm);
-  project<vocab, width>(w->f32 + lmHead, norm, out);
+  if (kernelInfo.base.i8_elements && !w->q4)
+    return -1;
+  hybrid::Scratch norm(width);
+  zeroCenteredNorm(input, w->f32 + finalNorm, width, norm.data());
+  proj_lmHead(*w, norm.data(), out, 1);
   return 0;
 }
 extern "C" int32_t lm_head_prefill(const BJ47WeightsV1 *w, const float *input,

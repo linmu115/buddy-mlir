@@ -775,3 +775,41 @@ do not hang.
   `--prompt-length`, `--audio`, `--image`, `--chat-template`,
   `--perplexity`/`--ppl-*`, `--defer-decode-token-readback`, or
   `--print-all-batch`.
+
+### Route B hybrid text bundles
+
+`tools/buddy-codegen/build_route_b_hybrid.py` accepts `--variant f32` or
+`--variant w4g32`. The latter uses the K3 group-32 projection kernels and
+defaults to eight threads. Add `--prefill-ime` for the K3 cross target to
+pack both the decode tiles and the 64-row IME layout. The head uses only the
+decode layout. The GDN beta and decay projections, convolution and norms stay
+in f32. The embedding table supports `--embed-dtype f16` and `f32`.
+The exporter requires the Buddy Python bindings on `PYTHONPATH` for w4g32.
+It packs bounded slabs of output channels directly into each layout.
+
+Prefill projects a zero-tailed 64-row frame. GDN solves the unit lower
+triangular system on the valid prefix, then updates its convolution and
+recurrent state for that prefix only. Decode uses the recurrent single-step
+kernel. Full attention appends valid rows to the slot's KV cache.
+
+Pass the directory containing the official `tokenizer.json`,
+`tokenizer_config.json` and `chat_template.jinja` via `--tokenizer-dir` (default
+lookup is the checkpoint directory). Rank zero runs a resident Python 3
+tokenizer worker with Jinja2 installed. The manifest authenticates the worker,
+the three input assets, the decoder vocabulary and the exported Unicode tables.
+The exporter derives canonical decomposition, composition, combining-class
+order and regex character classes from the reference tokenizers library.
+Rank zero uses those tables across Python versions. The legacy f32 exporter
+continues to accept `--vocab` for its original vocabulary-only fixtures.
+
+The host supports `--enable-thinking` (the default for official assets) and
+`--no-thinking`. The HTTP gateway forwards the complete message list and
+accepts a boolean `chat_template_kwargs.enable_thinking` or a top-level
+`enable_thinking`. In the resident JSONL protocol the equivalent submit field is
+`"chat": {"messages": [...], "enable_thinking": false}`.
+
+Generate a tile-compatible test checkpoint with
+`tests/Pipeline/qwen35_route_b_reference.py --tile-fixture`. The numerical
+probe reports both free-running greedy matches and common-history tensor
+errors against dequantized weights. The K3 projections quantize activations
+to Q8. The IME prefill also changes scale and accumulation precision.

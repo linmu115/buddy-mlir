@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Export Qwen3.5 text tensors and build reusable f32 Route B templates."""
+"""Stream Qwen hybrid text weights and build reusable Route B templates."""
 
 import argparse
 import hashlib
@@ -13,6 +13,7 @@ import time
 from pathlib import Path
 
 import route_b_hybrid_ir as ir
+import route_b_hybrid_w4 as w4
 import torch
 from safetensors import safe_open
 
@@ -210,7 +211,9 @@ def octets(value):
     return "{" + ", ".join(map(str, bytes.fromhex(value))) + "}"
 
 
-def generate(role, d, c, schema, offsets, count, dtype, layout, shape):
+def generate(
+    role, d, c, schema, offsets, count, dtype, layout, shape, i8_count=0
+):
     owner = OWNERS[role]
     role_id = ROLE_IDS[role]
     state_a = state_b = rope = 0
@@ -232,7 +235,7 @@ def generate(role, d, c, schema, offsets, count, dtype, layout, shape):
         d["headDim"],
         d["vocab"],
         0 if half else count,
-        0,
+        i8_count,
         rope // 2,
         0,
         0,
@@ -292,19 +295,29 @@ inline int32_t embed<{rows}>(const EmbedElement *table, const int64_t *ids, floa
 }}
 """
     else:
-        header += "template <int N, int K> void project(const float *, const float *, float *);\n"
+        header += "template <int R, int N, int K> void project(const float *, const float *, float *);\n"
         projections = sorted(
             {shape for _, shape in schema.values() if len(shape) == 2}
         )
         for n, k in projections:
-            mlir.append(ir.projection(n, k))
-            header += f"""\
-extern "C" void _mlir_ciface_project_{n}_{k}(Descriptor<2> *, Descriptor<1> *, Descriptor<1> *);
+            for rows in [1] if owner == "head" else [1, d["chunk"]]:
+                mlir.append(ir.projection(n, k, rows))
+                header += f"""
+extern "C" void _mlir_ciface_project_{rows}_{n}_{k}(Descriptor<2> *, Descriptor<2> *, Descriptor<2> *);
 template <>
-inline void project<{n}, {k}>(const float *w, const float *x, float *y) {{
+inline void project<{rows}, {n}, {k}>(const float *w, const float *x, float *y) {{
   Descriptor<2> weights(w, {{{n}, {k}}});
-  Descriptor<1> input(x, {{{k}}}), out(y, {{{n}}});
-  _mlir_ciface_project_{n}_{k}(&weights, &input, &out);
+  Descriptor<2> input(x, {{{rows}, {k}}}), out(y, {{{rows}, {n}}});
+  _mlir_ciface_project_{rows}_{n}_{k}(&weights, &input, &out);
+}}
+"""
+        for name, (_, dims) in schema.items():
+            if len(dims) == 2:
+                n, k = dims
+                header += f"""
+inline void proj_{name}(const BJ47WeightsV1 &w, const float *x, float *y, int rows) {{
+  if (rows == 1) project<1, {n}, {k}>(w.f32 + {name}, x, y);
+  {"" if owner == "head" else f"else project<chunk, {n}, {k}>(w.f32 + {name}, x, y);"}
 }}
 """
         if owner == "gdn":
@@ -328,7 +341,7 @@ inline void deltaStep(float *s, const float *q, const float *k, const float *v,
     return header, "\n".join(mlir), symbols
 
 
-def compile_template(args, role, header, mlir, symbols):
+def compile_template(args, role, header, mlir, symbols, specs=()):
     dest = args.work / role
     dest.mkdir(parents=True, exist_ok=True)
     (dest / "HybridConfig.h").write_text(header)
@@ -397,6 +410,17 @@ def compile_template(args, role, header, mlir, symbols):
         )
     output = args.output / f"{role}.so"
     tmp = dest / output.name
+    extra = []
+    if specs:
+        extra = [
+            *w4.compile_kernels(args, dest, specs),
+            "-Wl,-rpath,$ORIGIN",
+            "-L" + str(args.output),
+            "-lbj47_kernel_runtime",
+            "-fopenmp-simd",
+            "-Xclang",
+            "-fopenmp",
+        ]
     subprocess.run(
         [
             args.llvm_bin / "clang++",
@@ -413,6 +437,7 @@ def compile_template(args, role, header, mlir, symbols):
             "-I" + str(dest),
             SOURCE / "HybridKernel.cpp",
             llvm,
+            *extra,
             "-Wl,-z,defs",
             "-Wl,--version-script=" + str(exports),
             "-o",
@@ -430,6 +455,37 @@ def export_bundle(args):
         args.checkpoint / "config.json", args.context, args.chunk
     )
     schema = schemas(dims)
+    quant = args.variant == "w4g32"
+    if args.threads <= 0 or (args.prefill_ime and not quant):
+        raise ValueError("positive threads required; IME requires w4g32")
+    if quant:
+        runtime = args.output / "libbj47_kernel_runtime.so"
+        subprocess.run(
+            [
+                args.llvm_bin / "clang",
+                *args.cxx_flag,
+                "-O2",
+                "-fPIC",
+                "-shared",
+                "-DBUDDY_COMPONENT_RUNTIME",
+                "-DBUDDY_ARENA_DEFAULT_PREFAULT_MB=0",
+                SOURCE / "Runtime.c",
+                *(
+                    [SOURCE / "CheckedHeap.c", "-DBJ47_CHECKED_HEAP"]
+                    if any("fsanitize=address" in f for f in args.cxx_flag)
+                    else [ROOT / "runtime/arena/BuddyArena.c"]
+                ),
+                ROOT / "runtime/threadpool/BuddyThreadPool.c",
+                ROOT / "runtime/spacemit/BuddySpacemitTcm.c",
+                "-lpthread",
+                "-ldl",
+                "-lm",
+                "-Wl,-soname," + runtime.name,
+                "-o",
+                runtime,
+            ],
+            check=True,
+        )
     rope = c["rope_parameters"]
     shape = digest({"dims": dims, "epsilon": c["rms_norm_eps"], "rope": rope})
     role_names = [
@@ -438,7 +494,55 @@ def export_bundle(args):
     index = weights_index(args.checkpoint)
     args.work.mkdir(parents=True, exist_ok=True)
     vocab_path = args.output / "vocab.txt"
-    shutil.copyfile(args.vocab, vocab_path)
+    assets = {}
+    tokenizer_dir = args.tokenizer_dir or args.checkpoint
+    if (tokenizer_dir / "tokenizer.json").exists():
+        for name in (
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "chat_template.jinja",
+            "qwen_bpe.py",
+        ):
+            src = (
+                ROOT / "tools/route_b_serve" / name
+                if name.endswith(".py")
+                else tokenizer_dir / name
+            )
+            dst = args.output / name
+            shutil.copyfile(src, dst)
+            assets[name] = file_digest(dst)
+        data = json.loads((args.output / "tokenizer.json").read_bytes())
+        from route_b_hybrid_unicode import build_tables
+
+        unicode_asset = args.output / "unicode.json"
+        unicode_asset.write_text(canonical(build_tables()), encoding="utf-8")
+        assets[unicode_asset.name] = file_digest(unicode_asset)
+        added = {item["content"]: item["id"] for item in data["added_tokens"]}
+        for token, expected in {
+            "<|endoftext|>": 248044,
+            "<|im_start|>": 248045,
+            "<|im_end|>": 248046,
+            "<think>": 248068,
+            "</think>": 248069,
+        }.items():
+            if added.get(token) != expected:
+                raise ValueError(f"unexpected tokenizer id for {token}")
+        tokens = [""] * dims["vocab"]
+        for token, i in data["model"]["vocab"].items():
+            tokens[i] = token
+        for item in data["added_tokens"]:
+            tokens[item["id"]] = item["content"]
+        vocab_path.write_text("\n".join(tokens) + "\n", encoding="utf-8")
+    elif quant or args.tokenizer_dir:
+        raise ValueError(
+            "w4g32 and --tokenizer-dir require the official tokenizer assets"
+        )
+    elif args.vocab is not None:
+        shutil.copyfile(args.vocab, vocab_path)
+    else:
+        raise ValueError(
+            "provide --vocab for a legacy f32 fixture or --tokenizer-dir"
+        )
     kernels, weights, layouts = [], [], {}
     compiled = {}
     for role in role_names:
@@ -448,6 +552,25 @@ def export_bundle(args):
         layout = layouts[owner] = digest(
             {"schema": list(keys.items()), "dtype": dtype}
         )
+        quantized = w4.quantized_fields(keys) if quant else {}
+        positions, i8_count = (
+            w4.offsets(quantized, args.prefill_ime and owner != "head")
+            if quantized
+            else ({}, 0)
+        )
+        if quantized:
+            layout = layouts[owner] = digest(
+                {
+                    "schema": list(keys.items()),
+                    "q4": positions,
+                    "variant": args.variant,
+                }
+            )
+            keys = {
+                name: field
+                for name, field in keys.items()
+                if name not in positions
+            }
         offsets, count = {}, 0
         for name, (_, weight_shape) in keys.items():
             offsets[name] = count
@@ -467,16 +590,35 @@ def export_bundle(args):
             weights.append(
                 weight_receipt(path, owner, dtype, count, layout, layer)
             )
+            if quantized:
+                qfile = args.output / f"{label}.q4"
+                prefix = "" if layer is None else f"{PREFIX}layers.{layer}."
+                w4.pack(
+                    qfile, args.checkpoint, index, prefix, quantized, positions
+                )
+                weights.append(
+                    weight_receipt(qfile, owner, "q4", i8_count, layout, layer)
+                    | {"dtype": "i8"}
+                )
         header, mlir, symbols = generate(
-            role, dims, c, keys, offsets, count, dtype, layout, shape
+            role, dims, c, keys, offsets, count, dtype, layout, shape, i8_count
         )
-        binary = compile_template(args, role, header, mlir, symbols)
+        specs = []
+        if quantized:
+            code, specs = w4.projection_code(args, owner, quantized, positions)
+            header += (
+                f"\n#define HYBRID_THREADS {args.threads}\n#include <algorithm>\n"
+                + code
+            )
+        binary = compile_template(args, role, header, mlir, symbols, specs)
         compiled[role] = binary.pop("compile_seconds")
         kernels.append(
             binary
             | {
                 "role": role,
                 "abi_version": 2,
+                "f32_elements": 0 if dtype == "f16" else count,
+                "i8_elements": i8_count,
                 "layout_id": layout,
                 "shape_id": shape,
             }
@@ -497,9 +639,9 @@ def export_bundle(args):
         "format": "bj47.route-b/1",
         "model_id": args.model_id,
         "architecture": "Qwen3_5ForConditionalGeneration",
-        "variant": "f32",
+        "variant": args.variant,
         "kernels": "k3",
-        "prefill_ime": False,
+        "prefill_ime": args.prefill_ime,
         "activation_type": "f32",
         "total_layers": len(types),
         "layer_types": types,
@@ -514,12 +656,20 @@ def export_bundle(args):
         "stop_token_ids": [248044, 248046],
         "vocab_file": vocab_path.name,
         "vocab_sha256": file_digest(vocab_path),
-        "pack_version": "qwen3_5-f32/1",
+        "pack_version": f"qwen3_5-{args.variant}/1",
         "shape_id": shape,
         "layouts": layouts,
         "templates": kernels,
         "weights": weights,
     }
+    if assets:
+        manifest["tokenizer_assets"] = assets
+    if quant:
+        manifest.update(
+            runtime=runtime.name,
+            runtime_sha256=file_digest(runtime),
+            threads=args.threads,
+        )
     manifest["bundle_id"] = digest(manifest)
     pending = args.output / "route-b.json.tmp"
     pending.write_text(json.dumps(manifest, indent=2) + "\n")
@@ -555,7 +705,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     for path in (
         "checkpoint",
-        "vocab",
         "output",
         "work",
         "llvm-bin",
@@ -566,6 +715,11 @@ if __name__ == "__main__":
     parser.add_argument(
         "--tokenizer", choices=["qwen3_5", "qwen3_8"], default="qwen3_8"
     )
+    parser.add_argument("--tokenizer-dir", type=Path)
+    parser.add_argument("--vocab", type=Path)
+    parser.add_argument("--variant", choices=["f32", "w4g32"], default="f32")
+    parser.add_argument("--threads", type=int, default=8)
+    parser.add_argument("--prefill-ime", action="store_true")
     parser.add_argument("--model-id", required=True)
     parser.add_argument("--context", type=int, default=256)
     parser.add_argument("--chunk", type=int, default=64)

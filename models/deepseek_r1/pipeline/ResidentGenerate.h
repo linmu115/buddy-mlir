@@ -109,6 +109,13 @@ BatchCtrlReply residentPrefill(const DistributedGenerateOptions &opts,
   stage.setActiveSlot(slot);
   link.startPrefill(slot, stream.promptRows, stream.limit, plan.size());
   if (rank == last) {
+    if (!opts.logitsDumpPath.empty() && opts.logitsDumpPath != "-") {
+      stream.prefill.raw.open(opts.logitsDumpPath + ".slot" +
+                                  std::to_string(slot),
+                              std::ios::binary | std::ios::app);
+      if (!stream.prefill.raw)
+        throw std::runtime_error("cannot append resident logits");
+    }
     stream.prefill.sampler.emplace(opts.samplerConfig);
     stream.generated.reserve(stream.limit);
   }
@@ -162,6 +169,12 @@ void runResident(const DistributedGenerateOptions &opts, Stage &stage,
                  const std::string &ranges) {
   const auto &config = stage.configuration();
   const int last = ranks - 1;
+  if (rank == last && !opts.logitsDumpPath.empty() &&
+      opts.logitsDumpPath != "-")
+    for (int slot = 0; slot < slots; ++slot)
+      if (!std::ofstream(opts.logitsDumpPath + ".slot" + std::to_string(slot),
+                         std::ios::binary))
+        throw std::runtime_error("cannot initialize resident logits dump");
   std::vector<ResidentStream> streams(slots);
   BatchLink<WireElement> link(config.activationWidth, slots, comm, rank, last,
                               config.prefillChunk);
@@ -169,7 +182,7 @@ void runResident(const DistributedGenerateOptions &opts, Stage &stage,
   std::thread reader;
   try {
     std::optional<buddy::Text<size_t, 2>> tokenizer;
-    if (rank == 0) {
+    if (rank == 0 && !opts.chatEncode) {
       tokenizer.emplace("");
       tokenizer->loadVocab(opts.vocabPath);
     }
@@ -293,9 +306,14 @@ void runResident(const DistributedGenerateOptions &opts, Stage &stage,
         const auto value = command.value(field, ServeJson(0));
         if (!value.is_number_integer() || value < 0 || value > config.context)
           throw std::invalid_argument("invalid token limit");
-        const auto prompt = command.at("prompt").get<std::string>();
-        rows = tokenizePrompt(prompt, opts.vocabPath, config.context,
-                              opts.tokenizer, tokens, &*tokenizer);
+        const bool structured = command.contains("chat");
+        if (structured && !opts.chatEncode)
+          throw std::invalid_argument("bundle does not support chat");
+        const auto prompt = structured
+                                ? command.at("chat").dump()
+                                : command.at("prompt").get<std::string>();
+        rows = encodePrompt(opts, config, prompt, tokens,
+                            tokenizer ? &*tokenizer : nullptr, structured);
         limit = resolveGeneratedTokenLimit(
             value.get<int>(),
             newTokens ? TokenLimitMode::NewTokens

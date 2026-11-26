@@ -106,6 +106,11 @@ __attribute__((constructor)) static void arenaInit(void) {
   arenaBase = (char *)p;
 }
 
+__attribute__((destructor)) static void releaseArena(void) {
+  if (arenaBase)
+    munmap(arenaBase, arenaSize);
+}
+
 // Called by the session before each forward call: the buffers of the
 // previous call are dead.
 void buddy_arena_reset(void) {

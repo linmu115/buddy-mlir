@@ -1,6 +1,7 @@
 #include "PipelineGenerate.h"
 #include "ResidentGenerate.h"
 #include "TemplateBundle.h"
+#include "route_b/ChatTokenizer.h"
 #include <optional>
 #include <thread>
 
@@ -15,9 +16,14 @@ void run(int argc, char **argv, int rank, int size) {
   auto transport = pipeline::Transport::Blocking;
   bool verify = false, serve = false;
   int slots = 2;
+  std::optional<bool> thinking;
   std::optional<std::string> list, single;
   for (int i = 1; i < argc; ++i) {
     std::string opt = argv[i];
+    if (opt == "--enable-thinking" || opt == "--no-thinking") {
+      thinking = opt == "--enable-thinking";
+      continue;
+    }
     if (opt == "--serve") {
       serve = true;
       continue;
@@ -103,22 +109,40 @@ void run(int argc, char **argv, int rank, int size) {
   if (rank == 0)
     b.verifyVocab();
   auto stage = makeTemplateStage(b, range, verify, slotCount);
+  checkLocalConfig(b.spec, stage->configuration());
+  auto opts = makeGenerateOptions(b.spec, b.vocab.string(), cfg,
+                                  stage->configuration(), rank, size);
+  if (thinking && b.tokenizerAssets.empty())
+    throw std::invalid_argument("thinking requires a chat template");
+  std::unique_ptr<ChatTokenizer> tokenizer;
+  if (rank == 0 && !b.tokenizerAssets.empty()) {
+    tokenizer = std::make_unique<ChatTokenizer>(b.vocab.parent_path());
+    opts.chatEncode = [&](const std::string &text, bool structured) {
+      using json = nlohmann::json;
+      auto request =
+          structured
+              ? json::parse(text)
+              : json{{"messages",
+                      json::array({{{"role", "user"}, {"content", text}}})}};
+      if (!request.contains("enable_thinking"))
+        request["enable_thinking"] = thinking.value_or(true);
+      if (!request.at("enable_thinking").is_boolean())
+        throw std::invalid_argument("enable_thinking must be boolean");
+      return tokenizer->encode(request);
+    };
+  }
   if (serve) {
-    checkLocalConfig(b.spec, stage->configuration());
-    const auto opts = makeGenerateOptions(b.spec, b.vocab.string(), cfg,
-                                          stage->configuration(), rank, size);
     pipeline::generateResident(
         opts, *stage, MPI_COMM_WORLD, rank, size, slots,
         list.value_or(single.value_or("0:" + std::to_string(total))));
-    reportPipelineMemory(rank);
   } else if (streamCount == 1) {
-    cfg.prompt = std::move(prompts.front());
-    runDistributedStage(*stage, b.spec, b.model, b.vocab.string(), cfg,
-                        MPI_COMM_WORLD, rank, size);
+    opts.prompt = std::move(prompts.front());
+    pipeline::generateDistributed(opts, *stage, MPI_COMM_WORLD, rank, size);
   } else {
-    runDistributedBatch(*stage, b.spec, b.model, b.vocab.string(), cfg, prompts,
-                        MPI_COMM_WORLD, rank, size);
+    pipeline::generateDistributedBatch(opts, prompts, *stage, MPI_COMM_WORLD,
+                                       rank, size);
   }
+  reportPipelineMemory(rank);
 }
 } // namespace
 int main(int argc, char **argv) {

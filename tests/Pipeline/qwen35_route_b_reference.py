@@ -42,14 +42,14 @@ def prompt_ids(prompt):
     ]
 
 
-def fixture(spec, path):
+def fixture(spec, path, tile_fixture=False):
     config = json.loads((spec / "qwen38_27b_config.json").read_text())
     c = config["text_config"]
     c.update(
-        hidden_size=256,
-        intermediate_size=512,
-        linear_num_key_heads=4,
-        linear_num_value_heads=8,
+        hidden_size=128 if tile_fixture else 256,
+        intermediate_size=256 if tile_fixture else 512,
+        linear_num_key_heads=2 if tile_fixture else 4,
+        linear_num_value_heads=4 if tile_fixture else 8,
         linear_key_head_dim=32,
         linear_value_head_dim=32,
         num_attention_heads=4,
@@ -219,7 +219,16 @@ class TextCache:
 
 
 @torch.no_grad()
-def reference(spec, checkpoint, dtype, rows, steps, whole_prefill=False):
+def reference(
+    spec,
+    checkpoint,
+    dtype,
+    rows,
+    steps,
+    whole_prefill=False,
+    dequantize=False,
+    replay=None,
+):
     operators = load_torch_fallback(spec / "modeling_qwen3_5.py")
     config, _, _ = read_config(checkpoint / "config.json", 256, 64)
     d = SimpleNamespace(**config, _attn_implementation="eager")
@@ -227,6 +236,23 @@ def reference(spec, checkpoint, dtype, rows, steps, whole_prefill=False):
 
     for shard in checkpoint.glob("*.safetensors"):
         weights.update(load_file(shard))
+    if dequantize:
+        from buddy.compiler.graph.transform import k3_w4
+        from route_b_hybrid_w4 import quantized_fields
+
+        _, dims, types = read_config(checkpoint / "config.json", 256, 64)
+        fields = schemas(dims)
+        for owner, prefix in [("head", "")] + [
+            (kind, f"{PREFIX}layers.{i}.") for i, kind in enumerate(types)
+        ]:
+            for field, (n, k) in quantized_fields(fields[owner]).values():
+                tensor = weights[prefix + field]
+                for start in range(0, n, 1024):
+                    slab = tensor[start : start + 1024]
+                    q, scales = k3_w4.quantize_q4(slab.numpy().T)
+                    slab.copy_(
+                        torch.from_numpy(k3_w4.dequantize_q4(q, scales).T)
+                    )
     embed = weights[PREFIX + "embed_tokens.weight"]
     final_norm = operators["Qwen3_5RMSNorm"](d.hidden_size, d.rms_norm_eps)
     final_norm.load_state_dict({"weight": weights[PREFIX + "norm.weight"]})
@@ -289,7 +315,11 @@ def reference(spec, checkpoint, dtype, rows, steps, whole_prefill=False):
             token_ids[p : p + block], f"prefill{p // block}", p + block >= rows
         )
     for i in range(steps - 1):
-        forward(tokens[-1:], f"decode{i}", True)
+        forward(
+            tokens[-1:] if replay is None else replay[i : i + 1],
+            f"decode{i}",
+            True,
+        )
     snapshots["tokens"] = torch.tensor(tokens, dtype=torch.int64)
     return snapshots
 
@@ -299,7 +329,12 @@ if __name__ == "__main__":
     parser.add_argument("--spec", required=True, type=Path)
     parser.add_argument("--checkpoint", required=True, type=Path)
     parser.add_argument("--fixture", action="store_true")
+    parser.add_argument(
+        "--tile-fixture",
+        action="store_true",
+        help="generate the K3-compatible 128-wide checkpoint",
+    )
     args = parser.parse_args()
     torch.set_num_threads(2)
-    if args.fixture:
-        fixture(args.spec, args.checkpoint)
+    if args.fixture or args.tile_fixture:
+        fixture(args.spec, args.checkpoint, args.tile_fixture)

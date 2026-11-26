@@ -313,12 +313,13 @@ static void growPool(int n) {
 // code is unmapped.
 __attribute__((destructor)) static void stopPool(void) {
   profReport();
-  if (poolSize < 2)
-    return;
   atomic_store_explicit(&quitting, 1, memory_order_relaxed);
   atomic_fetch_add_explicit(&jobGeneration, 1, memory_order_release);
   for (int i = 1; i < poolSize; i++)
     pthread_join(poolThreads[i], NULL);
+  free(poolThreads);
+  free(poolStart);
+  free(poolCpus);
   poolSize = 0;
 }
 

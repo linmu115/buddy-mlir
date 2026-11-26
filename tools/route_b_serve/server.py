@@ -171,7 +171,7 @@ class Engine:
         command = {
             "cmd": "submit",
             "req_id": request_id,
-            "prompt": prompt,
+            ("chat" if isinstance(prompt, dict) else "prompt"): prompt,
             "max_new_tokens": max_tokens,
         }
         with self.lock:
@@ -258,6 +258,7 @@ class Gateway(ThreadingHTTPServer):
     def __init__(self, address, engine, manifest, vocab):
         super().__init__(address, Handler)
         self.engine = engine
+        self.manifest = manifest
         self.model = manifest["model_id"]
         self.vocab = vocab
         self.stop = {manifest["eos_id"], *manifest.get("stop_token_ids", [])}
@@ -326,19 +327,45 @@ class Handler(BaseHTTPRequestHandler):
         messages = payload.get("messages")
         if not isinstance(messages, list):
             raise ValueError("messages must be an array")
-        prompt = next(
-            (
-                item.get("content")
-                for item in reversed(messages)
-                if isinstance(item, dict) and item.get("role") == "user"
-            ),
-            None,
-        )
-        if not isinstance(prompt, str) or not prompt.strip():
-            raise ValueError("Expected a non-empty last user message")
-        # Reject JSON scalar escapes for isolated surrogates before writing
-        # the request to the engine's UTF-8 JSON parser.
-        prompt.encode("utf-8")
+        if self.server.manifest.get("tokenizer_assets"):
+            options = payload.get("chat_template_kwargs", {})
+            if not isinstance(options, dict):
+                raise ValueError("chat_template_kwargs must be an object")
+            thinking = payload.get(
+                "enable_thinking", options.get("enable_thinking", True)
+            )
+            if type(thinking) is not bool:
+                raise ValueError("enable_thinking must be boolean")
+            if not messages or not all(
+                isinstance(item, dict) for item in messages
+            ):
+                raise ValueError("messages must be a nonempty array of objects")
+            json.dumps(messages, ensure_ascii=False).encode("utf-8")
+            prompt = {"messages": messages, "enable_thinking": thinking}
+            for key in (
+                "reasoning_effort",
+                "preserve_thinking",
+                "add_vision_id",
+            ):
+                if key in options:
+                    prompt[key] = options[key]
+            for key in ("reasoning_effort", "tools"):
+                if key in payload:
+                    prompt[key] = payload[key]
+        else:
+            prompt = next(
+                (
+                    item.get("content")
+                    for item in reversed(messages)
+                    if isinstance(item, dict) and item.get("role") == "user"
+                ),
+                None,
+            )
+            if not isinstance(prompt, str) or not prompt.strip():
+                raise ValueError("Expected a non-empty last user message")
+            # Reject JSON scalar escapes for isolated surrogates before writing
+            # the request to the engine's UTF-8 JSON parser.
+            prompt.encode("utf-8")
         max_tokens = payload.get("max_tokens", 0)
         if (
             type(max_tokens) is not int
