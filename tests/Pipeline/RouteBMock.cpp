@@ -47,10 +47,17 @@ int layer(const BJ47WeightsV1 *w, const float *in, float *k, float *v,
   if (std::getenv("CHECK_ROUTE_B_KV") && frame->cache_position &&
       (k[0] != global + 1 || v[0] != global + 2))
     return -3;
+  // Tag each frame at its source and check the tag across every layer/rank.
+  // Reusing a still-pending send buffer can deliver a later frame's tag.
+  const bool checkFrame = std::getenv("CHECK_ROUTE_B_FRAME");
+  if (checkFrame && global && in[rows * 16 - 1] != frame->cache_position)
+    return -5;
   ++calls;
   k[frame->cache_position] = global + 1;
   v[frame->cache_position] = global + 2;
   std::fill_n(out, rows * 16, float(global + 1));
+  if (checkFrame)
+    out[rows * 16 - 1] = float(frame->cache_position);
   return 0;
 }
 int head(const float *in, float *out, int token) {

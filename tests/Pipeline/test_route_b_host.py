@@ -106,12 +106,14 @@ def fixture(root):
     return index
 
 
-def run(cmd, error=None, env=None):
+def run(cmd, error=None, env=None, diagnostic=None):
     p = subprocess.run(cmd, capture_output=True, text=True, timeout=20, env=env)
     if (p.returncode != 0) != (error is not None) or (
         error and error not in p.stderr + p.stdout
     ):
         raise AssertionError((cmd, p.returncode, p.stderr, p.stdout))
+    if diagnostic and diagnostic not in p.stderr:
+        raise AssertionError((cmd, diagnostic, p.stderr))
     return p.stdout
 
 
@@ -194,16 +196,78 @@ with tempfile.TemporaryDirectory() as directory:
         run([*part, "verify"], "weight digest")
     else:
 
-        def cli(path=manifest):
+        def cli(path=manifest, prompt="hello", limit="18"):
             return [
                 BUILD / "buddy-pp-route-b",
                 "--bundle",
                 path,
                 "--prompt",
-                "hello",
+                prompt,
                 "--total-tokens",
-                "18",
+                limit,
             ]
+
+        if TEST == "mpi_wire":
+            for ranks in (1, 2, 4, 8):
+                ranges = ",".join(
+                    f"{i * 28 // ranks}:{(i + 1) * 28 // ranks}"
+                    for i in range(ranks)
+                )
+                for wire in ("f32", "f16"):
+                    for transport in ("blocking", "async"):
+                        out = run(
+                            [
+                                MPI,
+                                "-n",
+                                str(ranks),
+                                *cli(prompt="x" + " x" * 85, limit="128"),
+                                "--ranges",
+                                ranges,
+                                "--wire",
+                                wire,
+                                "--transport",
+                                transport,
+                            ],
+                            env=dict(
+                                os.environ,
+                                BUDDY_PP_TEST_EOS_STEP="3",
+                                CHECK_ROUTE_B_FRAME="1",
+                            ),
+                            diagnostic=(
+                                f"transport={transport} requested_wire="
+                                f"{'native' if wire == 'f32' else 'f16'} "
+                                f"effective_wire={wire if ranks > 1 else 'none'}"
+                            ),
+                        )
+                        result = json.loads(out)
+                        assert 64 < result["prompt_tokens"] < 126, result
+                        assert result["token_ids"] == [42, 43, 43], result
+            for opt, value, error in (
+                ("--wire", "f16", "pp_wire_dtype mismatch"),
+                ("--transport", "async", "pp_transport mismatch"),
+            ):
+                run(
+                    [
+                        MPI,
+                        "-n",
+                        "1",
+                        *cli(),
+                        "--stage-range",
+                        "0:14",
+                        ":",
+                        "-n",
+                        "1",
+                        *cli(),
+                        "--stage-range",
+                        "14:28",
+                        opt,
+                        value,
+                    ],
+                    error,
+                )
+            for opt in ("--wire", "--transport"):
+                run([MPI, "-n", "1", *cli(), opt, "invalid"], opt + " expects")
+            sys.exit(0)
 
         for cuts in (
             [28],

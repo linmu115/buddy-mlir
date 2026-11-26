@@ -83,7 +83,7 @@ The host requires a C++17 compiler, MPI, nlohmann-json and OpenSSL Crypto.
 Use the K3 toolchain and target OpenSSL libraries for a cross build. Set
 `RISCV_MPI_DIR` to the target MPICH prefix. A kernel build can also enable
 `BJ47_ROUTE_B_HOST` to expose the executable target in the same build tree.
-Native host builds with testing enabled include three mock-kernel tests.
+Native host builds with testing enabled include mock-kernel and wire-protocol tests.
 Build the default target before running `ctest --test-dir "$HOST_BUILD"`.
 
 Deploy the index, vocabulary, kernels, shared runtime and weights to the
@@ -97,6 +97,14 @@ opens only the weight blobs belonging to its current range plus RoPE.
 mpiexec -n 2 buddy-pp-route-b --bundle "$BUNDLE/route-b.json" \
   --ranges 0:14,14:28 --prompt "What is the capital of France?" --total-tokens 128
 ```
+
+The runtime defaults to `--wire f32 --transport blocking`. Select
+`--wire f16` to round hidden activations to binary16 during MPI transfer.
+Each receiver expands them to f32 before running the next layer. Generated
+tokens may change. All ranks must agree on both flags. With
+`--transport async`, MPI sends own their buffers. On two ranks, set
+`BUDDY_PP_COMPLETE_PREFILL_SEND=1` to complete each multi-row send before
+the next chunk when using software MPI progress.
 
 For a new request, restart with `--ranges 0:16,16:28`. Each process starts
 with empty persistent KV for its new range. In MPMD jobs supply a single

@@ -156,6 +156,12 @@ class TemplateStage final : public Stage {
       checked(p.embed(table, ids, out), 0, "embed");
       in = out;
       out = b.data();
+    } else if (reinterpret_cast<uintptr_t>(in) %
+               decoder.info->required_alignment) {
+      // Transport-owned receive buffers only promise float alignment.
+      // Use the spare aligned buffer as input to the first local layer.
+      std::copy_n(in, size_t(rows) * cfg.activationWidth, b.data());
+      in = b.data();
     }
     for (int i = cfg.startLayer; i < cfg.endLayer; ++i) {
       auto &l = layers[i - cfg.startLayer];

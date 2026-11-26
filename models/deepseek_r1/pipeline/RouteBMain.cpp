@@ -9,6 +9,8 @@ void run(int argc, char **argv, int rank, int size) {
   RunConfig cfg;
   cfg.maxNewTokens = 0;
   std::string bundle;
+  auto wire = pipeline::WireDtype::Native; // Route B computes in f32.
+  auto transport = pipeline::Transport::Blocking;
   bool verify = false;
   std::optional<std::string> list, single;
   for (int i = 1; i < argc; ++i) {
@@ -28,7 +30,21 @@ void run(int argc, char **argv, int rank, int size) {
       single = val;
     else if (opt == "--prompt")
       cfg.prompt = val;
-    else if (opt == "--total-tokens") {
+    else if (opt == "--wire") {
+      if (val == "f32")
+        wire = pipeline::WireDtype::Native;
+      else if (val == "f16")
+        wire = pipeline::WireDtype::F16;
+      else
+        throw std::invalid_argument("--wire expects f32 or f16");
+    } else if (opt == "--transport") {
+      if (val == "blocking")
+        transport = pipeline::Transport::Blocking;
+      else if (val == "async")
+        transport = pipeline::Transport::Async;
+      else
+        throw std::invalid_argument("--transport expects blocking or async");
+    } else if (opt == "--total-tokens") {
       auto [end, ec] = std::from_chars(val.data(), val.data() + val.size(),
                                        cfg.maxNewTokens);
       if (ec != std::errc{} || end != val.data() + val.size() ||
@@ -57,6 +73,8 @@ void run(int argc, char **argv, int rank, int size) {
   b.config.startLayer = b.spec.startLayer = range.first;
   b.config.endLayer = b.spec.endLayer = range.second;
   pipeline::StageCheckOptions check;
+  check.wireDtype = b.spec.wireDtype = wire;
+  check.transport = b.spec.transport = transport;
   check.modelName = planIdentity;
   check.requireModelName = true;
   pipeline::checkAllStages(MPI_COMM_WORLD, rank, size, b.config, check);

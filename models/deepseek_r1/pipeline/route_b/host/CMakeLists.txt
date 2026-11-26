@@ -36,7 +36,7 @@ if(BUILD_TESTING AND NOT RISCV_MPI_DIR)
   target_include_directories(route_b_mock_incomplete PRIVATE "${repo}/runtime/include")
   add_executable(route_b_local "${tests}/RouteBLocal.cpp")
   target_link_libraries(route_b_local PRIVATE route_b_stage)
-  foreach(test storage_and_dso local_stage mpi_ranges)
+  foreach(test storage_and_dso local_stage mpi_ranges mpi_wire)
     add_test(NAME test_route_b_${test} COMMAND "${Python3_EXECUTABLE}"
       "${tests}/test_route_b_host.py" "${test}" "${CMAKE_CURRENT_BINARY_DIR}" "${MPIEXEC_EXECUTABLE}")
     set_tests_properties(test_route_b_${test} PROPERTIES TIMEOUT 180)

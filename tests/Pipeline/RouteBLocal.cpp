@@ -28,10 +28,11 @@ int main(int argc, char **argv) {
           return 7;
       }
       alignas(64) std::array<int64_t, 64> ids{};
-      alignas(64) std::array<float, 64 * 16> hidden;
+      alignas(64) std::array<float, 64 * 16 + 1> hidden;
       hidden.fill(float(range.first));
-      void *input =
-          range.first ? static_cast<void *>(hidden.data()) : ids.data();
+      void *input = range.first
+                        ? static_cast<void *>(hidden.data() + repeat % 2)
+                        : ids.data();
       const float *result =
           static_cast<const float *>(stage->prefillChunk(input, 0, true));
       bool last = range.second == b.config.totalLayers;
