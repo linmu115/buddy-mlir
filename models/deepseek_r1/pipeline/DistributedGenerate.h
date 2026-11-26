@@ -129,41 +129,43 @@ inline bool isStopToken(int token, int eosId,
 inline int tokenizePrompt(const std::string &prompt,
                           const std::string &vocabPath, int context,
                           TokenizerKind tokenizer,
-                          std::vector<int64_t> &tokenInput) {
+                          std::vector<int64_t> &tokenInput,
+                          buddy::Text<size_t, 2> *text = nullptr) {
   if (context <= 0)
     throw std::runtime_error("field context must be positive (got " +
                              std::to_string(context) + ")");
   if (vocabPath.empty())
     throw std::runtime_error("field vocab_uri missing on first stage");
+  if (tokenizer == TokenizerKind::Qwen3 && prompt.empty())
+    throw std::runtime_error("field prompt must be non-empty");
+  if (tokenizer == TokenizerKind::DeepSeekR1 &&
+      (prompt.empty() || prompt.front() == ' '))
+    throw std::runtime_error("field prompt must be non-empty and start with "
+                             "a non-space character");
 
-  buddy::Text<size_t, 2> text(prompt);
-  if (tokenizer == TokenizerKind::Qwen3) {
-    if (prompt.empty())
-      throw std::runtime_error("field prompt must be non-empty");
-    // Match whole-model Qwen3VLMoeRunner (Text::tokenizeQwen3). Pass at least
-    // 2*prompt.size()+8 so prompts exceeding `context` are rejected cleanly
-    // instead of being silently truncated before the 5-token assistant suffix.
-    text.tokenizeQwen3(vocabPath, std::max<size_t>(static_cast<size_t>(context),
-                                                   2 * prompt.size() + 8));
-  } else {
-    if (prompt.empty() || prompt.front() == ' ')
-      throw std::runtime_error("field prompt must be non-empty and start with "
-                               "a non-space character");
-    // Space is mapped to a two-byte character. Allow the chat markers too
-    // so the tokenizer can report a too-long prompt before the model runs.
-    text.tokenizeDeepSeekR1(
-        vocabPath,
-        std::max<size_t>(static_cast<size_t>(context), 2 * prompt.size() + 6));
+  std::optional<buddy::Text<size_t, 2>> local;
+  if (!text) {
+    local.emplace("");
+    local->loadVocab(vocabPath);
+    text = &*local;
   }
 
-  if (text.getTokenCnt() == 0)
+  // Allow for the byte-level space mapping and chat markers. The tokenizer
+  // can then report the true prompt length instead of truncating to context.
+  const size_t capacity = std::max<size_t>(context, 2 * prompt.size() + 8);
+  if (tokenizer == TokenizerKind::Qwen3)
+    text->tokenizeQwen3WithLoadedVocab(prompt, capacity);
+  else
+    text->tokenizeDeepSeekR1WithLoadedVocab(prompt, capacity);
+
+  if (text->getTokenCnt() == 0)
     throw std::runtime_error("field prompt produced zero tokens");
-  if (text.getTokenCnt() > static_cast<size_t>(context))
+  if (text->getTokenCnt() > static_cast<size_t>(context))
     throw std::runtime_error(
-        "tokenized prompt (" + std::to_string(text.getTokenCnt()) +
+        "tokenized prompt (" + std::to_string(text->getTokenCnt()) +
         ") exceeds model context (" + std::to_string(context) + ")");
-  const int promptRows = static_cast<int>(text.getTokenCnt());
-  tokenInput.assign(text.getData(), text.getData() + context);
+  const int promptRows = static_cast<int>(text->getTokenCnt());
+  tokenInput.assign(text->getData(), text->getData() + context);
   return promptRows;
 }
 
@@ -834,7 +836,12 @@ inline constexpr size_t kMaxBatchStreams = 8;
 
 namespace detail {
 using BatchClock = std::chrono::steady_clock;
-enum class BatchActKind : uint32_t { Decode = 1, Shutdown = 2 };
+enum class BatchActKind : uint32_t {
+  Decode = 1,
+  Shutdown = 2,
+  PrefillStart = 3,
+  PrefillChunk = 4
+};
 inline constexpr uint32_t kBatchActMagic = 0x424A3437;
 inline constexpr int kTagBatchAct = 3;
 inline constexpr int kTagBatchCtrl = 4;
@@ -845,6 +852,8 @@ struct BatchActHeader {
   int32_t pos;
   uint32_t wireDtype;
   uint32_t payloadBytes;
+  int32_t rows;
+  int32_t limit;
 };
 struct BatchCtrlReply {
   int32_t slot;
@@ -852,7 +861,7 @@ struct BatchCtrlReply {
   int32_t stop;
   int32_t reserved;
 };
-static_assert(sizeof(BatchActHeader) == 24);
+static_assert(sizeof(BatchActHeader) == 32);
 static_assert(sizeof(BatchCtrlReply) == 16);
 
 struct BatchStream {
@@ -876,7 +885,7 @@ template <typename WireElement> class BatchLink {
       static_cast<uint32_t>(Half ? ActivationType::F16 : ActivationType::F32);
   static constexpr size_t HeaderElements =
       sizeof(BatchActHeader) / sizeof(WireElement);
-  const size_t width;
+  const size_t width, capacity;
   const int frameBytes;
   MPI_Comm comm;
   int rank, last;
@@ -903,32 +912,49 @@ template <typename WireElement> class BatchLink {
 
 public:
   BatchLink(int activationWidth, size_t slots, MPI_Comm comm, int rank,
-            int last)
-      : width(activationWidth), frameBytes(checkedFrameBytes(width)),
-        comm(comm), rank(rank), last(last), sendSlots(rank < last ? slots : 0),
+            int last, int chunkRows = 1)
+      : width(activationWidth), capacity(width * chunkRows),
+        frameBytes(checkedFrameBytes(capacity)), comm(comm), rank(rank),
+        last(last), sendSlots(rank < last ? slots : 0),
         requests(slots, MPI_REQUEST_NULL), ctrlSlots(rank == last ? slots : 0),
-        recvBuffer(rank > 0 ? HeaderElements + width : 0),
-        decoded(rank > 0 && Half ? width : 0) {
+        recvBuffer(rank > 0 ? HeaderElements + capacity : 0),
+        decoded(rank > 0 && Half ? capacity : 0) {
     for (auto &buffer : sendSlots)
-      buffer.resize(HeaderElements + width);
+      buffer.resize(HeaderElements + capacity);
   }
 
-  void sendActivation(int slot, int pos, const void *output) {
+  void sendActivation(int slot, int pos, const void *output, int rows = 1,
+                      BatchActKind kind = BatchActKind::Decode) {
+    const size_t count = width * rows;
+    if (rows < 1 || count > capacity)
+      throw std::logic_error("batch send exceeds activation capacity");
     mpiCheck(MPI_Wait(&requests[slot], MPI_STATUS_IGNORE));
     auto &buffer = sendSlots[slot];
     const BatchActHeader header{
-        kBatchActMagic, BatchActKind::Decode,
+        kBatchActMagic, kind,
         slot,           pos,
-        Dtype,          uint32_t(width * sizeof(WireElement))};
+        Dtype,          uint32_t(count * sizeof(WireElement)),
+        rows,           0};
     std::memcpy(buffer.data(), &header, sizeof(header));
     auto *payload = buffer.data() + HeaderElements;
     const auto *floats = static_cast<const float *>(output);
     if constexpr (Half)
-      encodeInto(floats, width, payload, width);
+      encodeInto(floats, count, payload, count);
     else
-      std::copy_n(floats, width, payload);
-    mpiCheck(MPI_Isend(buffer.data(), frameBytes, MPI_BYTE, rank + 1,
-                       kTagBatchAct, comm, &requests[slot]));
+      std::copy_n(floats, count, payload);
+    mpiCheck(MPI_Isend(buffer.data(), checkedFrameBytes(count), MPI_BYTE,
+                       rank + 1, kTagBatchAct, comm, &requests[slot]));
+  }
+
+  void startPrefill(int slot, int promptRows, int limit, int chunks) {
+    if (rank < last) {
+      const BatchActHeader header{kBatchActMagic, BatchActKind::PrefillStart,
+                                  slot,           promptRows,
+                                  Dtype,          0,
+                                  chunks,         limit};
+      mpiCheck(MPI_Send(&header, sizeof(header), MPI_BYTE, rank + 1,
+                        kTagBatchAct, comm));
+    }
   }
 
   BatchActHeader receiveActivation(size_t slots) {
@@ -943,21 +969,30 @@ public:
     std::memcpy(&header, recvBuffer.data(), sizeof(header));
     if (header.magic != kBatchActMagic || header.wireDtype != Dtype)
       throw std::runtime_error("invalid batch activation header");
-    if (header.kind == BatchActKind::Shutdown) {
+    if (header.kind != BatchActKind::Shutdown &&
+        (header.slot < 0 || size_t(header.slot) >= slots))
+      throw std::runtime_error("invalid batch activation slot");
+    if (header.kind == BatchActKind::Shutdown ||
+        header.kind == BatchActKind::PrefillStart) {
       if (bytes != static_cast<int>(sizeof(header)) || header.payloadBytes != 0)
-        throw std::runtime_error("invalid batch shutdown frame");
-    } else if (header.kind != BatchActKind::Decode || header.slot < 0 ||
-               size_t(header.slot) >= slots || bytes != frameBytes ||
-               header.payloadBytes != width * sizeof(WireElement)) {
-      throw std::runtime_error("invalid batch decode frame");
+        throw std::runtime_error("invalid batch control frame");
+    } else {
+      const size_t count = width * header.rows;
+      if (header.rows < 1 || count > capacity ||
+          (header.kind != BatchActKind::PrefillChunk &&
+           (header.kind != BatchActKind::Decode || header.rows != 1)) ||
+          bytes != checkedFrameBytes(count) ||
+          header.payloadBytes != count * sizeof(WireElement) || header.limit)
+        throw std::runtime_error("invalid batch activation frame");
     }
     return header;
   }
 
-  void *activationData() {
+  void *activationData(int rows = 1) {
     auto *payload = recvBuffer.data() + HeaderElements;
     if constexpr (Half) {
-      decodeInto(payload, width, decoded.data(), width);
+      const size_t count = width * rows;
+      decodeInto(payload, count, decoded.data(), count);
       return decoded.data();
     } else {
       // TemplateStage copies unaligned input into its aligned scratch buffer.
@@ -988,12 +1023,16 @@ public:
     return reply;
   }
 
-  void drainAndShutdown() {
+  void drain() {
     mpiCheck(MPI_Waitall(static_cast<int>(requests.size()), requests.data(),
                          MPI_STATUSES_IGNORE));
+  }
+
+  void drainAndShutdown() {
+    drain();
     if (rank < last) {
       const BatchActHeader header{
-          kBatchActMagic, BatchActKind::Shutdown, -1, 0, Dtype, 0};
+          kBatchActMagic, BatchActKind::Shutdown, -1, 0, Dtype, 0, 0, 0};
       mpiCheck(MPI_Send(&header, sizeof(header), MPI_BYTE, rank + 1,
                         kTagBatchAct, comm));
     }
@@ -1036,6 +1075,15 @@ inline const void *decodeBatchSlot(const DistributedGenerateOptions &opts,
   return stage.decodeData(input, stream.pos);
 }
 
+[[noreturn]] inline void abortBatch(MPI_Comm comm, int rank, const char *phase,
+                                    const char *what) {
+  // Abort before destroying buffers which MPI may still own.
+  std::fprintf(stderr, "rank %d %s: %s\n", rank, phase, what);
+  std::fflush(stderr);
+  MPI_Abort(comm, 1);
+  std::abort();
+}
+
 inline int64_t batchElapsedUs(BatchClock::time_point start) {
   return std::chrono::duration_cast<std::chrono::microseconds>(
              BatchClock::now() - start)
@@ -1057,8 +1105,8 @@ int64_t decodeBatch(const DistributedGenerateOptions &opts, Stage &stage,
         if (frame.kind == BatchActKind::Shutdown)
           break;
         auto &stream = streams[frame.slot];
-        if (stream.done || frame.pos != stream.pos ||
-            stream.pos >= config.context)
+        if (frame.kind != BatchActKind::Decode || stream.done ||
+            frame.pos != stream.pos || stream.pos >= config.context)
           throw std::runtime_error("unexpected batch slot position");
         const auto *output = decodeBatchSlot(opts, stage, rank, frame.slot,
                                              stream, link.activationData());
@@ -1132,10 +1180,9 @@ int64_t decodeBatch(const DistributedGenerateOptions &opts, Stage &stage,
     link.drainAndShutdown();
     return elapsed;
   } catch (const std::exception &e) {
-    // Abort before destroying buffers which MPI may still own.
-    std::fprintf(stderr, "rank %d batch decode: %s\n", rank, e.what());
-    MPI_Abort(comm, 1);
-    std::abort();
+    abortBatch(comm, rank, "batch decode", e.what());
+  } catch (...) {
+    abortBatch(comm, rank, "batch decode", "unknown exception");
   }
 }
 
@@ -1204,6 +1251,7 @@ inline void generateDistributedBatch(const DistributedGenerateOptions &opts,
     if (!opts.logitsDumpPath.empty() && opts.logitsDumpPath != "-")
       prefillOpts.logitsDumpPath += ".slot" + std::to_string(slot);
 
+    stage.clearSlot(static_cast<int>(slot));
     stage.setActiveSlot(static_cast<int>(slot));
     generatePrepared<true>(prefillOpts, stage, comm, rank, ranks,
                            stream.promptRows, 1, input, &stream.prefill);

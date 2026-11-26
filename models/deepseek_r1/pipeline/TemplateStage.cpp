@@ -24,15 +24,17 @@ size_t product(std::initializer_list<size_t> dims) {
 }
 struct Buffer {
   std::unique_ptr<float, decltype(&free)> ptr{nullptr, free};
+  size_t bytes = 0;
   void allocate(size_t elements, bool zero = false) {
-    size_t bytes = product({elements, sizeof(float)});
+    bytes = product({elements, sizeof(float)});
     void *p = nullptr;
     if (posix_memalign(&p, 64, bytes))
       throw std::bad_alloc();
     ptr.reset(static_cast<float *>(p));
     if (zero)
-      std::memset(p, 0, bytes);
+      clear();
   }
+  void clear() { std::memset(ptr.get(), 0, bytes); }
   float *data() const { return ptr.get(); }
 };
 struct Mapping {
@@ -108,6 +110,7 @@ struct Layer {
 };
 class TemplateStage final : public Stage {
   StageConfig cfg;
+  Library::Handle runtime{nullptr, dlclose};
   Library decoder, embed, head;
   Phase pre{}, dec{};
   std::vector<std::unique_ptr<Mapping>> mappings;
@@ -193,6 +196,14 @@ public:
       throw std::invalid_argument("invalid local layer range");
     cfg.startLayer = start;
     cfg.endLayer = end;
+    if (!bundle.runtimeDigest.empty()) {
+      verifyFileDigest(bundle.runtime, bundle.runtimeDigest, "runtime");
+      // Load the verified SONAME before opening template dependencies, even
+      // when the launcher supplied additional library search paths.
+      runtime.reset(dlopen(bundle.runtime.c_str(), RTLD_LOCAL | RTLD_NOW));
+      if (!runtime)
+        throw std::runtime_error(bundle.runtime.string() + ": " + dlerror());
+    }
     decoder.open(bundle, "decoder_layer", 2);
     auto weights = [&](const char *owner, int id, const Library &lib) {
       return BJ47WeightsV1{
@@ -250,10 +261,20 @@ public:
   }
   const StageConfig &configuration() const override { return cfg; }
   int maxSlots() const override { return slots; }
-  void setActiveSlot(int slot) override {
+  void checkSlot(int slot) const {
     if (slot < 0 || slot >= slots)
       throw std::out_of_range("Route B KV slot");
+  }
+  void setActiveSlot(int slot) override {
+    checkSlot(slot);
     activeSlot = slot;
+  }
+  void clearSlot(int slot) override {
+    checkSlot(slot);
+    for (auto &layer : layers) {
+      layer.k[slot].clear();
+      layer.v[slot].clear();
+    }
   }
   const uint16_t *prefill(void *) override {
     throw std::logic_error("Route B requires f32");

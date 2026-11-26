@@ -26,12 +26,16 @@ struct TemplateBundle {
   std::string id, shape, model;
   int kvHeads, headDim;
   StageManifest spec{};
-  std::filesystem::path vocab;
+  std::filesystem::path vocab, runtime;
+  std::string vocabDigest, runtimeDigest;
+  void verifyVocab() const;
   std::map<std::string, TemplateEntry> kernels;
   std::map<std::tuple<std::string, int, std::string>, WeightEntry> weights;
   static TemplateBundle load(const std::filesystem::path &index);
 };
 std::string contentDigest(const void *data, size_t bytes);
+void verifyFileDigest(const std::filesystem::path &path,
+                      const std::string &digest, const char *role);
 std::string hexDigest(const uint8_t *bytes);
 std::vector<LayerRange> parseRanges(const std::string &text, int total,
                                     bool full);

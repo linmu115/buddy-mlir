@@ -149,3 +149,56 @@ Kernel files are small enough to check their complete SHA-256 before
 dlopen on every launch. To recheck the contents of every local weight
 mapping, add `--verify-weights`. This touches all its pages and is excluded
 from hot-restart and residency measurements.
+
+### Resident MPI and HTTP serving
+
+Build the host target against the existing bundle. Each rank loads its
+assigned templates and weights once. Rank 0 checks the vocabulary digest
+when present and keeps the tokenizer vocabulary loaded between requests. Each
+rank checks its loaded template DSOs and the bundle
+runtime digest when present.
+
+```sh
+cmake --build "$HOST_BUILD" --target buddy-pp-route-b-serve
+mpiexec -n 2 buddy-pp-route-b-serve --bundle "$BUNDLE/route-b.json" \
+  --ranges 0:16,16:28 --wire f16 --serve --slots 2
+```
+
+Rank 0 reads JSONL on stdin. Wait for `ready`, then send one command per line.
+The default is two KV slots, with one to eight supported. A submit with
+`total_tokens` uses the same limit as the offline CLI. A submit with
+`max_new_tokens` counts generated tokens, including the first prefill sample.
+Omit the limit or pass zero to use the remaining context.
+
+```jsonl
+{"cmd":"submit","req_id":"a","prompt":"Why does ice float?","max_new_tokens":64}
+{"cmd":"submit","req_id":"b","prompt":"为什么天空是蓝色的？","total_tokens":128}
+{"cmd":"shutdown"}
+```
+
+Each request emits `accepted`, one or more `token` events, then `done`.
+Invalid input emits `error`. Token step zero is the prefill sample. TTFT in
+each token event starts at receipt of the complete command and includes queue
+time. Engine event timestamps use the rank-0 monotonic clock. When a request
+can be admitted, rank 0 drains already sent Decode frames before forwarding
+PrefillStart. Each rank clears the selected KV slot before forwarding prompt
+frames. Surviving requests resume Decode alongside the admitted request.
+Shutdown and EOF finish the accepted and queued work, then close all ranks.
+
+The standard-library gateway owns the MPI process and takes its launch
+arguments directly. Build or install the host first, then use
+`python3 tools/route_b_serve/server.py --help` for launcher flags. K3 mode
+takes an absolute MPICH launcher, rank-ordered 1G `end0` addresses and the
+board's VLEN probe. It selects the AI cores in each rank process and uses
+TCP with NODELAY and eight compute threads. The gateway binds to loopback
+by default. `GET /health` includes rank PIDs, VmRSS and VmHWM. It reads local
+rank memory from `/proc` and uses the same SSH host addresses for other K3
+ranks.
+
+Use `GET /v1/models` to discover the served model and
+`POST /v1/chat/completions` with the last user message, optional `max_tokens`
+and `stream`. SSE deltas preserve UTF-8 across token boundaries. An
+incomplete codepoint at the output limit is omitted. Set
+`"route_b_metrics": true` to include a Route B event with each step, even
+when the UTF-8 decoder is waiting for a complete character. For a streaming
+terminal session, run `python3 tools/route_b_serve/stream_chat.py`.

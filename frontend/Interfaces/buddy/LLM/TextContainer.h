@@ -85,6 +85,10 @@ public:
   // Qwen3 Tokenizer
   // This function is designed for tokenizing input text for Qwen3 models.
   void tokenizeQwen3(const std::string &vocab, size_t length);
+  // Reuse a vocabulary previously read by loadVocab() across prompts.
+  void tokenizeDeepSeekR1WithLoadedVocab(const std::string &prompt,
+                                         size_t length);
+  void tokenizeQwen3WithLoadedVocab(const std::string &prompt, size_t length);
   // Qwen3-VL Tokenizer
   // Tokenizes the free-form prompt text with the same byte-level BPE encoder
   // as tokenizeQwen3(), and wraps it in the fixed single-image chat-template
@@ -127,6 +131,8 @@ public:
   void loadVocab(const std::string &token);
 
 private:
+  void prepareTokenBuffer(size_t length);
+
   // Check if a char is component of multi-bytes string.
   // Using lookup table to determine the number of bytes of a character.
   // If the number of bytes is 1, return false(0), otherwise return the
@@ -447,15 +453,29 @@ void Text<T, N>::tokenizeStableDiffusion(const std::string &vocab,
 
 // DeepSeekR1 Tokenizer
 template <typename T, size_t N>
-void Text<T, N>::tokenizeDeepSeekR1(const std::string &vocab, size_t length) {
-  // Initialize MemRef container members.
+void Text<T, N>::prepareTokenBuffer(size_t length) {
+  if (idToTokenVec.empty())
+    throw std::runtime_error("tokenizer vocabulary is empty");
+  this->releaseAllocatedStorage();
   this->offset = 0;
   this->sizes[0] = 1;
   this->sizes[1] = length;
   this->setStrides();
-  size_t size = this->product(this->sizes);
-  this->allocated = (T *)malloc(sizeof(T) * size);
-  this->aligned = this->allocated;
+  this->allocateStorage(length, MemRefAllocationKind::Malloc);
+  if (!this->allocated)
+    throw std::bad_alloc();
+}
+
+template <typename T, size_t N>
+void Text<T, N>::tokenizeDeepSeekR1(const std::string &vocab, size_t length) {
+  loadVocab(vocab);
+  tokenizeDeepSeekR1WithLoadedVocab(str, length);
+}
+
+template <typename T, size_t N>
+void Text<T, N>::tokenizeDeepSeekR1WithLoadedVocab(const std::string &prompt,
+                                                   size_t length) {
+  prepareTokenBuffer(length);
   this->bos = 151646;
   this->eos = 151643;
   this->pad = 151643;
@@ -468,17 +488,14 @@ void Text<T, N>::tokenizeDeepSeekR1(const std::string &vocab, size_t length) {
   this->aligned[tokenCnt++] = bos;
   this->aligned[tokenCnt++] = userToken;
 
-  // Load Vocab
-  loadVocab(vocab);
-
   // Replace space with Ġ.
   std::string strWithoutSpace;
-  strWithoutSpace.reserve(str.size() * 2);
+  strWithoutSpace.reserve(prompt.size() * 2);
   std::string replace = "Ġ";
-  for (int i = 0; i < (int)str.size(); i++) {
-    if (str[i] != ' ')
-      strWithoutSpace.push_back(str[i]);
-    if (str[i] == ' ' && (i == 0 || str[i - 1] != ' '))
+  for (size_t i = 0; i < prompt.size(); i++) {
+    if (prompt[i] != ' ')
+      strWithoutSpace.push_back(prompt[i]);
+    if (prompt[i] == ' ' && (i == 0 || prompt[i - 1] != ' '))
       strWithoutSpace.append(replace);
   }
 
@@ -544,14 +561,14 @@ void Text<T, N>::tokenizeDeepSeekR1(const std::string &vocab, size_t length) {
 // Qwen3 Tokenizer
 template <typename T, size_t N>
 void Text<T, N>::tokenizeQwen3(const std::string &vocab, size_t length) {
-  // 1. Initialize container members
-  this->offset = 0;
-  this->sizes[0] = 1;
-  this->sizes[1] = length;
-  this->setStrides();
-  size_t size = this->product(this->sizes);
-  this->allocated = (T *)malloc(sizeof(T) * size);
-  this->aligned = this->allocated;
+  loadVocab(vocab);
+  tokenizeQwen3WithLoadedVocab(str, length);
+}
+
+template <typename T, size_t N>
+void Text<T, N>::tokenizeQwen3WithLoadedVocab(const std::string &prompt,
+                                              size_t length) {
+  prepareTokenBuffer(length);
 
   // Standard Special Token IDs for the Qwen series
   this->bos = 151644;
@@ -566,12 +583,8 @@ void Text<T, N>::tokenizeQwen3(const std::string &vocab, size_t length) {
   this->aligned[tokenCnt++] = userToken;
   this->aligned[tokenCnt++] = newlineToken;
 
-  // 2. Load the vocabulary
-  loadVocab(vocab);
-
-  // 3. Core Step: Convert raw UTF-8 string to BPE-encoded string
-  // e.g., converts "你好 😊" to a format like "ä½ å¥½ðŁĺĬ"
-  std::string bpeEncodedStr = this->bytes_to_bpe_string(this->str);
+  // Convert raw UTF-8 to the byte-level BPE alphabet before matching.
+  std::string bpeEncodedStr = this->bytes_to_bpe_string(prompt);
 
   // 4. Tokenization using Dynamic Programming (Forward Pass)
   int n = bpeEncodedStr.length();

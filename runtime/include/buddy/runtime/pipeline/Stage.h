@@ -69,6 +69,7 @@ public:
     if (slot != 0)
       throw std::out_of_range("single-slot stage");
   }
+  virtual void clearSlot(int slot) { (void)slot; }
 };
 
 extern "C" {

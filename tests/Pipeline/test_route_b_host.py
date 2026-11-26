@@ -3,11 +3,13 @@
 import hashlib
 import json
 import os
+import queue
 import shutil
 import struct
 import subprocess
 import sys
 import tempfile
+import threading
 from pathlib import Path
 
 TEST, BUILD, MPI = sys.argv[1:]
@@ -117,12 +119,309 @@ def run(cmd, error=None, env=None, diagnostic=None):
     return p.stdout
 
 
+class Resident:
+    def __init__(self, cmd, env):
+        self.log = []
+        self.events = queue.Queue()
+        self.stderr = tempfile.TemporaryFile(mode="w+t")  # noqa: SIM115
+        self.proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=self.stderr,
+            text=True,
+            encoding="utf-8",
+            env=env,
+        )
+        self.reader = threading.Thread(target=self.read, daemon=True)
+        self.reader.start()
+
+    def read(self):
+        for line in self.proc.stdout:
+            self.events.put(line)
+        self.events.put(None)
+
+    def send(self, **event):
+        self.proc.stdin.write(json.dumps(event) + "\n")
+        self.proc.stdin.flush()
+
+    def submit(self, key, prompt, **limit):
+        self.send(cmd="submit", req_id=key, prompt=prompt, **limit)
+
+    def until(self, predicate):
+        while True:
+            line = self.events.get(timeout=15)
+            if line is None:
+                self.stderr.seek(0)
+                raise AssertionError(self.stderr.read())
+            event = json.loads(line)
+            self.log.append(event)
+            if predicate(event):
+                return event
+
+    def done(self, key):
+        return self.until(lambda e: e["event"] == "done" and e["req_id"] == key)
+
+    def sequences(self, refs, keys):
+        for key in keys:
+            tokens = [
+                e
+                for e in self.log
+                if e["event"] == "token" and e["req_id"] == key
+            ]
+            assert [e["token_id"] for e in tokens] == refs[key], (key, tokens)
+            assert [e["step"] for e in tokens] == list(range(len(tokens)))
+            assert [e["is_prefill"] for e in tokens] == [True] + [False] * (
+                len(tokens) - 1
+            )
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, *_):
+        try:
+            if exc_type is None:
+                self.send(cmd="shutdown")
+                assert self.proc.wait(timeout=15) == 0
+            else:
+                self.proc.kill()
+                self.proc.wait()
+        finally:
+            if self.proc.poll() is None:
+                self.proc.kill()
+                self.proc.wait()
+            self.reader.join(timeout=5)
+            self.proc.stdin.close()
+            self.proc.stdout.close()
+            self.stderr.close()
+
+
+def test_resident(root, manifest, index):
+    env = dict(
+        os.environ,
+        CHECK_ROUTE_B_BATCH="1",
+        CHECK_ROUTE_B_FRAME="1",
+        CHECK_ROUTE_B_SERVE="1",
+    )
+    # A has the shortest decode. B and C cover multi-frame/overlapped prefill.
+    prompts = {
+        "A": "hello" + " x" * 17,
+        "B": "hello" + " x" * 72,
+        "C": "hello" + " x" * 89,
+    }
+    limits = {"A": 18, "B": 30, "C": 7}
+    index["vocab_sha256"] = hashlib.sha256(
+        (root / "vocab.txt").read_bytes()
+    ).hexdigest()
+    runtime = root / "libbj47_kernel_runtime.so"
+    shutil.copy(BUILD / "libroute_b_mock_1.so", runtime)
+    index["runtime_sha256"] = hashlib.sha256(runtime.read_bytes()).hexdigest()
+    save(manifest, index)
+
+    for ranks in (1, 2, 4):
+        ranges = ",".join(
+            f"{i * 28 // ranks}:{(i + 1) * 28 // ranks}" for i in range(ranks)
+        )
+        for wire in ("f32", "f16"):
+            base = [
+                MPI,
+                "-n",
+                str(ranks),
+                BUILD / "buddy-pp-route-b-serve",
+                "--bundle",
+                manifest,
+                "--ranges",
+                ranges,
+                "--wire",
+                wire,
+            ]
+            refs = {}
+            totals = {}
+            for key, prompt in prompts.items():
+                length = json.loads(
+                    run(
+                        [*base, "--prompt", prompt, "--total-tokens", "1"],
+                        env=env,
+                    )
+                )["prompt_tokens"]
+                totals[key] = str(length + limits[key] - 1)
+                refs[key] = json.loads(
+                    run(
+                        [
+                            *base,
+                            "--prompt",
+                            prompt,
+                            "--total-tokens",
+                            totals[key],
+                        ],
+                        env=env,
+                    )
+                )["token_ids"]
+                assert len(refs[key]) == limits[key]
+
+            with Resident([*base, "--serve", "--slots", "1"], env) as server:
+                assert (
+                    server.until(lambda e: e["event"] == "ready")["slots"] == 1
+                )
+                server.submit("A", prompts["A"], total_tokens=int(totals["A"]))
+                assert server.done("A")["slot"] == 0
+                server.submit("B", prompts["B"], max_new_tokens=limits["B"])
+                assert server.done("B")["slot"] == 0
+                server.sequences(refs, "AB")
+
+            with Resident([*base, "--serve"], env) as server:
+                server.until(lambda e: e["event"] == "ready")
+                server.submit("A", prompts["A"], max_new_tokens=limits["A"])
+                server.until(lambda e: e["event"] == "token" and e["step"] == 4)
+                server.submit("bad", "x " * 200, max_new_tokens=1)
+                server.proc.stdin.write("{ malformed json\n")
+                server.proc.stdin.flush()
+                server.submit("empty", "")
+                for key in ("bad", "", "empty"):
+                    error = server.until(lambda e: e["event"] == "error")
+                    assert error["req_id"] == key
+                    if key == "bad":
+                        assert "exceeds model context" in error["message"]
+                server.submit("B", prompts["B"], max_new_tokens=limits["B"])
+                server.until(
+                    lambda e: e["event"] == "accepted" and e["req_id"] == "B"
+                )
+                server.done("A")
+                server.done("B")
+                server.sequences(refs, "AB")
+
+            with Resident([*base, "--serve", "--slots", "2"], env) as server:
+                server.until(lambda e: e["event"] == "ready")
+                for key, prompt in prompts.items():
+                    server.submit(key, prompt, max_new_tokens=limits[key])
+                accepted_a = server.until(lambda e: e["event"] == "accepted")
+                accepted_b = server.until(lambda e: e["event"] == "accepted")
+                assert (accepted_a["req_id"], accepted_b["req_id"]) == (
+                    "A",
+                    "B",
+                )
+                assert accepted_a["slot"] != accepted_b["slot"]
+                server.done("A")
+                accepted_c = server.until(lambda e: e["event"] == "accepted")
+                assert (
+                    accepted_c["req_id"] == "C"
+                    and accepted_c["slot"] == accepted_a["slot"]
+                )
+                server.until(
+                    lambda _: (
+                        len([e for e in server.log if e["event"] == "done"])
+                        == 3
+                    )
+                )
+                server.sequences(refs, "ABC")
+
+        original = index["vocab_sha256"]
+        index["vocab_sha256"] = ZERO
+        save(manifest, index)
+        run([*base, "--serve"], "rank 0: vocab digest", env=env)
+        index["vocab_sha256"] = original
+        save(manifest, index)
+        data = runtime.read_bytes()
+        runtime.write_bytes(data + b"tampered")
+        try:
+            run([*base, "--serve"], "runtime digest", env=env)
+        finally:
+            runtime.write_bytes(data)
+        assert (
+            run([*base, "--serve", "--slots", "8"], env=env).count(
+                '"event":"ready"'
+            )
+            == 1
+        )
+
+    # Inject a non-std exception after Prefill and one Decode step. Both
+    # async paths must abort the original communicator with their diagnostic.
+    inject_env = dict(
+        env,
+        CHECK_ROUTE_B_THROW_DECODE_POSITION=str(
+            int(totals["A"]) - limits["A"] + 2
+        ),
+    )
+    distributed = [
+        MPI,
+        "-n",
+        "2",
+        BUILD / "buddy-pp-route-b-serve",
+        "--bundle",
+        manifest,
+        "--ranges",
+        "0:14,14:28",
+        "--wire",
+        "f16",
+    ]
+    run(
+        [
+            *distributed,
+            "--prompt",
+            prompts["A"],
+            "--prompt",
+            prompts["B"],
+            "--total-tokens",
+            totals["A"],
+        ],
+        "batch decode: unknown exception",
+        env=inject_env,
+    )
+    p = subprocess.run(
+        [*distributed, "--serve"],
+        input=json.dumps(
+            {
+                "cmd": "submit",
+                "req_id": "throw",
+                "prompt": prompts["A"],
+                "max_new_tokens": limits["A"],
+            }
+        )
+        + "\n",
+        capture_output=True,
+        text=True,
+        env=inject_env,
+        timeout=20,
+    )
+    assert (
+        p.returncode != 0 and "resident serve: unknown exception" in p.stderr
+    ), p.stderr
+
+    base = [BUILD / "buddy-pp-route-b-serve", "--bundle", manifest]
+    for first, second in (
+        (["--serve"], ["--prompt", "hello"]),
+        (["--serve", "--slots", "1"], ["--serve", "--slots", "2"]),
+    ):
+        run(
+            [
+                MPI,
+                "-n",
+                "1",
+                *base,
+                "--stage-range",
+                "0:14",
+                *first,
+                ":",
+                "-n",
+                "1",
+                *base,
+                "--stage-range",
+                "14:28",
+                *second,
+            ],
+            "field model_name mismatch",
+            env=env,
+        )
+
+
 with tempfile.TemporaryDirectory() as directory:
     root = Path(directory)
     index = fixture(root)
     manifest = root / "index.json"
     local = [BUILD / "route_b_local", manifest]
-    if TEST == "local_stage":
+    if TEST == "mpi_serve":
+        test_resident(root, manifest, index)
+    elif TEST == "local_stage":
         for part in ("0:28", "0:1", "0:7", "2:5", "2:6", "27:28", "22:28"):
             start, end = map(int, part.split(":"))
             run(
@@ -174,7 +473,10 @@ with tempfile.TemporaryDirectory() as directory:
         run(part, "bundle_id")
         save(manifest, index)
         dso = root / "decoder_layer.so"
-        dso.write_bytes(dso.read_bytes()[:-1])
+        original = dso.read_bytes()
+        dso.write_bytes(original[:-1] + bytes([original[-1] ^ 1]))
+        run(part, "kernel digest")
+        dso.write_bytes(original[:-1])
         run(part, "kernel size")
         shutil.copy(BUILD / "libroute_b_mock_1.so", dso)
 

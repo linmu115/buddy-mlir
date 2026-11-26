@@ -1,8 +1,10 @@
 #include "TemplateBundle.h"
+#include <array>
 #include <climits>
 #include <fstream>
 #include <limits>
 #include <nlohmann/json.hpp>
+#include <openssl/evp.h>
 #include <openssl/sha.h>
 #include <set>
 
@@ -58,6 +60,37 @@ std::string contentDigest(const void *data, size_t bytes) {
     throw std::runtime_error("SHA256 failed");
   return hexDigest(digest);
 }
+void verifyFileDigest(const std::filesystem::path &path,
+                      const std::string &digest, const char *role) {
+  std::ifstream stream(path, std::ios::binary);
+  if (!stream)
+    throw std::runtime_error(std::string("cannot open ") + role + ": " +
+                             path.string());
+  std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> ctx(EVP_MD_CTX_new(),
+                                                              EVP_MD_CTX_free);
+  auto check = [](int rc) {
+    if (rc != 1)
+      throw std::runtime_error("SHA256 failed");
+  };
+  if (!ctx)
+    throw std::bad_alloc();
+  check(EVP_DigestInit_ex(ctx.get(), EVP_sha256(), nullptr));
+  std::array<char, 65536> buffer;
+  while (stream.read(buffer.data(), buffer.size()) || stream.gcount())
+    check(EVP_DigestUpdate(ctx.get(), buffer.data(), stream.gcount()));
+  if (stream.bad() || !stream.eof())
+    throw std::runtime_error("cannot read " + path.string());
+  unsigned char result[32];
+  check(EVP_DigestFinal_ex(ctx.get(), result, nullptr));
+  if (hexDigest(result) != digest)
+    throw std::runtime_error(std::string(role) + " digest: " + path.string());
+}
+
+void TemplateBundle::verifyVocab() const {
+  if (!vocabDigest.empty())
+    verifyFileDigest(vocab, vocabDigest, "vocab");
+}
+
 TemplateBundle TemplateBundle::load(const std::filesystem::path &index) {
   std::ifstream stream(index);
   if (!stream)
@@ -106,6 +139,12 @@ TemplateBundle TemplateBundle::load(const std::filesystem::path &index) {
   }
   const auto root = std::filesystem::absolute(index).parent_path();
   b.vocab = file(root, j.at("vocab_file"));
+  if (j.contains("vocab_sha256"))
+    b.vocabDigest = digestField(j, "vocab_sha256");
+  if (j.contains("runtime_sha256")) {
+    b.runtimeDigest = digestField(j, "runtime_sha256");
+    b.runtime = std::filesystem::absolute(root / "libbj47_kernel_runtime.so");
+  }
   const auto &layouts = j.at("layouts");
   const std::map<std::string, std::string> owners{
       {"embed", "embed"}, {"decoder_layer", "decoder"}, {"lm_head", "head"}};
