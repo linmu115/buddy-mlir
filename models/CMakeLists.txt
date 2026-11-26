@@ -29,3 +29,5 @@ endif()
 if(BUDDY_BUILD_YOLOV8_MODEL)
   add_subdirectory(yolov8)
 endif()
+
+add_subdirectory(deepseek_v41)
