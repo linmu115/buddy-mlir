@@ -153,3 +153,21 @@ worker computes the visible Q/K scores before the value accumulation starts.
 This keeps Q out of the online softmax loop. The group size divides the GQA
 ratio and limits live Q lanes. The existing block softmax, tail updates and
 per-head reduction order are preserved.
+
+On K3 with VLEN=1024, the one-row 2048-to-151936 vocabulary projection
+loads each 32-element activation group with four 64-bit scalar loads.
+Four independent widening MAC chains accumulate modulo 65536 before the
+original per-group floating-point scale and FMA. Both head entry points use
+this path when exporting the 30B template, including the last row of prefill.
+
+Decode MoE assigns one selected expert slot to a worker for gate/up and
+hidden-state quantization. A workshare barrier makes all eight slots visible
+before the output tiles accumulate them in slot order. The parallel join
+completes the final workshare. Prefill retains four-row expert blocks, and
+decode attention retains groups of two query heads.
+
+For the 48-layer 24+24 split, the optimized decoder, head and runtime were
+benchmarked together. On the 18+30 split with a 256-token prompt, that
+combination regressed in end-to-end decode. The measured fallback combines
+the optimized head with the Wave-1 decoder and runtime. Package those exact
+libraries together and regenerate their hashes and bundle ID in the manifest.

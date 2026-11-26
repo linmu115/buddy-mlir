@@ -1450,6 +1450,107 @@ def _residual_sum(fn, ty, spec, val, mem, at):
     )
 
 
+def _stream_head_tile(fn, ty, spec, a, tile, row):
+    """VLEN=1024, one row. Fetch four 512-byte banks before the MACs.
+    Four independent i16 partial sums add modulo 65536. Each G32 still
+    updates the f32 accumulator exactly once, in the original group order.
+    """
+    k = spec["k"]
+    w = _addi(
+        memref.ExtractAlignedPointerAsIndexOp(a["w"]).result,
+        memref.ExtractStridedMetadataOp(a["w"]).offset,
+    )
+    w = _addi(w, _muli(tile, fn.idx(tile_bytes(k))))
+    q = _addi(
+        memref.ExtractAlignedPointerAsIndexOp(a["xq"]).result,
+        _muli(row, fn.idx(k)),
+    )
+    s = _addi(
+        memref.ExtractAlignedPointerAsIndexOp(a["xs"]).result,
+        _muli(row, fn.idx(k // G * 4)),
+    )
+    scratch = memref.AllocaOp(
+        _memref([1, NB], ty.f32), [], [], alignment=128
+    ).result
+    out = memref.ExtractAlignedPointerAsIndexOp(scratch).result
+    args = [arith.IndexCastOp(ty.i64, v).result for v in (w, q, s, out)]
+    asm = [
+        "mv t0,$0",
+        "mv t1,$1",
+        "mv t2,$2",
+        f"li t3,{k}",
+        "add t3,t3,t1",
+        "vsetvli t5,zero,e32,m4,ta,ma",
+        "vmv.v.i v0,0",
+        "2:",
+        "vsetvli t5,zero,e8,m1,ta,ma",
+    ]
+    # v0:3 is the persistent sum, v8:23 the packed weights and v24:31
+    # the four widening integer MAC chains. v5 is one signed nibble.
+    for bank in range(4):
+        asm += [
+            f"ld a{bank},{8 * bank}(t1)",
+            f"addi t5,t0,{512 * bank}",
+            f"vl4re8.v v{8 + 4 * bank},(t5)",
+        ]
+    for bank in range(4):
+        for j in range(8):
+            weight = 8 + 4 * bank + j // 2
+            scalar = f"a{bank}"
+            if j:
+                asm.append(f"srli t5,{scalar},{8 * j}")
+                scalar = "t5"
+            if j % 2:
+                asm.append(f"vsra.vi v5,v{weight},4")
+            else:
+                asm.extend([f"vsll.vi v5,v{weight},4", "vsra.vi v5,v5,4"])
+            dot = 24 + 2 * (j % 4)
+            if bank == 0 and j < 4:
+                asm.append(f"vwmul.vx v{dot},v5,{scalar}")
+            else:
+                asm.append(f"vwmacc.vx v{dot},{scalar},v5")
+    asm += [
+        "vsetvli t5,zero,e16,m2,ta,ma",
+        "vadd.vv v24,v24,v26",
+        "vadd.vv v28,v28,v30",
+        "vadd.vv v24,v24,v28",
+        "flw ft0,0(t2)",
+        "addi t0,t0,1024",
+        "addi t0,t0,1024",
+        "vsetvli t5,zero,e16,m2,ta,ma",
+        "vle16.v v16,(t0)",
+        "vfwcvt.f.f.v v20,v16",
+        "vfwcvt.f.x.v v8,v24",
+        "vsetvli t5,zero,e32,m4,ta,ma",
+        "vfmul.vf v20,v20,ft0",
+        "vfmacc.vv v0,v8,v20",
+        "addi t0,t0,256",
+        "addi t1,t1,32",
+        "addi t2,t2,4",
+        "bltu t1,t3,2b",
+        "vse32.v v0,($3)",
+    ]
+    clobbers = [
+        *(f"t{i}" for i in range(7)),
+        *(f"a{i}" for i in range(4)),
+        "ft0",
+        "vl",
+        "vtype",
+        "memory",
+        *(f"v{i}" for i in range(32)),
+    ]
+    llvm.InlineAsmOp(
+        None,
+        args,
+        "\n".join(asm),
+        ",".join(["r"] * 4 + ["~{" + r + "}" for r in clobbers]),
+        has_side_effects=True,
+    )
+    return vector.LoadOp(
+        _vec(NB, ty.f32), scratch, [fn.idx(0), fn.idx(0)]
+    ).result
+
+
 def _tile_fn(ty, spec):
     """One weight tile (NB output columns) for all the rows."""
     m = spec["m"]
@@ -1479,7 +1580,12 @@ def _tile_fn(ty, spec):
                 )
                 vals = [_silu_mul(fn, ty, g, u, NB) for g, u in zip(gate, up)]
             else:
-                vals = _accumulate(fn, ty, spec, a, a["wt"], rows)
+                if spec.get("stream_head"):
+                    vals = [
+                        _stream_head_tile(fn, ty, spec, a, a["wt"], rows[0])
+                    ]
+                else:
+                    vals = _accumulate(fn, ty, spec, a, a["wt"], rows)
                 if spec["bias"]:
                     bias = _read(
                         vf, a["bias"], [a["bcol"]], fn.const(ty.f32, 0.0)
@@ -1810,7 +1916,7 @@ def _moe_fn(ty, spec):
         quantize(x, m, k, xq, xs)
         bufs = [idx, wts, xq, xs, h, hq, hs]
         if m == 1:
-            _moe_decode(fn, ty, spec, items, quantize, expert, wgu, wd, bufs, y)
+            _moe_decode(fn, ty, spec, expert, wgu, wd, bufs, y)
         else:
             _moe_prefill(fn, ty, spec, items, quantize, wgu, wd, bufs, y)
         for buf in bufs + ([xn] if xn is not None else []):
@@ -1946,7 +2052,26 @@ def _moe_route(fn, ty, spec, x, wr, idx, wts):
     memref.DeallocOp(part)
 
 
-def _moe_decode(fn, ty, spec, items, quantize, expert, wgu, wd, bufs, y):
+def _moe_team_work(fn, ty, n, body, nowait=False):
+    """A static workshare inside an existing team. Each iteration has one owner."""
+    attrs = {"operandSegmentSizes": ir.DenseI32ArrayAttr.get([0] * 7)}
+    if nowait:
+        attrs["nowait"] = ir.UnitAttr.get()
+    ws = ir.Operation.create("omp.wsloop", attributes=attrs, regions=1)
+    with ir.InsertionPoint(ws.regions[0].blocks.append()):
+        nest = ir.Operation.create(
+            "omp.loop_nest",
+            operands=[fn.idx(0), fn.idx(n), fn.idx(1)],
+            attributes={"collapse_num_loops": ir.IntegerAttr.get(ty.i64, 1)},
+            regions=1,
+        )
+        block = nest.regions[0].blocks.append(ty.index)
+        with ir.InsertionPoint(block):
+            body(block.arguments[0])
+            ir.Operation.create("omp.yield")
+
+
+def _moe_decode(fn, ty, spec, expert, wgu, wd, bufs, y):
     """_moe_fn for one row."""
     k, inter, kk = spec["k"], spec["inter"], spec["topk"]
     ti, th = inter // NB, k // NB
@@ -1954,9 +2079,7 @@ def _moe_decode(fn, ty, spec, items, quantize, expert, wgu, wd, bufs, y):
     _, wts, xq, xs, h, hq, hs = bufs
     r = fn.idx(0)
 
-    def gate_up(it):
-        j = _divui(it, fn.idx(ti))
-        t = arith.RemUIOp(it, fn.idx(ti)).result
+    def gate_up(j, t):
         tg = _addi(_muli(expert(r, j), fn.idx(2 * ti)), _muli(t, fn.idx(2)))
         a = {"w": wgu, "xq": xq, "xs": xs}
         (g,) = _tile_accumulator(fn, ty, k, a, tg, [r], "expert_gu")
@@ -1967,8 +2090,21 @@ def _moe_decode(fn, ty, spec, items, quantize, expert, wgu, wd, bufs, y):
             _silu_mul(fn, ty, g, u, NB), h, [j, _muli(t, fn.idx(NB))]
         )
 
-    items(kk * ti, gate_up)
-    quantize(h, kk, inter, hq, hs)
+    def produce(j):
+        tiles = scf.ForOp(fn.idx(0), fn.idx(ti), fn.idx(1))
+        with ir.InsertionPoint(tiles.body):
+            gate_up(j, tiles.induction_variable)
+            scf.YieldOp([])
+        groups = scf.ForOp(fn.idx(0), fn.idx(inter // G), fn.idx(1))
+        with ir.InsertionPoint(groups.body):
+            g = groups.induction_variable
+            col = _muli(g, fn.idx(G))
+            xi, scale = _q8_group(
+                fn, ty, vector.LoadOp(_vec(G, ty.f32), h, [j, col]).result
+            )
+            vector.StoreOp(xi, hq, [j, col])
+            memref.StoreOp(scale, hs, [j, g])
+            scf.YieldOp([])
 
     def down(t):
         a = {"w": wd, "xq": hq, "xs": hs}
@@ -1986,7 +2122,18 @@ def _moe_decode(fn, ty, spec, items, quantize, expert, wgu, wd, bufs, y):
             val = _residual_sum(fn, ty, spec, val, res, [r, col])
         vector.StoreOp(val, y, [r, col])
 
-    items(th, down)
+    team = ir.Operation.create(
+        "omp.parallel",
+        operands=[fn.const(ty.i32, spec["threads"])],
+        attributes={
+            "operandSegmentSizes": ir.DenseI32ArrayAttr.get([0, 0, 0, 1, 0, 0])
+        },
+        regions=1,
+    )
+    with ir.InsertionPoint(team.regions[0].blocks.append()):
+        _moe_team_work(fn, ty, kk, produce)
+        _moe_team_work(fn, ty, th, down, nowait=True)
+        ir.Operation.create("omp.terminator")
 
 
 # Prefill MoE: rows of one expert that share each unpacked weight vector.
@@ -3724,7 +3871,9 @@ def _declare(ty, name, types, results=()):
     op.attributes["sym_visibility"] = ir.StringAttr.get("private")
 
 
-def build_kernels(specs, part: str = "main", emulate_ime=False) -> ir.Module:
+def build_kernels(
+    specs, part: str = "main", emulate_ime=False, fixed_vlen=False
+) -> ir.Module:
     """The module of the kernels `specs` (k3_w4_rewrite) describe, in the
     active context; verified. part "main": the kernels, with the RVV tiles
     and declarations of the IME functions; part "ime": the IME tiles, their
@@ -3776,13 +3925,23 @@ def build_kernels(specs, part: str = "main", emulate_ime=False) -> ir.Module:
                 if ime:
                     _declare(ty, f"{s['name']}__tile", _tile_types(ty, s))
                 else:
+                    if (
+                        fixed_vlen
+                        and s["kind"] == "plain"
+                        and s["m"] == 1
+                        and s["k"] == 2048
+                        and s["ns"] == [151936]
+                    ):
+                        s = dict(s, stream_head=True)
                     _tile_fn(ty, s)
     if not module.operation.verify():
         raise RuntimeError("k3_w4: the generated kernels do not verify")
     return module
 
 
-def gen_kernels(specs, part: str = "main", emulate_ime=False) -> str:
+def gen_kernels(
+    specs, part: str = "main", emulate_ime=False, fixed_vlen=False
+) -> str:
     """build_kernels() in a context of its own, as MLIR text."""
     with ir.Context(), ir.Location.unknown():
-        return str(build_kernels(specs, part, emulate_ime))
+        return str(build_kernels(specs, part, emulate_ime, fixed_vlen))
