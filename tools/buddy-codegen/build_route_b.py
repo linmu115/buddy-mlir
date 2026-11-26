@@ -181,9 +181,18 @@ def build(a):
         raw = (src / (captured + "-w4g32.mlir")).read_text()
         driver = (src / ("forward_" + phase + "-w4g32.mlir")).read_text()
         ir, args = subgraph(raw, driver, role, phase, rows, dim)
-        if role == "lm_head" or (role == "decoder_layer" and rows == 1):
+        # Older prefill captures end in a graph residual. A fused MoE
+        # can write directly into the caller's disjoint ping-pong buffer.
+        fused_prefill = re.search(
+            r" = call @k3_moe_m\d+_\w+_res(?:_rhs)?\(", ir
+        )
+        if role == "lm_head" or (
+            role == "decoder_layer" and (rows == 1 or fused_prefill)
+        ):
             ir, kernels["k3_kernels-w4g32"] = final_projection(
-                ir, kernels["k3_kernels-w4g32"]
+                ir,
+                kernels["k3_kernels-w4g32"],
+                1 if role == "lm_head" else rows,
             )
         objs.append(
             compile_ir(
