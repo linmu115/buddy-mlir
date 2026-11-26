@@ -21,6 +21,43 @@ ROOT = Path(__file__).resolve().parents[2]
 SRC = ROOT / "models/deepseek_r1/pipeline/route_b"
 
 
+def elide_final_workshare_barriers(path):
+    """A bare final workshare is joined by its enclosing parallel region."""
+    source = path.read_text()
+    if "omp.wsloop" not in source:
+        return
+    try:
+        from buddy_mlir import ir
+    except ModuleNotFoundError as exc:
+        if exc.name != "buddy_mlir":
+            raise
+        # Binary-only toolchains can still lower the original barriers.
+        return
+    with ir.Context() as context:
+        context.allow_unregistered_dialects = True
+        module = ir.Module.parse(source)
+
+        def visit(op):
+            if op.name == "omp.parallel" and len(op.regions[0].blocks) == 1:
+                ops = list(op.regions[0].blocks[0].operations)
+                if len(ops) >= 2 and ops[-1].operation.name == "omp.terminator":
+                    ws = ops[-2].operation
+                    if (
+                        ws.name == "omp.wsloop"
+                        and not len(ws.operands)
+                        and all(
+                            str(a) == "operandSegmentSizes"
+                            for a in ws.attributes
+                        )
+                    ):
+                        ws.attributes["nowait"] = ir.UnitAttr.get()
+            return ir.WalkResult.ADVANCE
+
+        module.operation.walk(visit)
+        module.operation.verify()
+        path.write_text(str(module))
+
+
 def compile_ir(a, name, source, pipeline, cfg):
     path = a.work / (name + ".mlir")
     path.write_text(source)
@@ -65,6 +102,8 @@ def compile_ir(a, name, source, pipeline, cfg):
             if tool.endswith("translate")
             else f".{i}.mlir"
         )
+        if tool.endswith("translate"):
+            elide_final_workshare_barriers(path)
         nxt = a.work / (name + suffix)
         subprocess.run(
             [_resolve_tool(tool, a.buddy_opt, a.llvm), path, *flags, "-o", nxt],

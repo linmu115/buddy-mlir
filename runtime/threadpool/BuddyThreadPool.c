@@ -250,7 +250,8 @@ static void *worker(void *arg) {
     }
     // Every worker reports, so that the next region does not rewrite job
     // while a worker that sat this one out still reads it.
-    atomic_fetch_add_explicit(&finished, 1, memory_order_release);
+    // Chain all completions before the caller acquires the final count.
+    atomic_fetch_add_explicit(&finished, 1, memory_order_acq_rel);
   }
 }
 

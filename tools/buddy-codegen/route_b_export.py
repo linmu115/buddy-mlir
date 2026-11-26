@@ -320,7 +320,7 @@ def export_one(config, root, role, index, expected, layouts, signatures):
     if emit:
         if specs:
             (target / "k3_kernels-w4g32.mlir").write_text(
-                gen_kernels(list(specs.values()))
+                gen_kernels(list(specs.values()), fixed_vlen=(role == "head"))
             )
             if role == "decoder":
                 (target / "k3_kernels_ime-w4g32.mlir").write_text(
