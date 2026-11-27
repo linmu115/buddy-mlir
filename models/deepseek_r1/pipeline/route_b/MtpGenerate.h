@@ -141,7 +141,8 @@ public:
         tokens[i] = int(std::max_element(row, row + vocab) - row);
       }
     }
-    mpiCheck(MPI_Bcast(tokens, rows, MPI_INT, last, comm));
+    if (last)
+      mpiCheck(MPI_Bcast(tokens, rows, MPI_INT, last, comm));
   }
   // All accepted IDs are already present on every rank. A prefix length and
   // one correction/bonus token suffice even for a four-row verify.
@@ -158,7 +159,8 @@ public:
         }
       }
     }
-    mpiCheck(MPI_Bcast(reply.data(), 2, MPI_INT, last, comm));
+    if (last)
+      mpiCheck(MPI_Bcast(reply.data(), 2, MPI_INT, last, comm));
     return reply;
   }
   const float *advance(const int64_t *shifted, const float *hidden, int pos,
@@ -202,7 +204,8 @@ public:
           decision[1] = probability >= opt.minP && cumulative >= opt.tau;
         }
       }
-      mpiCheck(MPI_Bcast(decision, 2, MPI_INT, last, comm));
+      if (last)
+        mpiCheck(MPI_Bcast(decision, 2, MPI_INT, last, comm));
       // Always verify one candidate. Discard a failed deeper candidate.
       if (decision[1] || !draft.count)
         draft.tokens[draft.count++] = decision[0];
@@ -324,7 +327,8 @@ inline void generate(const DistributedGenerateOptions &opts, MtpStage &stage,
         ready.pop_front();
       }
     }
-    mpiCheck(MPI_Bcast(cmd, 3, MPI_INT, 0, comm));
+    if (ranks > 1)
+      mpiCheck(MPI_Bcast(cmd, 3, MPI_INT, 0, comm));
     int slot = cmd[0];
     if (slot < 0)
       break;
@@ -412,7 +416,8 @@ inline void generate(const DistributedGenerateOptions &opts, MtpStage &stage,
         s.history.resize(s.prompt);
         if (!rank)
           std::copy_n(promptIds.begin(), s.prompt, s.history.begin());
-        mpiCheck(MPI_Bcast(s.history.data(), s.prompt, MPI_INT64_T, 0, comm));
+        if (ranks > 1)
+          mpiCheck(MPI_Bcast(s.history.data(), s.prompt, MPI_INT64_T, 0, comm));
       }
       for (int pos = 0; pos < s.prompt; pos += chunk) {
         int valid = std::min(chunk, s.prompt - pos);

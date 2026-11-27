@@ -341,6 +341,21 @@ optional MTP and DSpark. The verifier reduces two row-parallel projections
 per layer. Each collective covers the valid rows times the hidden width.
 Both ranks commit the same prefix and restore their local GDN and KV state.
 
+The default TP transport is MPI. Select `--tp-transport tcp` for a
+poll-based full-duplex socket or `--tp-transport tcp-spin` to spin on the
+same socket and sleep briefly after 20 ms without progress. Both use
+TCP_NODELAY and carry the commands, embedding frames and reductions on one
+persistent connection. Rank 0 listens on an ephemeral port. Set
+`--tp-tcp-iface IFNAME` on a two-host run so rank 1 can reach that port.
+CLI values override `BUDDY_TP_TRANSPORT` and `BUDDY_TP_TCP_IFACE`. The interface falls back to
+`MPIR_CVAR_NETWORK_IFACE`, then loopback. The wire precision applies to
+reductions. The embedding frame stays in f32.
+
+To time the production reduction hook locally, run
+`mpiexec -n 2 ./tp_allreduce_bench --hops 128 --elems 2560 --iters 20 --iface lo`.
+The benchmark times both ranks, checks the result bytes against MPI at the
+same precision, and prints individual-hop and whole-batch statistics.
+
 For direct resident generation, send JSONL to the endpoint stdin. Hydra
 normally forwards stdin to rank 0. In that setup pass `--launcher-stdin`
 to forward requests to the endpoint when it resides on rank 1. The relay

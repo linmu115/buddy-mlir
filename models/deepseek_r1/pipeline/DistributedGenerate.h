@@ -499,7 +499,9 @@ inline void generateTokenized(const DistributedGenerateOptions &opts,
   const auto &config = stage.configuration();
   const bool first = rank == 0, last = rank == ranks - 1;
   const int version = resolveWireSpec(config.dtype, opts.wireDtype).version;
-  BlockingActivation activation(config, comm, opts.wireDtype);
+  std::optional<BlockingActivation> activation;
+  if (ranks > 1 && !async)
+    activation.emplace(config, comm, opts.wireDtype);
 
   int capacity = 0;
   std::vector<float> hiddenF32;
@@ -528,7 +530,7 @@ inline void generateTokenized(const DistributedGenerateOptions &opts,
       return async->finishReceive(h, rank - 1);
     }
     FrameInterval interval(rank, h.step, "recv-wait");
-    activation.receive(hidden, capacity, rank - 1, h);
+    activation->receive(hidden, capacity, rank - 1, h);
     return hidden;
   };
   // Software-progress MPI providers may leave a large send idle throughout
@@ -542,7 +544,7 @@ inline void generateTokenized(const DistributedGenerateOptions &opts,
       async->postSend(h, output, rank + 1, completePrefill && h.rows > 1);
     } else {
       FrameInterval interval(rank, h.step, "send-wait");
-      activation.send(h, output, rank + 1);
+      activation->send(h, output, rank + 1);
     }
   };
 
@@ -839,7 +841,8 @@ inline void generateDistributed(const DistributedGenerateOptions &opts,
   }
 
   std::array<int, 2> broadcastMeta{promptRows, resolvedNewTokens};
-  mpiCheck(MPI_Bcast(broadcastMeta.data(), 2, MPI_INT, 0, comm));
+  if (ranks > 1)
+    mpiCheck(MPI_Bcast(broadcastMeta.data(), 2, MPI_INT, 0, comm));
   promptRows = broadcastMeta[0];
   resolvedNewTokens = broadcastMeta[1];
 
@@ -1049,6 +1052,8 @@ public:
   }
 
   void drain() {
+    if (last == 0)
+      return;
     mpiCheck(MPI_Waitall(static_cast<int>(requests.size()), requests.data(),
                          MPI_STATUSES_IGNORE));
   }
@@ -1265,7 +1270,8 @@ inline void generateDistributedBatch(const DistributedGenerateOptions &opts,
                                            opts.allowZeroTokenLimit, meta[0],
                                            config.context);
     }
-    mpiCheck(MPI_Bcast(meta.data(), 2, MPI_INT, 0, comm));
+    if (ranks > 1)
+      mpiCheck(MPI_Bcast(meta.data(), 2, MPI_INT, 0, comm));
     stream.promptRows = stream.pos = meta[0];
     stream.limit = meta[1];
 

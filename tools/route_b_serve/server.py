@@ -528,6 +528,7 @@ def parse_args():
         type=Path,
         help="Local vocabulary for a remote TP endpoint",
     )
+    parser.add_argument("--tp-transport", choices=["mpi", "tcp", "tcp-spin"])
     parser.add_argument("--wire", default="f16", choices=["f16", "f32"])
     parser.add_argument("--slots", type=int, default=2, choices=range(1, 9))
     parser.add_argument("--bind", default="127.0.0.1")
@@ -571,6 +572,8 @@ def main(args):
         if path is None:
             raise FileNotFoundError(f"no TP rank manifest in {args.tp_bundle}")
         model_args = ["--tp-bundle", str(args.tp_bundle), "--launcher-stdin"]
+        if args.tp_transport:
+            model_args += ["--tp-transport", args.tp_transport]
     else:
         path = args.bundle
         model_args = ["--bundle", str(path), "--ranges", args.ranges]

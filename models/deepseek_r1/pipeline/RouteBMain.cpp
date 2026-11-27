@@ -13,6 +13,10 @@ void run(int argc, char **argv, int rank, int size) {
   RunConfig cfg;
   cfg.maxNewTokens = 0;
   std::string bundle, tpBundle;
+  std::string tpTransport = optionalEnvString("BUDDY_TP_TRANSPORT");
+  if (tpTransport.empty())
+    tpTransport = "mpi";
+  std::string tpIface;
   const int physicalRank = rank;
   MPI_Comm generatorComm = MPI_COMM_WORLD;
   std::vector<std::string> prompts;
@@ -55,6 +59,10 @@ void run(int argc, char **argv, int rank, int size) {
       bundle = val;
     else if (opt == "--tp-bundle")
       tpBundle = val;
+    else if (opt == "--tp-transport")
+      tpTransport = val;
+    else if (opt == "--tp-tcp-iface")
+      tpIface = val;
     else if (opt == "--ranges")
       list = val;
     else if (opt == "--spec-mode") {
@@ -130,6 +138,7 @@ void run(int argc, char **argv, int rank, int size) {
         "--launcher-stdin requires --tp-bundle and --serve");
   if (!tpBundle.empty() && (!bundle.empty() || list || single))
     throw std::invalid_argument("--tp-bundle owns both complete layer ranges");
+  const auto tpMode = parseTpTransport(tpTransport);
   auto launch =
       nlohmann::json::array({mtp, serve, slotCount, int(wire), int(transport),
                              int(spec.mode), spec.maxDraft, spec.tau, spec.minP,
@@ -137,11 +146,14 @@ void run(int argc, char **argv, int rank, int size) {
           .dump();
   auto b = tpBundle.empty() ? TemplateBundle::load(bundle)
                             : TensorParallel::load(tpBundle, rank, size, launch,
-                                                   MPI_COMM_WORLD);
+                                                   MPI_COMM_WORLD, tpMode);
   std::unique_ptr<TensorParallel> tp;
   if (!tpBundle.empty()) {
     tp = std::make_unique<TensorParallel>(MPI_COMM_WORLD, rank, b,
-                                          wire == pipeline::WireDtype::F16);
+                                          wire == pipeline::WireDtype::F16,
+                                          tpMode, tpIface);
+    if (physicalRank == b.tpHost)
+      std::cerr << "tp_transport=" << tpTransport << '\n';
     rank = 0;
     size = 1;
     generatorComm = MPI_COMM_SELF;

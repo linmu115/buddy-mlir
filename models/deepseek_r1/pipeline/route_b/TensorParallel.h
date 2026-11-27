@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../TemplateBundle.h"
+#include "TcpSpinAllReduce.h"
 #include "buddy/runtime/pipeline/ActivationWire.h"
 #include <climits>
 #include <fstream>
@@ -21,6 +22,7 @@ class TensorParallel {
   MPI_Comm comm;
   int rank, peer, width, chunk;
   bool half;
+  std::unique_ptr<TpSocket> socket;
   std::vector<uint16_t> sendHalf, recvHalf;
   std::vector<float> remote;
 
@@ -29,26 +31,39 @@ class TensorParallel {
       throw std::runtime_error("TP MPI operation failed");
   }
   void send(Command c) {
+    if (socket) {
+      socket->transfer(&c, sizeof(c), nullptr, 0);
+      return;
+    }
     check(MPI_Send(&c, sizeof(c), MPI_BYTE, peer, 530, comm));
   }
   static int32_t reduce(void *ctx, float *x, int64_t n) {
     auto &self = *static_cast<TensorParallel *>(ctx);
-    if (n < 1 || n > INT_MAX)
+    if (n < 1 || n > int64_t(self.width) * self.chunk)
       return -1;
-    if (!self.half)
+    if (self.half) {
+      pipeline::encodeInto(x, n, self.sendHalf.data(), self.sendHalf.size());
+      if (self.socket) {
+        size_t bytes = size_t(n) * sizeof(uint16_t);
+        self.socket->transfer(self.sendHalf.data(), bytes, self.recvHalf.data(),
+                              bytes);
+      } else {
+        int rc = MPI_Sendrecv(self.sendHalf.data(), n, MPI_UINT16_T, self.peer,
+                              532, self.recvHalf.data(), n, MPI_UINT16_T,
+                              self.peer, 532, self.comm, MPI_STATUS_IGNORE);
+        if (rc != MPI_SUCCESS)
+          return rc;
+      }
+      pipeline::decodeInto(self.sendHalf.data(), n, x, n);
+      pipeline::decodeInto(self.recvHalf.data(), n, self.remote.data(),
+                           self.remote.size());
+    } else if (self.socket) {
+      size_t bytes = size_t(n) * sizeof(float);
+      self.socket->transfer(x, bytes, self.remote.data(), bytes);
+    } else {
       return MPI_Allreduce(MPI_IN_PLACE, x, int(n), MPI_FLOAT, MPI_SUM,
                            self.comm);
-    // Two ranks need one full-duplex exchange. Round both operands to f16
-    // then sum in f32, so both replicas enter the next norm with equal values.
-    pipeline::encodeInto(x, n, self.sendHalf.data(), self.sendHalf.size());
-    int rc = MPI_Sendrecv(self.sendHalf.data(), n, MPI_UINT16_T, self.peer, 532,
-                          self.recvHalf.data(), n, MPI_UINT16_T, self.peer, 532,
-                          self.comm, MPI_STATUS_IGNORE);
-    if (rc != MPI_SUCCESS)
-      return rc;
-    pipeline::decodeInto(self.sendHalf.data(), n, x, n);
-    pipeline::decodeInto(self.recvHalf.data(), n, self.remote.data(),
-                         self.remote.size());
+    }
     for (int i = 0; i < n; ++i)
       x[i] += self.remote[i];
     return 0;
@@ -56,15 +71,21 @@ class TensorParallel {
 
 public:
   TensorHooks hooks{};
-  TensorParallel(MPI_Comm c, int r, const TemplateBundle &b, bool fp16)
+  TensorParallel(MPI_Comm c, int r, const TemplateBundle &b, bool fp16,
+                 TpTransport mode = TpTransport::Mpi,
+                 const std::string &iface = {})
       : comm(c), rank(r), peer(1 - r), width(b.config.activationWidth),
         chunk(b.config.prefillChunk), half(fp16) {
-    if (int64_t(width) * chunk > INT_MAX)
-      throw std::length_error("TP frame exceeds MPI count");
+    if (width <= 0 || chunk <= 0 || int64_t(width) * chunk > INT_MAX)
+      throw std::length_error("invalid TP frame capacity");
+    if (mode != TpTransport::Mpi)
+      socket = std::make_unique<TpSocket>(comm, rank,
+                                          mode == TpTransport::TcpSpin, iface);
+    if (half || socket)
+      remote.resize(width * chunk);
     if (half) {
       sendHalf.resize(width * chunk);
       recvHalf.resize(width * chunk);
-      remote.resize(width * chunk);
     }
     hooks.reduce = reduce;
     hooks.context = this;
@@ -75,7 +96,11 @@ public:
         if (rows > 1 && rows != chunk)
           std::copy_n(ids, rows, c.ids);
         send(c);
-        check(MPI_Send(x, valid * width, MPI_FLOAT, peer, 531, comm));
+        if (socket)
+          socket->transfer(x, size_t(valid) * width * sizeof(float), nullptr,
+                           0);
+        else
+          check(MPI_Send(x, valid * width, MPI_FLOAT, peer, 531, comm));
       };
       hooks.clear = [this](int slot) { send({Clear, slot, 0, 0, 0}); };
       hooks.commit = [this](int slot, int pos, int kept, int rows) {
@@ -127,8 +152,11 @@ public:
     Command pending{};
     for (;;) {
       Command cmd{};
-      check(MPI_Recv(&cmd, sizeof(cmd), MPI_BYTE, peer, 530, comm,
-                     MPI_STATUS_IGNORE));
+      if (socket)
+        socket->transfer(nullptr, 0, &cmd, sizeof(cmd));
+      else
+        check(MPI_Recv(&cmd, sizeof(cmd), MPI_BYTE, peer, 530, comm,
+                       MPI_STATUS_IGNORE));
       if (cmd.op == Stop)
         return;
       stage.setActiveSlot(cmd.slot);
@@ -148,13 +176,19 @@ public:
         if (cmd.valid < 1 || cmd.valid > cmd.capacity || cmd.capacity > chunk)
           throw std::runtime_error("invalid TP frame");
         if (cmd.capacity > 1 && cmd.capacity != chunk) {
+          if (cmd.capacity > int(std::size(cmd.ids)))
+            throw std::runtime_error("invalid TP verifier capacity");
           for (int i = 0; i < cmd.valid; ++i)
             if (cmd.ids[i] < 0 || cmd.ids[i] >= stage.configuration().vocabSize)
               throw std::runtime_error("invalid TP verifier token");
           pending = cmd;
         }
-        check(MPI_Recv(frame.data(), width * cmd.valid, MPI_FLOAT, peer, 531,
-                       comm, MPI_STATUS_IGNORE));
+        if (socket)
+          socket->transfer(nullptr, 0, frame.data(),
+                           size_t(width) * cmd.valid * sizeof(float));
+        else
+          check(MPI_Recv(frame.data(), width * cmd.valid, MPI_FLOAT, peer, 531,
+                         comm, MPI_STATUS_IGNORE));
         stage.backbone(frame.data(), cmd.position, cmd.capacity, cmd.valid);
         break;
       default:
@@ -164,7 +198,8 @@ public:
   }
   static TemplateBundle load(const std::filesystem::path &path, int rank,
                              int size, const std::string &options,
-                             MPI_Comm comm) {
+                             MPI_Comm comm,
+                             TpTransport mode = TpTransport::Mpi) {
     if (size != 2)
       throw std::invalid_argument("TP requires two MPI ranks");
     std::ifstream stream(path / "tp.json");
@@ -177,7 +212,8 @@ public:
     if (b.tpRank != rank || ids.at(rank) != b.id)
       throw std::invalid_argument("invalid TP member");
     auto plan = index.dump() + b.tpSource + std::to_string(b.tpHost) +
-                nlohmann::json(b.tpHeads).dump() + options;
+                nlohmann::json(b.tpHeads).dump() +
+                nlohmann::json::array({options, int(mode)}).dump();
     auto hash = contentDigest(plan.data(), plan.size());
     char other[64];
     check(MPI_Sendrecv(hash.data(), 64, MPI_CHAR, 1 - rank, 529, other, 64,

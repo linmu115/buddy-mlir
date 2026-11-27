@@ -24,6 +24,10 @@ add_executable(buddy-pp-route-b)
 target_link_libraries(buddy-pp-route-b PRIVATE route_b_main)
 add_executable(buddy-pp-route-b-serve)
 target_link_libraries(buddy-pp-route-b-serve PRIVATE route_b_main)
+add_executable(tp_allreduce_bench TpAllReduceBench.cpp)
+target_compile_features(tp_allreduce_bench PRIVATE cxx_std_17)
+target_include_directories(tp_allreduce_bench PRIVATE "${repo}/runtime/include")
+target_link_libraries(tp_allreduce_bench PRIVATE route_b_mpi nlohmann_json::nlohmann_json)
 include(CTest)
 if(BUILD_TESTING AND NOT RISCV_MPI_DIR)
   find_package(Python3 REQUIRED COMPONENTS Interpreter)
@@ -77,6 +81,15 @@ if(BUILD_TESTING AND NOT RISCV_MPI_DIR)
       add_test(NAME test_route_b_tp_${wire} COMMAND "${MPIEXEC_EXECUTABLE}"
         -n 2 $<TARGET_FILE:route_b_tp_probe> "${ROUTE_B_TP_SOURCE}" "${ROUTE_B_TP_BUNDLE}" "${wire}")
       set_tests_properties(test_route_b_tp_${wire} PROPERTIES TIMEOUT 180)
+      foreach(mode tcp tcp-spin)
+        add_test(NAME test_route_b_tp_${mode}_${wire} COMMAND "${MPIEXEC_EXECUTABLE}"
+          -n 2 $<TARGET_FILE:route_b_tp_probe> "${ROUTE_B_TP_SOURCE}" "${ROUTE_B_TP_BUNDLE}" "${wire}" "${mode}")
+        add_test(NAME test_route_b_tp_generate_${mode}_${wire} COMMAND "${Python3_EXECUTABLE}"
+          "${tests}/test_route_b_tp_generate.py" "${MPIEXEC_EXECUTABLE}"
+          $<TARGET_FILE:buddy-pp-route-b> "${ROUTE_B_TP_SOURCE}" "${ROUTE_B_TP_BUNDLE}" "${mode}" "${wire}")
+        set_tests_properties(test_route_b_tp_${mode}_${wire} test_route_b_tp_generate_${mode}_${wire}
+          PROPERTIES TIMEOUT 480 ENVIRONMENT "BUDDY_TP_TCP_IFACE=lo")
+      endforeach()
     endforeach()
   endif()
 endif()
