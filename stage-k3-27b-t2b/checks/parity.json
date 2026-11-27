@@ -1,0 +1,78 @@
+{
+  "baseline_git": "804a3fd0bb62aa47ff6e257649ed767774f31d5d",
+  "production_emulator_vlen": 1024,
+  "comparisons": {
+    "gdn_layer.1.64": {
+      "bytes": 3330048,
+      "baseline_and_candidate_sha256": "e8d7ad1032d74d0577f05e96e5b3b7906972d17daf8ae561a305e1d3265fb61e"
+    },
+    "gdn_layer.2.64": {
+      "bytes": 6660096,
+      "baseline_and_candidate_sha256": "0a81b5fcdbcdaea90f313d458030f1f528d57e5c88fa501581ea304960183128"
+    },
+    "gdn_layer.64.64": {
+      "bytes": 4620288,
+      "baseline_and_candidate_sha256": "4b244c2ae1a955103bb6f1e5352324998156c8d377317191d8f4f6f83e8da258"
+    },
+    "full_attn_layer.64.64": {
+      "bytes": 34865152,
+      "baseline_and_candidate_sha256": "827ffc839ed4143c5ad53f60ff35c6cba2a1fae2f20683dfb2a19417703ddcfa"
+    },
+    "full_attn_layer.64.256": {
+      "bytes": 34865152,
+      "baseline_and_candidate_sha256": "0b24826695cbb2c153b380ffd839ba2baa3d025da3e8c81ac19e364dee559dae"
+    },
+    "full_attn_layer.64.1024": {
+      "bytes": 34865152,
+      "baseline_and_candidate_sha256": "2e6939b9eb3b92c9f1363cb5f7222a0689869554d20fb85db50afafd2127e6fe"
+    },
+    "full_attn_layer.2.1024": {
+      "bytes": 33595392,
+      "baseline_and_candidate_sha256": "b303e118ece89b38eb8be438dcc1e6547b0a704ce0a2be7947bae98e45f91fda"
+    },
+    "tiny.trace": {
+      "bytes": 4415512,
+      "baseline_and_candidate_sha256": "b49d72b8ba1866cf595e7bb9d3491eadd0f88ab150c195bdb10c17013b668ee3"
+    },
+    "tiny.mtp": {
+      "bytes": 3800576,
+      "baseline_and_candidate_sha256": "c8b3fe4cfc19225a12ab9205cc53aa8752b61cebe9dc214537aa6bfae6718c81"
+    },
+    "tiny.partial-3": {
+      "bytes": 53248,
+      "baseline_and_candidate_sha256": "8d265016563e13d2e5772f2d257ccb739695a5dff0f983f6f7248d053d32808b"
+    },
+    "tiny.partial-4": {
+      "bytes": 53248,
+      "baseline_and_candidate_sha256": "660f6ddb6390a8416c2a8545d30e3333bd94726d8f48a164c1cd2430537f7c75"
+    },
+    "production_mtp.P64_M2_M1": {
+      "bytes": 102035456,
+      "baseline_and_candidate_sha256": "1fa026da02e8f691564cce2729dac114f64978a80955f4c5ab36620f7d5815f9"
+    },
+    "production_embed.P64": {
+      "bytes": 1310720,
+      "baseline_and_candidate_sha256": "440fc4d2f4a7e12781c7f6c2a1399422ee5c8d83d77999b32fe27f69a642d291"
+    },
+    "production_head.M1_M2": {
+      "bytes": 2979840,
+      "baseline_and_candidate_sha256": "e825699ed48b58f865ffa0b017e09994346bb5bbd22bcc11936d25d193b965dd"
+    },
+    "host_tiny_mtp": {
+      "bytes": 201,
+      "baseline_and_candidate_sha256": "fb4a7cec79e80726c8b9b1645d8b80fabe9029362bdd3896a3aaf6ca556c6280"
+    }
+  },
+  "direct_operator_checks": [
+    "gate M=1 both outputs, 48 heads: max_abs=0",
+    "gate M=2 both outputs, 48 heads: max_abs=0",
+    "gate M=3 both outputs, 48 heads: max_abs=0",
+    "gate M=4 both outputs, 48 heads: max_abs=0",
+    "gate M=64 both outputs, 48 heads: max_abs=0",
+    "attention P64 prior KV=64 all 64 causal rows: max_abs=0",
+    "attention P64 prior KV=256 all 64 causal rows: max_abs=0",
+    "attention P64 prior KV=1024 all 64 causal rows: max_abs=0"
+  ],
+  "weight_files": 134,
+  "weight_receipts_verified_bytes": 31208607872
+}

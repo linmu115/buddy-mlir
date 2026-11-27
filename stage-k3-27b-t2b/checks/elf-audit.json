@@ -1,0 +1,327 @@
+{
+  "before": "628131f54465c6148288e8bbaaa69d84b07181ac4a93be397901af13e057a789",
+  "after": "6ab906cb94da83083a9d35e24ba6af19f9bcc76b216b29ef92395632712f18d4",
+  "manifest_changed": [
+    "templates",
+    "bundle_id"
+  ],
+  "pack": "qwen3_5-w4g32/2",
+  "weight_bytes": 31208607872,
+  "weights": 134,
+  "templates": {
+    "embed.so": {
+      "sha256": "88527cca8dfdf4920c5604b3521060c4fe44e36373ae1f8e009bff88f01f9f4c",
+      "descriptor_sha256": "5abbf97ffaaadf3c187f60760df506549c4f3b826404f50037805535a93bccfc",
+      "exports": [
+        "bj47_kernel_info_v1",
+        "embed_decode_f16",
+        "embed_prefill_f16"
+      ]
+    },
+    "lm_head.so": {
+      "sha256": "c922e25f7fa6ba197a4fb523eafa1529a84fd38d702f1ec9b69ea3efa47dc6d9",
+      "descriptor_sha256": "f48299d26313851d576aa1201ea1ec7ab63a371a2e65404455ab071351c58db5",
+      "exports": [
+        "bj47_kernel_info_v1",
+        "lm_head",
+        "lm_head_decode",
+        "lm_head_linear",
+        "lm_head_normalize",
+        "lm_head_prefill"
+      ]
+    },
+    "gdn_layer.so": {
+      "sha256": "501532f7a139634393d897c4a849e907fb2c789ddf70581d717d757c0b29cea5",
+      "descriptor_sha256": "3095649c3e61c75a24a37e5a4a3f289f955e5bf6463fb38b8986f8ff51242772",
+      "exports": [
+        "bj47_kernel_info_v1",
+        "layer_decode",
+        "layer_prefill",
+        "layer_verify_2"
+      ]
+    },
+    "full_attn_layer.so": {
+      "sha256": "dcd5908011ffa225e2a409cc88534ca751342fe22ebc821c72dd5b57ac1d3836",
+      "descriptor_sha256": "0b7854b82619b9c3e8b4414f2a0f04db578488049ab8e10536173b912b7e5781",
+      "exports": [
+        "bj47_kernel_info_v1",
+        "layer_decode",
+        "layer_prefill",
+        "layer_verify_2",
+        "prepare_decode",
+        "prepare_prefill"
+      ]
+    },
+    "mtp_layer.so": {
+      "sha256": "2a1379ee605cafd9133f790f2c38390057dc58a5943459814060b5336c11c9f5",
+      "descriptor_sha256": "5a3b94750ca446f28ea304ed453e9dbd43480bb972fb1936765aced629765330",
+      "exports": [
+        "bj47_kernel_info_v1",
+        "mtp_forward",
+        "prepare_decode",
+        "prepare_prefill"
+      ]
+    }
+  },
+  "functions": {
+    "gdn_layer:_ZN12_GLOBAL__N_13mixERK13BJ47WeightsV1PKfPfS5_RK11BJ47FrameV1iiS4_S5_": {
+      "pc": "0000000000002b66",
+      "rvv": {},
+      "whole_register_memory_sites": [],
+      "allocator_vector_spills_reloads": []
+    },
+    "gdn_layer:_ZN12_GLOBAL__N_13mixERK13BJ47WeightsV1PKfPfS5_RK11BJ47FrameV1iiS4_S5_.omp_outlined": {
+      "pc": "0000000000002da0",
+      "rvv": {
+        "vsetivli": 2,
+        "vmv.s.x": 2,
+        "vsetvli": 3,
+        "vle32.v": 6,
+        "vfmul.vv": 2,
+        "vfredosum.vs": 2,
+        "vfmv.f.s": 2,
+        "vfmul.vf": 3,
+        "vse32.v": 2
+      },
+      "whole_register_memory_sites": [],
+      "allocator_vector_spills_reloads": []
+    },
+    "gdn_layer:_ZN12_GLOBAL__N_114gateProjectionILi4EEEvPKfS2_S2_PfS3_": {
+      "pc": "0000000000003414",
+      "rvv": {
+        "vsetivli": 2,
+        "vmv.v.i": 8,
+        "vle32.v": 6,
+        "vfmul.vv": 8,
+        "vfadd.vv": 8,
+        "vmv.s.x": 1,
+        "vfredosum.vs": 8,
+        "vse32.v": 8
+      },
+      "whole_register_memory_sites": [],
+      "allocator_vector_spills_reloads": []
+    },
+    "gdn_layer:_ZN12_GLOBAL__N_114gateProjectionILi2EEEvPKfS2_S2_PfS3_": {
+      "pc": "0000000000003522",
+      "rvv": {
+        "vsetivli": 2,
+        "vmv.v.i": 4,
+        "vle32.v": 4,
+        "vfmul.vv": 4,
+        "vfadd.vv": 4,
+        "vmv.s.x": 1,
+        "vfredosum.vs": 4,
+        "vse32.v": 4
+      },
+      "whole_register_memory_sites": [],
+      "allocator_vector_spills_reloads": []
+    },
+    "gdn_layer:_ZN12_GLOBAL__N_114gateProjectionILi1EEEvPKfS2_S2_PfS3_": {
+      "pc": "00000000000035b8",
+      "rvv": {
+        "vsetivli": 2,
+        "vmv.v.i": 2,
+        "vle32.v": 3,
+        "vfmul.vv": 2,
+        "vfadd.vv": 2,
+        "vmv.s.x": 1,
+        "vfredosum.vs": 2,
+        "vse32.v": 2
+      },
+      "whole_register_memory_sites": [],
+      "allocator_vector_spills_reloads": []
+    },
+    "gdn_layer:_ZN12_GLOBAL__N_113recurrentStepEPfPKfS2_S2_S0_ff": {
+      "pc": "0000000000003616",
+      "rvv": {
+        "vsetvli": 1,
+        "vmv.v.i": 2,
+        "vle32.v": 3,
+        "vfmul.vf": 5,
+        "vse32.v": 3,
+        "vfadd.vv": 3,
+        "vfsub.vv": 1
+      },
+      "whole_register_memory_sites": [],
+      "allocator_vector_spills_reloads": []
+    },
+    "gdn_layer:_ZN6hybrid8chunkGDNEPKfS1_S1_iS1_S1_iPfS2_iiii": {
+      "pc": "0000000000004110",
+      "rvv": {
+        "vsetivli": 3,
+        "vmv.s.x": 3,
+        "vfmv.f.s": 3,
+        "vsetvli": 9,
+        "vle32.v": 18,
+        "vfmul.vf": 9,
+        "vfadd.vv": 5,
+        "vse32.v": 8,
+        "vfsub.vv": 1,
+        "vfmul.vv": 2,
+        "vfredosum.vs": 2
+      },
+      "whole_register_memory_sites": [],
+      "allocator_vector_spills_reloads": []
+    },
+    "gdn_layer:_ZN12_GLOBAL__N_112gatedNormRowEPfPKfS2_": {
+      "pc": "00000000000036b0",
+      "rvv": {
+        "vsetivli": 1,
+        "vmv.s.x": 1,
+        "vsetvli": 2,
+        "vle32.v": 6,
+        "vfmul.vv": 4,
+        "vfredosum.vs": 1,
+        "vfmv.f.s": 1,
+        "vfrdiv.vf": 1,
+        "vfmul.vf": 1,
+        "vse32.v": 1
+      },
+      "whole_register_memory_sites": [],
+      "allocator_vector_spills_reloads": []
+    },
+    "gdn_layer:_ZN12_GLOBAL__N_18convolveEPfS0_PKfiS0_": {
+      "pc": "00000000000037f6",
+      "rvv": {
+        "vsetvli": 1,
+        "vlseg4e32.v": 2,
+        "vle32.v": 1,
+        "vsseg4e32.v": 1,
+        "vmv.v.i": 1,
+        "vfmul.vv": 4,
+        "vfadd.vv": 4,
+        "vse32.v": 1
+      },
+      "whole_register_memory_sites": [],
+      "allocator_vector_spills_reloads": []
+    },
+    "full_attn_layer:_ZN12_GLOBAL__N_13mixERK13BJ47WeightsV1PKfPfS5_RK11BJ47FrameV1iiS4_S5_": {
+      "pc": "0000000000002c00",
+      "rvv": {
+        "vsetvli": 6,
+        "vmv.s.x": 2,
+        "vsetivli": 1,
+        "vmv2r.v": 1,
+        "vle32.v": 11,
+        "vfmul.vv": 6,
+        "vfredosum.vs": 1,
+        "vfmv.f.s": 1,
+        "vfmul.vf": 1,
+        "vfadd.vf": 1,
+        "vse32.v": 5,
+        "vfsub.vv": 1,
+        "vfadd.vv": 1
+      },
+      "whole_register_memory_sites": [],
+      "allocator_vector_spills_reloads": []
+    },
+    "full_attn_layer:_ZN12_GLOBAL__N_13mixERK13BJ47WeightsV1PKfPfS5_RK11BJ47FrameV1iiS4_S5_.omp_outlined": {
+      "pc": "000000000000332e",
+      "rvv": {},
+      "whole_register_memory_sites": [],
+      "allocator_vector_spills_reloads": []
+    },
+    "full_attn_layer:_ZN12_GLOBAL__N_13mixERK13BJ47WeightsV1PKfPfS5_RK11BJ47FrameV1iiS4_S5_.omp_outlined.1": {
+      "pc": "0000000000004226",
+      "rvv": {
+        "vsetvli": 4,
+        "vmv.s.x": 1,
+        "vle32.v": 9,
+        "vfmul.vv": 6,
+        "vfredosum.vs": 1,
+        "vfmv.f.s": 1,
+        "vfmul.vf": 1,
+        "vfadd.vf": 1,
+        "vse32.v": 3,
+        "vfsub.vv": 1,
+        "vfadd.vv": 1
+      },
+      "whole_register_memory_sites": [],
+      "allocator_vector_spills_reloads": []
+    },
+    "full_attn_layer:_ZN12_GLOBAL__N_115onlineAttentionEPKfS1_S1_iPfS2_S2_": {
+      "pc": "0000000000004606",
+      "rvv": {
+        "vsetivli": 5,
+        "vmv.s.x": 3,
+        "vmv1r.v": 1,
+        "vsetvli": 5,
+        "vle32.v": 7,
+        "vfmul.vv": 1,
+        "vfredosum.vs": 3,
+        "vfmv.f.s": 3,
+        "vfmv.s.f": 1,
+        "vfdiv.vf": 1,
+        "vse32.v": 2,
+        "vfmul.vf": 1,
+        "vfadd.vv": 1
+      },
+      "whole_register_memory_sites": [],
+      "allocator_vector_spills_reloads": []
+    },
+    "mtp_layer:_ZN12_GLOBAL__N_13mixERK13BJ47WeightsV1PKfPfS5_RK11BJ47FrameV1iiS4_S5_": {
+      "pc": "00000000000035c4",
+      "rvv": {
+        "vsetvli": 6,
+        "vmv.s.x": 2,
+        "vsetivli": 1,
+        "vmv2r.v": 1,
+        "vle32.v": 11,
+        "vfmul.vv": 6,
+        "vfredosum.vs": 1,
+        "vfmv.f.s": 1,
+        "vfmul.vf": 1,
+        "vfadd.vf": 1,
+        "vse32.v": 5,
+        "vfsub.vv": 1,
+        "vfadd.vv": 1
+      },
+      "whole_register_memory_sites": [],
+      "allocator_vector_spills_reloads": []
+    },
+    "mtp_layer:_ZN12_GLOBAL__N_13mixERK13BJ47WeightsV1PKfPfS5_RK11BJ47FrameV1iiS4_S5_.omp_outlined": {
+      "pc": "0000000000003d5c",
+      "rvv": {},
+      "whole_register_memory_sites": [],
+      "allocator_vector_spills_reloads": []
+    },
+    "mtp_layer:_ZN12_GLOBAL__N_13mixERK13BJ47WeightsV1PKfPfS5_RK11BJ47FrameV1iiS4_S5_.omp_outlined.1": {
+      "pc": "0000000000004c54",
+      "rvv": {
+        "vsetvli": 4,
+        "vmv.s.x": 1,
+        "vle32.v": 9,
+        "vfmul.vv": 6,
+        "vfredosum.vs": 1,
+        "vfmv.f.s": 1,
+        "vfmul.vf": 1,
+        "vfadd.vf": 1,
+        "vse32.v": 3,
+        "vfsub.vv": 1,
+        "vfadd.vv": 1
+      },
+      "whole_register_memory_sites": [],
+      "allocator_vector_spills_reloads": []
+    },
+    "mtp_layer:_ZN12_GLOBAL__N_115onlineAttentionEPKfS1_S1_iPfS2_S2_": {
+      "pc": "0000000000005034",
+      "rvv": {
+        "vsetivli": 5,
+        "vmv.s.x": 3,
+        "vmv1r.v": 1,
+        "vsetvli": 5,
+        "vle32.v": 7,
+        "vfmul.vv": 1,
+        "vfredosum.vs": 3,
+        "vfmv.f.s": 3,
+        "vfmv.s.f": 1,
+        "vfdiv.vf": 1,
+        "vse32.v": 2,
+        "vfmul.vf": 1,
+        "vfadd.vv": 1
+      },
+      "whole_register_memory_sites": [],
+      "allocator_vector_spills_reloads": []
+    }
+  }
+}

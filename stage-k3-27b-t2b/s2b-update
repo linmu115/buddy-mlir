@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# Run prepare on both ranks before changing either one. Ranks must be drained
+# and stopped throughout activate/rollback, including after an interrupted copy.
+set -euo pipefail
+kit=$(cd "$(dirname "$0")" && pwd)
+root=${2:-"$HOME/route-b-qwen38-27b-release"}
+cd "$root"
+exec 9<.
+flock -x 9
+id=$(sha256sum "$kit/route-b.json" | cut -c1-16)
+state=".s2b-$id"
+payload=(embed.so lm_head.so gdn_layer.so full_attn_layer.so mtp_layer.so libbj47_kernel_runtime.so buddy-pp-route-b route-b.json)
+verify() { (cd "$1" && sha256sum --strict --quiet -c "$2"); }
+known_install() {
+  for name in "${payload[@]}" SHA256SUMS; do
+    if ! cmp -s -- "$name" "$state/old/$name" && ! cmp -s -- "$name" "$state/new/$name"; then
+      echo "unexpected installed file: $name" >&2
+      return 1
+    fi
+  done
+}
+case ${1:-} in
+  prepare)
+    verify "$kit" "$kit/SHA256SUMS"
+    if [[ -d "$state" ]]; then
+      verify "$state/old" "$kit/baseline.sha256"
+      verify "$state/new" "$kit/SHA256SUMS"
+      (cd "$state" && sha256sum --strict --quiet -c receipts.sha256)
+      known_install
+      exit 0
+    fi
+    verify . "$kit/baseline.sha256"
+    tmp=$(mktemp -d "./.s2b-prepare.XXXXXXXX")
+    mkdir "$tmp"/{old,new}
+    cp -p -- "${payload[@]}" SHA256SUMS "$tmp/old/"
+    cp -p -- "${payload[@]/#/$kit/}" "$tmp/new/"
+    awk 'NR==FNR {h[$2]=$1; next}
+         {key=$2; sub(/^\*/, "", key); sub(/^\.\//, "", key);
+          if (key in h) { print h[key] "  " key; seen[key]=1 } else print}
+         END {for (k in h) if (!(k in seen)) print h[k] "  " k}' \
+        "$kit/SHA256SUMS" SHA256SUMS > "$tmp/new/SHA256SUMS"
+    verify "$tmp/old" "$kit/baseline.sha256"
+    verify "$tmp/new" "$kit/SHA256SUMS"
+    (cd "$tmp" && sha256sum old/SHA256SUMS new/SHA256SUMS > receipts.sha256)
+    mv -T -- "$tmp" "$state"
+    ;;
+  activate|rollback)
+    (cd "$state" && sha256sum --strict --quiet -c receipts.sha256)
+    if [[ $1 == activate ]]; then
+      setdir="$state/new"; hashes="$kit/SHA256SUMS"
+    else
+      setdir="$state/old"; hashes="$kit/baseline.sha256"
+    fi
+    verify "$setdir" "$hashes"
+    known_install
+    for name in "${payload[@]}" SHA256SUMS; do
+      tmp=$(mktemp "./.$name.XXXXXXXX")
+      cp -p -- "$setdir/$name" "$tmp"
+      mv -fT -- "$tmp" "$name"
+    done
+    verify . "$hashes"
+    cmp -- "$setdir/SHA256SUMS" SHA256SUMS
+    ;;
+  *) echo "usage: s2b-update {prepare|activate|rollback} [release-directory]" >&2; exit 2 ;;
+esac

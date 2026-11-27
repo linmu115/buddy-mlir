@@ -1,0 +1,4 @@
+*.so
+/buddy-pp-route-b
+/checks/layer-probe
+/checks/peers.env

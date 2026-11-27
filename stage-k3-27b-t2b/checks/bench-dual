@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# Invoke only while holding the board lock, with resident ranks stopped.
+set -euo pipefail
+stage=$(cd "$(dirname "$0")/.." && pwd)
+: "${K3_R0:?set rank-0 SSH alias}" "${K3_R1:?set rank-1 SSH alias}"
+case ${1:-} in
+  prepare)
+    (cd "$stage" && sha256sum --quiet -c SHA256SUMS && sha256sum --quiet -c checks/probes.sha256)
+    for node in "$K3_R0" "$K3_R1"; do
+      ssh "$node" 'mkdir -p ~/t2b-incoming/checks'
+      rsync -a "$stage/"*.so "$stage"/{buddy-pp-route-b,route-b.json,SHA256SUMS,baseline.sha256,s2b-update} "$node:t2b-incoming/"
+      rsync -a "$stage/checks/"{layer-probe,probes.sha256} "$node:t2b-incoming/checks/"
+      ssh "$node" 'cd ~/t2b-incoming && sha256sum --quiet -c checks/probes.sha256 && ./s2b-update prepare'
+    done
+    ;;
+  activate|rollback)
+    for node in "$K3_R0" "$K3_R1"; do
+      ssh "$node" "bash ~/t2b-incoming/s2b-update $1"
+    done
+    ;;
+  run)
+    tag=${2:?supply a unique results label}
+    [[ $tag =~ ^[a-zA-Z0-9_-]+$ ]]
+    ssh "$K3_R1" bash -s -- "$tag" <<'BOARD'
+set -euo pipefail
+cd "$HOME/route-b-qwen38-27b-release"
+out="$HOME/t2b-incoming/$1-operators.log"
+set -o noclobber
+exec > "$out"
+echo 0 > /proc/set_ai_thread
+./vlen
+export OMP_NUM_THREADS=8 BUDDY_THREAD_POOL_THREADS=8
+export LD_LIBRARY_PATH="$PWD:$(dirname "$(cat mpiexec.path)")/../lib:${LD_LIBRARY_PATH:-}"
+probe=$HOME/t2b-incoming/checks/layer-probe
+sha256sum route-b.json gdn_layer.so full_attn_layer.so
+for m in 1 2 64; do
+  "$probe" --layer-bench . gdn-0.f32 gdn_layer "$m" 64
+  for pos in 64 256 1024; do
+    "$probe" --layer-bench . full_attn-3.f32 full_attn_layer "$m" "$pos"
+  done
+done
+BOARD
+    ssh "$K3_R0" bash -s -- "$tag" <<'BOARD'
+set -euo pipefail
+cd "$HOME/exp18-s1"
+for mode in off on; do
+  for workload in trace grid; do
+    test ! -e "28-$mode-f32-$workload-$1.json"
+    python3 bench.py 28 "$mode" f32 "$workload" "$1"
+  done
+done
+BOARD
+    ;;
+  *) echo "usage: bench-dual {prepare|activate|rollback|run LABEL}" >&2; exit 2 ;;
+esac

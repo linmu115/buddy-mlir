@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+stage=$(cd "$(dirname "$0")/.." && pwd)
+: "${QEMU_RUN:?Set to a VLEN=1024 QEMU launcher}" "${GDN_F32:?Set to gdn-0.f32}" "${PROBE:?Set to the cross-compiled operators.cpp executable}"
+symbol() {
+  riscv64-linux-gnu-nm -Cn "$1" | awk -v fn="$2" 'index($0,fn){address=$1; n++} END{if(n!=1)exit 1; print address}'
+}
+g=$stage/gdn_layer.so
+a=$stage/full_attn_layer.so
+"$QEMU_RUN" "$PROBE" gate "$g" "$(symbol "$g" 'gateProjection<1>')" "$(symbol "$g" 'gateProjection<2>')" "$(symbol "$g" 'gateProjection<4>')" "$GDN_F32"
+"$QEMU_RUN" "$PROBE" attention "$a" "$(symbol "$a" '::onlineAttention(')"
