@@ -263,3 +263,21 @@ by two positions. The service interleaves active slots at step boundaries and
 emits a token event for each committed token. CLI results and resident done
 events include proposal and acceptance counts, their ratio and generated
 decode tokens per verification step. The first prefill token is excluded.
+
+### Qwen3.8-27B on K3
+
+The fixed 1024-bit VLEN head streams four weight banks per group for both
+decode and two-row verification. Verification uses `lm_head_linear` with
+`rows=2`. Both rows visit an 18 KiB weight window before advancing.
+The packed layer templates fuse both residual additions into the projection
+stores. For the 24-query/4-KV attention geometry, decode scores two queries
+per group through visible length 384. Longer contexts split each KV head's
+six queries into groups of four and two.
+
+With `--prefill-ime`, the 64-row dense projections consume the existing
+144-byte IME blocks and accumulate the two K16 dots into an integer G32
+sum. Weight and activation scales are widened before the FP32 update.
+This changes prefill rounding relative to the earlier half-precision dot.
+The weight offsets, pack version and exported kernel signatures are stable.
+A binary upgrade also needs the matching template sizes, digests, runtime
+digest and bundle ID in `route-b.json`.

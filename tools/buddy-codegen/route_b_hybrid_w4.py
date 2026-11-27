@@ -4,7 +4,7 @@ import re
 import subprocess
 from contextlib import ExitStack
 
-from build_route_b import ATTRS
+from build_route_b import ATTRS, elide_final_workshare_barriers
 from compile_pipeline import build_stages, run_pipeline
 from safetensors import safe_open
 
@@ -117,10 +117,22 @@ def projection_code(args, owner, schema, positions):
                 args.threads,
                 matrix,
             )
+            residual = name in ("mixerOut", "downProj")
+            if residual:
+                spec.update(residual=True, residual_rhs=True)
+                spec["name"] += "_res_rhs"
+            if matrix and schema.get("glu", (None, None))[1] == (17408, 5120):
+                spec["exact_dense_dot"] = True
             symbol = spec["name"]
+            extra_arg = ", Descriptor<2>*" if residual else ""
+            res_desc = (
+                f"Descriptor<2> rhs(residual, {{rows, {n}}});"
+                if residual
+                else ""
+            )
             if symbol not in specs:
                 code.append(
-                    f'extern "C" void _mlir_ciface_{symbol}(Descriptor<2>*, Descriptor<2>*, Descriptor<1>*);'
+                    f'extern "C" void _mlir_ciface_{symbol}(Descriptor<2>*, Descriptor<2>*, Descriptor<1>*{extra_arg});'
                 )
             specs[symbol] = spec
             branches.append(f"""
@@ -128,12 +140,13 @@ def projection_code(args, owner, schema, positions):
       KernelCall call;
       Descriptor<2> result(nullptr, {{rows, {n}}}), input(x, {{rows, {k}}});
       Descriptor<1> packed(w.q4 + {ime if matrix else tiles}, {{{size}}});
-      _mlir_ciface_{symbol}(&result, &input, &packed);
+      {res_desc}
+      _mlir_ciface_{symbol}(&result, &input, &packed{", &rhs" if residual else ""});
       std::copy_n(static_cast<const float*>(result.aligned) + result.offset,
                   rows * {n}, out);
     }}""")
         code.append(
-            f"inline void proj_{name}(const BJ47WeightsV1 &w, const float *x, float *out, int rows) {{"
+            f"inline void proj_{name}(const BJ47WeightsV1 &w, const float *x, float *out, int rows{', const float *residual' if residual else ''}) {{"
             + "".join(branches)
             + "\n}"
         )
@@ -161,14 +174,21 @@ def compile_kernels(args, dest, specs):
             pipeline, args.threads, ATTRS if cross else "", "w4g32", arena=True
         )
         path = dest / f"w4-{part}.mlir"
-        path.write_text(k3_w4.gen_kernels(specs, part=part))
+        path.write_text(k3_w4.gen_kernels(specs, part=part, fixed_vlen=cross))
         obj = path.with_suffix(".o")
+        if part == "main":
+            lowered = dest / "w4-workshares.mlir"
+            run_pipeline(
+                stages[:1], path, lowered, args.buddy_opt, args.llvm_bin
+            )
+            elide_final_workshare_barriers(lowered)
+            path, stages = lowered, stages[1:]
         if not cross and any(
             "fsanitize=address" in flag for flag in args.cxx_flag
         ):
             # llc alone does not add redzone checks to generated memory accesses.
             llvm = path.with_suffix(".ll")
-            run_pipeline(stages[:2], path, llvm, args.buddy_opt, args.llvm_bin)
+            run_pipeline(stages[:1], path, llvm, args.buddy_opt, args.llvm_bin)
             llvm.write_text(
                 re.sub(
                     r"^(define .*) \{$",

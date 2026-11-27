@@ -1450,7 +1450,7 @@ def _residual_sum(fn, ty, spec, val, mem, at):
     )
 
 
-def _stream_head_tile(fn, ty, spec, a, tile, row):
+def _stream_head_tile(fn, ty, spec, a, tile, row, start=None, initial=None):
     """VLEN=1024, one row. Fetch four 512-byte banks before the MACs.
     Four independent i16 partial sums add modulo 65536. Each G32 still
     updates the f32 accumulator exactly once, in the original group order.
@@ -1469,19 +1469,26 @@ def _stream_head_tile(fn, ty, spec, a, tile, row):
         memref.ExtractAlignedPointerAsIndexOp(a["xs"]).result,
         _muli(row, fn.idx(k // G * 4)),
     )
-    scratch = memref.AllocaOp(
-        _memref([1, NB], ty.f32), [], [], alignment=128
-    ).result
+    # Reuse fixed scratch across every K window of this tile.
+    with ir.InsertionPoint.at_block_begin(fn.entry):
+        scratch = memref.AllocaOp(
+            _memref([1, NB], ty.f32), [], [], alignment=128
+        ).result
     out = memref.ExtractAlignedPointerAsIndexOp(scratch).result
+    if start is not None:
+        w = _addi(w, _muli(start, fn.idx(tile_bytes(G))))
+        q = _addi(q, _muli(start, fn.idx(G)))
+        s = _addi(s, _muli(start, fn.idx(4)))
+        vector.StoreOp(initial, scratch, [fn.idx(0), fn.idx(0)])
     args = [arith.IndexCastOp(ty.i64, v).result for v in (w, q, s, out)]
     asm = [
         "mv t0,$0",
         "mv t1,$1",
         "mv t2,$2",
-        f"li t3,{k}",
+        f"li t3,{k if start is None else 8 * G}",
         "add t3,t3,t1",
         "vsetvli t5,zero,e32,m4,ta,ma",
-        "vmv.v.i v0,0",
+        "vmv.v.i v0,0" if start is None else "vl4re32.v v0,($3)",
         "2:",
         "vsetvli t5,zero,e8,m1,ta,ma",
     ]
@@ -1580,7 +1587,37 @@ def _tile_fn(ty, spec):
                 )
                 vals = [_silu_mul(fn, ty, g, u, NB) for g, u in zip(gate, up)]
             else:
-                if spec.get("stream_head"):
+                if spec.get("stream_head") and len(rows) == 2:
+                    # Both rows consume each 18 KiB weight window before
+                    # advancing. Preserve one f32 FMA per group and row.
+                    groups = spec["k"] // G
+                    assert groups % 8 == 0
+                    window = scf.ForOp(
+                        fn.idx(0),
+                        fn.idx(groups),
+                        fn.idx(8),
+                        [fn.const(vf, 0.0)] * 2,
+                    )
+                    with ir.InsertionPoint(window.body):
+                        scf.YieldOp(
+                            [
+                                _stream_head_tile(
+                                    fn,
+                                    ty,
+                                    spec,
+                                    a,
+                                    a["wt"],
+                                    row,
+                                    window.induction_variable,
+                                    acc,
+                                )
+                                for row, acc in zip(
+                                    rows, window.inner_iter_args
+                                )
+                            ]
+                        )
+                    vals = window.results
+                elif spec.get("stream_head"):
                     vals = [
                         _stream_head_tile(fn, ty, spec, a, a["wt"], rows[0])
                     ]
@@ -3339,7 +3376,11 @@ def _svec(n, t):
     return ir.VectorType.get([n], t, scalable=[True])
 
 
-def _ime_step_fn(ty):
+def _ime_step_name(exact):
+    return "k3_ime_i32_step" if exact else IME_STEP_FN
+
+
+def _ime_step_fn(ty, exact=False):
     """k3_ime_hp_step(b, ng, a, s, acc, first): one 8-column block of the IME
     layout times 32 rows (4 row blocks of 8) of the chunk, over ng groups
     from b on. A100 vector loads cost ~10 ns each whatever their size (up to
@@ -3359,7 +3400,7 @@ def _ime_step_fn(ty):
     -misched-prera-direction=topdown: LLVM then issues the B load first and
     unpacks it while A loads (bottom-up scheduling sinks the loads next to
     their uses: 75 instead of 59 ns per group on one A100 core)."""
-    fn = _Fn(IME_STEP_FN, [ty.i64] * 6, [], public=False)
+    fn = _Fn(_ime_step_name(exact), [ty.i64] * 6, [], public=False)
     b, ng, a, s, o, first = fn.args
     v8, v16i8 = _svec(8, ty.i8), _svec(16, ty.i8)
     v4h, v4f, v16f = _svec(4, ty.f16), _svec(4, ty.f32), _svec(16, ty.f32)
@@ -3409,15 +3450,49 @@ def _ime_step_fn(ty):
                 vector.ScalableExtractOp(v4h, ss, 4 * i).result
                 for i in range(4)
             ]
-            ps = [
-                _vmadot_hp(ty, zero_h, avs[2 * i], lo, wscale) for i in range(4)
-            ]
             outs = []
-            for i in range(4):
-                q = _vmadot_hp(ty, ps[i], avs[2 * i + 1], hi, wscale)
-                w = arith.ExtFOp(v4f, q).result
-                xs = arith.ExtFOp(v4f, svs[i]).result
-                outs.append(_fma(w, xs, loop.inner_iter_args[i]))
+            if exact:
+                # The IME block stores eight column scales. Repeat them
+                # across the eight rows of the integer accumulator.
+                indices = _svec(4, ty.i16)
+                columns = arith.AndIOp(
+                    vector.StepOp(indices).result, fn.const(indices, 7)
+                ).result
+                repeated = llvm.CallIntrinsicOp(
+                    v4h,
+                    "llvm.riscv.vrgather.vv",
+                    [wscale, wscale, columns, fn.const(ty.i64, 64)],
+                    [],
+                    [],
+                ).result
+                ws = arith.ExtFOp(v4f, repeated).result
+                i32tile = _svec(4, ty.i32)
+                for i in range(4):
+                    dot = fn.const(i32tile, 0)
+                    for half, weights in enumerate((lo, hi)):
+                        dot = ir.Operation.create(
+                            "ime.intr.vmadot",
+                            results=[i32tile],
+                            operands=[dot, avs[2 * i + half], weights],
+                        ).result
+                    scale = _mulf(ws, arith.ExtFOp(v4f, svs[i]).result)
+                    outs.append(
+                        _fma(
+                            arith.SIToFPOp(v4f, dot).result,
+                            scale,
+                            loop.inner_iter_args[i],
+                        )
+                    )
+            else:
+                ps = [
+                    _vmadot_hp(ty, zero_h, avs[2 * i], lo, wscale)
+                    for i in range(4)
+                ]
+                for i in range(4):
+                    q = _vmadot_hp(ty, ps[i], avs[2 * i + 1], hi, wscale)
+                    w = arith.ExtFOp(v4f, q).result
+                    xs = arith.ExtFOp(v4f, svs[i]).result
+                    outs.append(_fma(w, xs, loop.inner_iter_args[i]))
             scf.YieldOp(outs)
         res = zero_acc
         for i in range(4):
@@ -3586,7 +3661,7 @@ def _ime_tile_fn(ty, spec):
                         )
                         func.CallOp(
                             [],
-                            IME_STEP_FN,
+                            _ime_step_name(spec.get("exact_dense_dot")),
                             [as_i64(wb), c64(kc), xa, xs, accj, first],
                         )
                         scf.YieldOp([])
@@ -4070,7 +4145,15 @@ def build_kernels(
             _prefill_logits_flag(ty)
         if part == "ime":
             if ime_mm:
-                _ime_step_fn(ty)
+                for exact in sorted(
+                    {
+                        bool(s.get("exact_dense_dot"))
+                        for s in specs
+                        if s.get("ime")
+                        and s["kind"] in ("plain", "multi", "glu")
+                    }
+                ):
+                    _ime_step_fn(ty, exact)
             if ime_attn:
                 _attn_mma_fns(ty)
         if part != "ime" and ime_attn:
@@ -4114,9 +4197,14 @@ def build_kernels(
                     if (
                         fixed_vlen
                         and s["kind"] == "plain"
-                        and s["m"] == 1
-                        and s["k"] == 2048
-                        and s["ns"] == [151936]
+                        and (
+                            (s["m"], s["k"], s["ns"]) == (1, 2048, [151936])
+                            or (
+                                s["m"] in (1, 2)
+                                and s["k"] == 5120
+                                and s["ns"] == [248320]
+                            )
+                        )
                     ):
                         s = dict(s, stream_head=True)
                     _tile_fn(ty, s)

@@ -519,7 +519,7 @@ for start in (0, 37):
 # CHECK: vir decode qk_norm start 0: same bits True
 # CHECK-NEXT: vir decode qk_norm start 37: same bits True
 
-# Only the fixed-VLEN, one-row 30B vocabulary projection uses whole banks.
+# Only the supported fixed-VLEN vocabulary projections use whole banks.
 head = {
     "name": "test_head",
     "kind": "plain",
@@ -535,5 +535,17 @@ assert "vl4re8.v" not in k3_w4.gen_kernels([head])
 assert "vl4re8.v" not in k3_w4.gen_kernels(
     [dict(head, ns=[2048])], fixed_vlen=True
 )
+for rows in (1, 2):
+    hybrid = dict(head, m=rows, k=5120, ns=[248320])
+    streamed = k3_w4.gen_kernels([hybrid], fixed_vlen=True)
+    assert streamed.count("vl4re8.v") == 4 * rows
+    assert "vl4re8.v" not in k3_w4.gen_kernels([hybrid])
 print("fixed VLEN head selection passed")
 # CHECK: fixed VLEN head selection passed
+
+# Both IME arithmetic modes can share a module and the same packed layout.
+dense = k3_w4.kernel_spec("plain", 64, 256, [128], False, 8, ime=True)
+exact = dict(dense, exact_dense_dot=True, name="hybrid_exact_test")
+ime = k3_w4.gen_kernels([dense, exact], part="ime")
+assert "@k3_ime_i32_step" in ime and "@k3_ime_hp_step" in ime
+assert '"ime.intr.vmadot"' in ime and '"ime.intr.vmadot.hp"' in ime

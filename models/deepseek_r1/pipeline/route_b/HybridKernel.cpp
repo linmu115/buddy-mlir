@@ -30,7 +30,7 @@ void zeroCenteredNorm(const float *x, const float *w, int size, float *out) {
 #if HYBRID_ROLE == 4
 void mix(const BJ47WeightsV1 &weights, const float *x, float *convState,
          float *ssmState, const BJ47FrameV1 &frame, int rows, int valid,
-         float *out) {
+         const float *residual, float *out) {
   const float *w = weights.f32;
   hybrid::Scratch qkvBuffer(rows * convDim), z(rows * valueWidth),
       b(rows * valueHeads), a(rows * valueHeads), core(rows * valueWidth);
@@ -114,7 +114,11 @@ void mix(const BJ47WeightsV1 &weights, const float *x, float *convState,
                  silu(z[t * valueWidth + h * valueDim + j]);
     }
   }
+#ifdef HYBRID_FUSED_GLU
+  proj_mixerOut(weights, core.data(), out, rows, residual);
+#else
   proj_mixerOut(weights, core.data(), out, rows);
+#endif
 }
 #elif (HYBRID_ROLE == 5 || HYBRID_ROLE == 6)
 void partialRotary(float *x, const float *cos, const float *sin) {
@@ -125,9 +129,54 @@ void partialRotary(float *x, const float *cos, const float *sin) {
   }
 }
 
+// Several adjacent queries use the same KV head. Finish scoring before
+// value accumulation so no query stays live across the softmax.
+template <int G>
+void decodeGroup(float *q, const float *norm, const float *cos,
+                 const float *sin, const float *keys, const float *values,
+                 int length, float *out) {
+  hybrid::Scratch scores(G * length);
+  float maximum[G], denominator[G] = {};
+  for (int h = 0; h < G; ++h) {
+    auto *query = q + h * 2 * headDim;
+    zeroCenteredNorm(query, norm, headDim, query);
+    partialRotary(query, cos, sin);
+    maximum[h] = -INFINITY;
+  }
+  const float scale = 1.0f / std::sqrt(float(headDim));
+  for (int t = 0; t < length; ++t) {
+    float dot[G] = {};
+    for (int i = 0; i < headDim; ++i)
+      for (int h = 0; h < G; ++h)
+        dot[h] += q[h * 2 * headDim + i] * keys[t * headDim + i];
+    for (int h = 0; h < G; ++h) {
+      scores[t * G + h] = dot[h] * scale;
+      maximum[h] = std::max(maximum[h], scores[t * G + h]);
+    }
+  }
+  for (int t = 0; t < length; ++t)
+    for (int h = 0; h < G; ++h) {
+      float &s = scores[t * G + h];
+      s = std::exp(s - maximum[h]);
+      denominator[h] += s;
+    }
+  std::fill_n(out, G * headDim, 0.0f);
+  for (int t = 0; t < length; ++t) {
+    float prob[G];
+    for (int h = 0; h < G; ++h)
+      prob[h] = scores[t * G + h] / denominator[h];
+    for (int i = 0; i < headDim; ++i)
+      for (int h = 0; h < G; ++h)
+        out[h * headDim + i] += prob[h] * values[t * headDim + i];
+  }
+  for (int h = 0; h < G; ++h)
+    for (int i = 0; i < headDim; ++i)
+      out[h * headDim + i] *= sigmoid(q[(h * 2 + 1) * headDim + i]);
+}
+
 void mix(const BJ47WeightsV1 &weights, const float *x, float *keys,
          float *values, const BJ47FrameV1 &frame, int rows, int valid,
-         float *out) {
+         const float *residual, float *out) {
   const auto *w = weights.f32;
   constexpr int qWidth = attentionHeads * headDim;
   constexpr int kvWidth = kvHeads * headDim;
@@ -156,6 +205,26 @@ void mix(const BJ47WeightsV1 &weights, const float *x, float *keys,
       }
     }
 
+#ifdef HYBRID_THREADS
+    if constexpr (attentionHeads / kvHeads == 6 && headDim == 256) {
+      if (rows == 1) {
+        const int group = position < 384 ? 2 : 4;
+        const int items = (6 + group - 1) / group;
+#pragma omp parallel for schedule(static) num_threads(HYBRID_THREADS)
+        for (uint64_t item = 0; item < uint64_t(kvHeads * items); ++item) {
+          const int kv = item / items, first = (item % items) * group;
+          const int h = kv * 6 + first;
+          auto apply =
+              (group == 4 && first == 0) ? decodeGroup<4> : decodeGroup<2>;
+          apply(qAndGate + h * 2 * headDim, w + qNorm, cos, sin,
+                keys + size_t(kv) * context * headDim,
+                values + size_t(kv) * context * headDim, position + 1,
+                core + h * headDim);
+        }
+        continue;
+      }
+    }
+#endif
     const float scale = 1.0f / std::sqrt(float(headDim));
     for (int h = 0; h < attentionHeads; ++h) {
       const int kvHead = h / (attentionHeads / kvHeads);
@@ -192,7 +261,11 @@ void mix(const BJ47WeightsV1 &weights, const float *x, float *keys,
         result[i] *= sigmoid(gate[i]);
     }
   }
+#ifdef HYBRID_FUSED_GLU
+  proj_mixerOut(weights, cores.data(), out, rows, residual);
+#else
   proj_mixerOut(weights, cores.data(), out, rows);
+#endif
 }
 #endif
 
@@ -219,11 +292,23 @@ int32_t layer(const BJ47WeightsV1 *weights, const float *input, float *a,
   for (int t = 0; t < validRows; ++t)
     zeroCenteredNorm(input + t * width, w + inputNorm, width,
                      norm.data() + t * width);
-  mix(*weights, norm.data(), a, b, *frame, rows, validRows, residual.data());
+  const float *skip = input;
+#ifdef HYBRID_FUSED_GLU
+  // The fused projection reads a full tile. Only valid input rows belong
+  // to the caller on a padded final chunk.
+  if (validRows < rows) {
+    std::copy_n(input, validRows * width, residual.data());
+    skip = residual.data();
+  }
+#endif
+  mix(*weights, norm.data(), a, b, *frame, rows, validRows, skip,
+      residual.data());
   for (int t = 0; t < validRows; ++t) {
     float *r = residual.data() + t * width;
+#ifndef HYBRID_FUSED_GLU
     for (int i = 0; i < width; ++i)
       r[i] += input[t * width + i];
+#endif
     zeroCenteredNorm(r, w + postNorm, width, norm.data() + t * width);
   }
 #ifdef HYBRID_FUSED_GLU
@@ -235,9 +320,13 @@ int32_t layer(const BJ47WeightsV1 *weights, const float *input, float *a,
   for (int i = 0; i < validRows * intermediate; ++i)
     gate[i] = silu(gate[i]) * up[i];
 #endif
+#ifdef HYBRID_FUSED_GLU
+  proj_downProj(*weights, gate.data(), out, rows, residual.data());
+#else
   proj_downProj(*weights, gate.data(), out, rows);
   for (int i = 0; i < validRows * width; ++i)
     out[i] += residual[i];
+#endif
   // Wire frames have fixed capacity. Define the tail without touching state.
   std::fill(out + validRows * width, out + rows * width, 0.0f);
   return 0;
