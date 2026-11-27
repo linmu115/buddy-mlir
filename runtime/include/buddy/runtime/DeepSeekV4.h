@@ -104,6 +104,57 @@ inline vfloat32m4_t loadE4M3(const uint8_t *src, size_t vl) {
       normal,
       __riscv_vsll_vx_u32m4(__riscv_vand_vx_u32m4(bits, 128, vl), 24, vl), vl));
 }
+inline float reduceSumM2(vfloat32m2_t v, size_t vl) {
+  auto zero = __riscv_vfmv_v_f_f32m1(0.f, 1);
+  return __riscv_vfmv_f_s_f32m1_f32(
+      __riscv_vfredusum_vs_f32m2_f32m1(v, zero, vl));
+}
+inline float reduceSumM1(vfloat32m1_t v, size_t vl) {
+  auto zero = __riscv_vfmv_v_f_f32m1(0.f, 1);
+  return __riscv_vfmv_f_s_f32m1_f32(
+      __riscv_vfredusum_vs_f32m1_f32m1(v, zero, vl));
+}
+// Branchless, zero-vrgather FP4 (E2M1) decode: returns 2 * E2M1(nibble) in f32m2.
+// Every E2M1 value * 2 is an exact signed integer in {-12,-8,-6,-4,-3,-2,-1,0,1,2,3,4,6,8,12}.
+// Avoiding vrgather.vv eliminates the severe K3 A100 gather bottleneck.
+inline vfloat32m2_t loadE2M1x2_m2(const uint8_t *packed, size_t vl) {
+  size_t bytes = (vl + 1) / 2;
+  auto raw = __riscv_vle8_v_u8mf4(packed, bytes);
+  auto pairs = __riscv_vzext_vf2_u16mf2(raw, bytes);
+  pairs = __riscv_vor_vv_u16mf2(pairs, __riscv_vsll_vx_u16mf2(pairs, 4, bytes),
+                                bytes);
+  auto ids =
+      __riscv_vand_vx_u8mf2(__riscv_vreinterpret_v_u16mf2_u8mf2(pairs), 15, vl);
+  auto mag = __riscv_vand_vx_u8mf2(ids, 7, vl);
+  auto e = __riscv_vsrl_vx_u8mf2(mag, 1, vl);
+  auto m = __riscv_vand_vx_u8mf2(mag, 1, vl);
+  auto isNorm = __riscv_vmsne_vx_u8mf2_b16(e, 0, vl);
+  auto shift = __riscv_vsub_vx_u8mf2_m(isNorm, e, 1, vl);
+  auto normVal =
+      __riscv_vsll_vv_u8mf2(__riscv_vor_vx_u8mf2(m, 2, vl), shift, vl);
+  auto val2 = __riscv_vmerge_vvm_u8mf2(m, normVal, isNorm, vl);
+  auto neg =
+      __riscv_vmsne_vx_u8mf2_b16(__riscv_vand_vx_u8mf2(ids, 8, vl), 0, vl);
+  auto sval = __riscv_vreinterpret_v_u8mf2_i8mf2(val2);
+  sval = __riscv_vneg_v_i8mf2_m(neg, sval, vl);
+  return __riscv_vfwcvt_f_x_v_f32m2(__riscv_vsext_vf2_i16m1(sval, vl), vl);
+}
+inline vfloat32m1_t loadE4M3_m1(const uint8_t *src, size_t vl) {
+  auto bits = __riscv_vzext_vf4_u32m1(__riscv_vle8_v_u8mf4(src, vl), vl);
+  auto mag = __riscv_vand_vx_u32m1(bits, 127, vl);
+  auto normal =
+      __riscv_vadd_vx_u32m1(__riscv_vsll_vx_u32m1(mag, 20, vl), 120u << 23, vl);
+  auto small =
+      __riscv_vfmul_vf_f32m1(__riscv_vfcvt_f_xu_v_f32m1(mag, vl), 0x1p-9f, vl);
+  normal = __riscv_vmerge_vvm_u32m1(normal,
+                                    __riscv_vreinterpret_v_f32m1_u32m1(small),
+                                    __riscv_vmsltu_vx_u32m1_b32(mag, 8, vl), vl);
+  normal = __riscv_vmerge_vxm_u32m1(
+      normal, 0x7fc00000, __riscv_vmseq_vx_u32m1_b32(mag, 127, vl), vl);
+  return __riscv_vreinterpret_v_u32m1_f32m1(__riscv_vor_vv_u32m1(
+      normal,
+      __riscv_vsll_vx_u32m1(__riscv_vand_vx_u32m1(bits, 128, vl), 24, vl), vl));
+}
 #endif
 inline const std::array<float, 256> &e4m3Table() {
   static const auto lut = [] {
@@ -140,34 +191,62 @@ inline void fp4MatVec(const float *x, const uint8_t *weights,
     return;
   }
   const size_t stride = (size_t(k) + 1) / 2, groups = (size_t(k) + 31) / 32;
+#if defined(__riscv_v_intrinsic)
+#pragma omp parallel for schedule(static) if (size_t(k) * n >= 262144)
+  for (int rb = 0; rb < n; rb += 4) {
+    size_t width = __riscv_vsetvl_e32m2(32);
+    if (rb + 4 <= n && (k & 31) == 0 && width == 32) {
+      const auto *r0 = weights + size_t(rb) * stride;
+      const auto *r1 = r0 + stride, *r2 = r1 + stride, *r3 = r2 + stride;
+      const auto *s0 = scales + size_t(rb) * groups;
+      const auto *s1 = s0 + groups, *s2 = s1 + groups, *s3 = s2 + groups;
+      auto a0 = __riscv_vfmv_v_f_f32m2(0.f, 32);
+      auto a1 = __riscv_vfmv_v_f_f32m2(0.f, 32);
+      auto a2 = __riscv_vfmv_v_f_f32m2(0.f, 32);
+      auto a3 = __riscv_vfmv_v_f_f32m2(0.f, 32);
+      for (int g = 0, j = 0; j < k; ++g, j += 32) {
+        auto xv = __riscv_vle32_v_f32m2(x + j, 32);
+        auto w0 = __riscv_vfmul_vf_f32m2(loadE2M1x2_m2(r0 + j / 2, 32),
+                                         0.5f * ue8m0(s0[g]), 32);
+        auto w1 = __riscv_vfmul_vf_f32m2(loadE2M1x2_m2(r1 + j / 2, 32),
+                                         0.5f * ue8m0(s1[g]), 32);
+        auto w2 = __riscv_vfmul_vf_f32m2(loadE2M1x2_m2(r2 + j / 2, 32),
+                                         0.5f * ue8m0(s2[g]), 32);
+        auto w3 = __riscv_vfmul_vf_f32m2(loadE2M1x2_m2(r3 + j / 2, 32),
+                                         0.5f * ue8m0(s3[g]), 32);
+        a0 = __riscv_vfmacc_vv_f32m2(a0, w0, xv, 32);
+        a1 = __riscv_vfmacc_vv_f32m2(a1, w1, xv, 32);
+        a2 = __riscv_vfmacc_vv_f32m2(a2, w2, xv, 32);
+        a3 = __riscv_vfmacc_vv_f32m2(a3, w3, xv, 32);
+      }
+      out[rb + 0] = reduceSumM2(a0, 32);
+      out[rb + 1] = reduceSumM2(a1, 32);
+      out[rb + 2] = reduceSumM2(a2, 32);
+      out[rb + 3] = reduceSumM2(a3, 32);
+    } else {
+      for (int r = rb; r < std::min(n, rb + 4); ++r) {
+        const auto *row = weights + size_t(r) * stride,
+                   *scale = scales + size_t(r) * groups;
+        auto acc = __riscv_vfmv_v_f_f32m2(0.f, width);
+        for (int j = 0; j < k; j += 32) {
+          float hs = 0.5f * ue8m0(scale[j / 32]);
+          for (int t = j; t < std::min(k, j + 32);) {
+            size_t vl = std::min<size_t>(width, std::min(k, j + 32) - t);
+            auto w = __riscv_vfmul_vf_f32m2(loadE2M1x2_m2(row + t / 2, vl), hs,
+                                            vl);
+            acc = __riscv_vfmacc_vv_f32m2_tu(
+                acc, w, __riscv_vle32_v_f32m2(x + t, vl), vl);
+            t += vl;
+          }
+        }
+        out[r] = reduceSumM2(acc, width);
+      }
+    }
+  }
+#else
 #pragma omp parallel for schedule(static) if (size_t(k) * n >= 262144)
   for (int r = 0; r < n; ++r) {
     const auto *row = weights + r * stride, *scale = scales + r * groups;
-#if defined(__riscv_v_intrinsic)
-    auto lut = __riscv_vle32_v_f32m4(E2M1, 16);
-    size_t width = __riscv_vsetvl_e32m4(32);
-    auto acc = __riscv_vfmv_v_f_f32m4(0, width);
-    for (int j = 0; j < k; j += 32) {
-      float s = ue8m0(scale[j / 32]);
-      for (int t = j; t < std::min(k, j + 32);) {
-        size_t vl = std::min<size_t>(width, std::min(k, j + 32) - t);
-        size_t bytes = (vl + 1) / 2;
-        auto pairs = __riscv_vzext_vf2_u16m1(
-            __riscv_vle8_v_u8mf2(row + t / 2, bytes), bytes);
-        // In little-endian e8 lanes each halfword becomes [low, high].
-        pairs = __riscv_vor_vv_u16m1(
-            pairs, __riscv_vsll_vx_u16m1(pairs, 4, bytes), bytes);
-        auto ids = __riscv_vand_vx_u8m1(
-            __riscv_vreinterpret_v_u16m1_u8m1(pairs), 15, vl);
-        auto w = __riscv_vrgather_vv_f32m4(
-            lut, __riscv_vzext_vf4_u32m4(ids, vl), vl);
-        acc = __riscv_vfmacc_vv_f32m4_tu(acc, __riscv_vfmul_vf_f32m4(w, s, vl),
-                                         __riscv_vle32_v_f32m4(x + t, vl), vl);
-        t += vl;
-      }
-    }
-    out[r] = reduceSum(acc, width);
-#else
     float sum = 0;
     for (int j = 0; j < k; j += 32) {
       float s = ue8m0(scale[j / 32]);
@@ -175,8 +254,8 @@ inline void fp4MatVec(const float *x, const uint8_t *weights,
         sum += x[t] * (E2M1[(row[t / 2] >> (4 * (t % 2))) & 15] * s);
     }
     out[r] = sum;
-#endif
   }
+#endif
 }
 // FP8 linear scales are shared by block x block tiles (including edge tiles).
 inline void fp8MatVec(const float *x, const uint8_t *weights,
@@ -195,19 +274,35 @@ inline void fp8MatVec(const float *x, const uint8_t *weights,
     const auto *row = weights + size_t(r) * k,
                *scale = scales + (r / block) * groups;
 #if defined(__riscv_v_intrinsic)
-    size_t width = __riscv_vsetvl_e32m4(std::min(k, block));
-    auto acc = __riscv_vfmv_v_f_f32m4(0, width);
-    for (int j = 0; j < k; j += block) {
-      float s = ue8m0(scale[j / block]);
-      for (int t = j; t < std::min(k, j + block);) {
-        size_t vl = std::min<size_t>(width, std::min(k, j + block) - t);
-        auto w = __riscv_vfmul_vf_f32m4(loadE4M3(row + t, vl), s, vl);
-        acc = __riscv_vfmacc_vv_f32m4_tu(acc, w,
-                                         __riscv_vle32_v_f32m4(x + t, vl), vl);
-        t += vl;
+    if (block <= 32) {
+      size_t width = __riscv_vsetvl_e32m1(std::min(k, block));
+      auto acc = __riscv_vfmv_v_f_f32m1(0.f, width);
+      for (int j = 0; j < k; j += block) {
+        float s = ue8m0(scale[j / block]);
+        for (int t = j; t < std::min(k, j + block);) {
+          size_t vl = std::min<size_t>(width, std::min(k, j + block) - t);
+          auto w = __riscv_vfmul_vf_f32m1(loadE4M3_m1(row + t, vl), s, vl);
+          acc = __riscv_vfmacc_vv_f32m1_tu(acc, w,
+                                           __riscv_vle32_v_f32m1(x + t, vl), vl);
+          t += vl;
+        }
       }
+      out[r] = reduceSumM1(acc, width);
+    } else {
+      size_t width = __riscv_vsetvl_e32m4(std::min(k, block));
+      auto acc = __riscv_vfmv_v_f_f32m4(0.f, width);
+      for (int j = 0; j < k; j += block) {
+        float s = ue8m0(scale[j / block]);
+        for (int t = j; t < std::min(k, j + block);) {
+          size_t vl = std::min<size_t>(width, std::min(k, j + block) - t);
+          auto w = __riscv_vfmul_vf_f32m4(loadE4M3(row + t, vl), s, vl);
+          acc = __riscv_vfmacc_vv_f32m4_tu(acc, w,
+                                           __riscv_vle32_v_f32m4(x + t, vl), vl);
+          t += vl;
+        }
+      }
+      out[r] = reduceSum(acc, width);
     }
-    out[r] = reduceSum(acc, width);
 #else
     float sum = 0;
     for (int j = 0; j < k; j += block) {
