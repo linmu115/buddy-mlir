@@ -7,6 +7,39 @@ def projection(output, width, rows=1):
     weights = f"memref<{output}x{width}xf32>"
     x = f"memref<{rows}x{width}xf32>"
     y = f"memref<{rows}x{output}xf32>"
+    if 2 <= rows <= 4:
+        # FP32 decay/beta gates stay in the original weight bucket. Keep
+        # independent accumulators in scalar-decode order, sharing each load.
+        vec = "vector<8xf32>"
+        lines = [
+            f"func.func @project_{rows}_{output}_{width}(%w: {weights}, %x: {x}, %y: {y}) attributes {{llvm.emit_c_interface}} {{",
+            *[f"%r{r} = arith.constant {r} : index" for r in range(rows)],
+            "%c8 = arith.constant 8 : index",
+            f"%width = arith.constant {width} : index",
+            f"%output = arith.constant {output} : index",
+            f"%zero = arith.constant dense<0.0> : {vec}",
+            "scf.for %i = %r0 to %output step %r1 {",
+        ]
+        args = ", ".join(f"%acc{r} = %zero" for r in range(rows))
+        types = ", ".join([vec] * rows)
+        lines += [
+            f"%partial:{rows} = scf.for %j = %r0 to %width step %c8 iter_args({args}) -> ({types}) {{",
+            f"%a = vector.load %w[%i, %j] : {weights}, {vec}",
+        ]
+        for r in range(rows):
+            lines += [
+                f"%b{r} = vector.load %x[%r{r}, %j] : {x}, {vec}",
+                f"%prod{r} = arith.mulf %a, %b{r} : {vec}",
+                f"%sum{r} = arith.addf %acc{r}, %prod{r} : {vec}",
+            ]
+        sums = ", ".join(f"%sum{r}" for r in range(rows))
+        lines += [f"scf.yield {sums} : {types}", "}"]
+        for r in range(rows):
+            lines += [
+                f"%dot{r} = vector.reduction <add>, %partial#{r} : {vec} into f32",
+                f"memref.store %dot{r}, %y[%r{r}, %i] : {y}",
+            ]
+        return "\n".join(lines + ["}", "return", "}"])
     return dedent(f"""\
       func.func @project_{rows}_{output}_{width}(%w: {weights}, %x: {x}, %y: {y})
           attributes {{llvm.emit_c_interface}} {{

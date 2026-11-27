@@ -1327,11 +1327,11 @@ def _tile_types(ty, spec):
     return t
 
 
-def _accumulate(fn, ty, spec, a, wtile, rows):
+def _accumulate(fn, ty, spec, a, wtile, rows, column=None, lanes=NB):
     """f32 accumulators (vector<NB x f32>) of `rows` over all groups of
     weight tile `wtile`."""
     k = spec["k"]
-    vf, v8, v16, v32 = (_vec(NB, t) for t in (ty.f32, ty.i8, ty.i16, ty.i32))
+    vf, v8, v16, v32 = (_vec(lanes, t) for t in (ty.f32, ty.i8, ty.i16, ty.i32))
     four = fn.const(v8, 4)
     tbase = _muli(wtile, fn.idx(tile_bytes(k)))
     zero = fn.const(vf, 0.0)
@@ -1346,13 +1346,19 @@ def _accumulate(fn, ty, spec, a, wtile, rows):
             # costs about the same whatever its size on the A100, and with
             # the exact VLEN given to llc the 128-byte slices are register
             # halves of one vl4r.
-            if p % 4 == 0:
-                wide = vector.LoadOp(
-                    _vec(4 * NB, ty.i8), a["w"], [_addi(gbase, fn.idx(p * NB))]
+            if column is not None:
+                offset = _addi(_addi(gbase, fn.idx(p * NB)), column)
+                w = vector.LoadOp(v8, a["w"], [offset]).result
+            else:
+                if p % 4 == 0:
+                    wide = vector.LoadOp(
+                        _vec(4 * NB, ty.i8),
+                        a["w"],
+                        [_addi(gbase, fn.idx(p * NB))],
+                    ).result
+                w = vector.ExtractStridedSliceOp(
+                    v8, wide, [(p % 4) * NB], [NB], [1]
                 ).result
-            w = vector.ExtractStridedSliceOp(
-                v8, wide, [(p % 4) * NB], [NB], [1]
-            ).result
             lo = arith.ShRSIOp(arith.ShLIOp(w, four).result, four).result
             hi = arith.ShRSIOp(w, four).result
             halves = [arith.ExtSIOp(v16, h).result for h in (lo, hi)]
@@ -1363,11 +1369,12 @@ def _accumulate(fn, ty, spec, a, wtile, rows):
                     ).result
                     xv = _bcast(v16, arith.ExtSIOp(ty.i16, xb).result)
                     acc16[i] = _addi(acc16[i], _muli(half, xv))
-        raw = vector.LoadOp(
-            _vec(2 * NB, ty.i8), a["w"], [_addi(gbase, fn.idx(G // 2 * NB))]
-        ).result
+        scale_base = _addi(gbase, fn.idx(G // 2 * NB))
+        if column is not None:
+            scale_base = _addi(scale_base, _muli(column, fn.idx(2)))
+        raw = vector.LoadOp(_vec(2 * lanes, ty.i8), a["w"], [scale_base]).result
         scale = arith.ExtFOp(
-            vf, vector.BitCastOp(_vec(NB, ty.f16), raw).result
+            vf, vector.BitCastOp(_vec(lanes, ty.f16), raw).result
         ).result
         outs = []
         for i, row in enumerate(rows):
@@ -1399,6 +1406,35 @@ def _tile_fn(ty, spec):
     fn = _Fn(f"{spec['name']}__tile", _tile_types(ty, spec), [], public=False)
     a = dict(zip(names, fn.args))
     vf = _vec(NB, ty.f32)
+    if spec.get("verify"):
+        # Strip-mine the 128 columns so four fp32 sums and four gated
+        # results fit in the RVV register file. Each byte belongs to one strip.
+        lanes = 32 if spec["kind"] == "glu" and m == 4 else 64
+        with ir.InsertionPoint(fn.entry):
+            strips = scf.ForOp(fn.idx(0), fn.idx(NB), fn.idx(lanes))
+            with ir.InsertionPoint(strips.body):
+                col = strips.induction_variable
+                rows = [fn.idx(r) for r in range(m)]
+                if spec["kind"] == "glu":
+                    tg = _muli(a["wt"], fn.idx(2))
+                    gate = _accumulate(fn, ty, spec, a, tg, rows, col, lanes)
+                    up = _accumulate(
+                        fn, ty, spec, a, _addi(tg, fn.idx(1)), rows, col, lanes
+                    )
+                    vals = [
+                        _silu_mul(fn, ty, g, u, lanes) for g, u in zip(gate, up)
+                    ]
+                else:
+                    vals = _accumulate(
+                        fn, ty, spec, a, a["wt"], rows, col, lanes
+                    )
+                for row, value in zip(rows, vals):
+                    vector.StoreOp(
+                        value, a["out"], [row, _addi(a["ocol"], col)]
+                    )
+                scf.YieldOp([])
+            func.ReturnOp([])
+        return
     with ir.InsertionPoint(fn.entry):
         loop = scf.ForOp(fn.idx(0), fn.idx(m), fn.idx(mb))
         with ir.InsertionPoint(loop.body):

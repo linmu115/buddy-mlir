@@ -51,10 +51,11 @@ void mix(const BJ47WeightsV1 &weights, const float *x, float *convState,
       qkv[c] = silu(sum);
     }
 
-    if (rows == 2 && t == 0)
+    if (rows <= 4 && t + 1 < valid)
       std::copy_n(
           convState, convDim * convKernel,
-          static_cast<const BJ47VerifyRows *>(frame.aux)->conv_snapshot);
+          static_cast<const BJ47VerifyRows *>(frame.aux)->conv_snapshot +
+              size_t(t) * convDim * convKernel);
     auto *query = qkv;
     auto *key = qkv + keyWidth;
 
@@ -88,7 +89,7 @@ void mix(const BJ47WeightsV1 &weights, const float *x, float *convState,
     const auto *v = qkvBuffer.data() + 2 * keyWidth + h * valueDim;
     float *state = ssmState + h * keyDim * valueDim;
     float *head = core.data() + h * valueDim;
-    if (rows <= 2
+    if (rows <= 4
 #ifdef HYBRID_RECURRENT_REFERENCE
         || rows == chunk
 #endif
@@ -97,11 +98,11 @@ void mix(const BJ47WeightsV1 &weights, const float *x, float *convState,
         deltaStep(state, q + t * convDim, k + t * convDim, v + t * convDim,
                   head + t * valueWidth, b[t * valueHeads + h],
                   std::exp(a[t * valueHeads + h]));
-        if (rows == 2 && t == 0)
+        if (rows <= 4 && t + 1 < valid)
           std::copy_n(
               state, keyDim * valueDim,
               static_cast<const BJ47VerifyRows *>(frame.aux)->ssm_snapshot +
-                  h * keyDim * valueDim);
+                  (size_t(t) * valueHeads + h) * keyDim * valueDim);
       }
     } else
       hybrid::chunkGDN(q, k, v, convDim, a.data() + h, b.data() + h, valueHeads,
@@ -270,7 +271,7 @@ extern "C" int32_t lm_head_normalize(const BJ47WeightsV1 *w, const float *input,
 }
 extern "C" int32_t lm_head_linear(const BJ47WeightsV1 *w, const float *input,
                                   float *out, int rows) {
-  if (!w || !input || !out || input == out || (rows != 1 && rows != 2) ||
+  if (!w || !input || !out || input == out || (rows < 1 || rows > 4) ||
       (kernelInfo.base.i8_elements ? !w->q4 : !w->f32))
     return -1;
   proj_lmHead(*w, input, out, rows);
@@ -301,7 +302,7 @@ extern "C" int32_t mtp_forward(const BJ47WeightsV1 *w, const float *embedding,
                                const BJ47FrameV1 *frame, float *out, int rows) {
   if (!w || !w->f32 || (kernelInfo.base.i8_elements && !w->q4) || !embedding ||
       !hidden || !frame || !frame->aux || !out ||
-      (rows != 1 && rows != 2 && rows != chunk))
+      ((rows < 1 || rows > 4) && rows != chunk))
     return -1;
   const auto valid =
       static_cast<const BJ47FrameRowsV2 *>(frame->aux)->valid_rows;
@@ -323,19 +324,28 @@ extern "C" int32_t mtp_forward(const BJ47WeightsV1 *w, const float *embedding,
   return 0;
 }
 #else
-extern "C" int32_t layer_verify_2(const BJ47WeightsV1 *w, const float *input,
-                                  float *a, float *b, const BJ47FrameV1 *frame,
-                                  float *out) {
+extern "C" int32_t layer_verify(const BJ47WeightsV1 *w, const float *input,
+                                float *a, float *b, const BJ47FrameV1 *frame,
+                                float *out) {
   if (!frame || !frame->aux)
     return -1;
   const auto *aux = static_cast<const BJ47VerifyRows *>(frame->aux);
-  if (aux->rows.valid_rows != 2)
+  if (aux->rows.valid_rows < 2 || aux->rows.valid_rows > 4)
     return -2;
 #if HYBRID_ROLE == 4
   if (!aux->conv_snapshot || !aux->ssm_snapshot)
     return -1;
 #endif
-  return layer(w, input, a, b, frame, out, 2);
+  return layer(w, input, a, b, frame, out,
+               static_cast<int>(aux->rows.valid_rows));
+}
+extern "C" int32_t layer_verify_2(const BJ47WeightsV1 *w, const float *input,
+                                  float *a, float *b, const BJ47FrameV1 *frame,
+                                  float *out) {
+  if (!frame || !frame->aux ||
+      static_cast<const BJ47FrameRowsV2 *>(frame->aux)->valid_rows != 2)
+    return -2;
+  return layer_verify(w, input, a, b, frame, out);
 }
 extern "C" int32_t layer_prefill(const BJ47WeightsV1 *w, const float *input,
                                  float *a, float *b, const BJ47FrameV1 *frame,
