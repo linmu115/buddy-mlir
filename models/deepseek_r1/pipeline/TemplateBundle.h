@@ -46,7 +46,7 @@ void validateChain(const std::vector<LayerRange> &ranges, int total);
 class MtpStage : public Stage {
 public:
   virtual const float *backbone(void *input, int pos, int rows, int valid) = 0;
-  virtual void rewindOne() = 0;
+  virtual void commitPrefix(int pos, int kept, int rows) = 0;
   virtual void gatherShifted(const int64_t *ids, int rows, void *packed) = 0;
   virtual const float *draftHidden(const void *packed, bool half,
                                    const float *hidden, int pos, int rows,
@@ -56,5 +56,7 @@ public:
 std::unique_ptr<MtpStage> makeTemplateStage(const TemplateBundle &, LayerRange,
                                             bool verifyWeights = false,
                                             int slots = 1,
-                                            bool enableMtp = false);
+                                            bool enableMtp = false,
+                                            int maxDraft = 1,
+                                            bool usePredictor = true);
 } // namespace buddy::runtime

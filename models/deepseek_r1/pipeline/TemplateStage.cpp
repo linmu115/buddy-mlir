@@ -139,7 +139,9 @@ struct Layer {
   decltype(&layer_prefill) prefill;
   decltype(&layer_decode) decode;
   decltype(&layer_verify_2) verify{};
-  std::vector<Buffer> k, v, savedK, savedV;
+  std::vector<Buffer> k, v;
+  // Verification and commit finish before switching slots.
+  Buffer savedK, savedV;
 };
 class TemplateStage final : public MtpStage {
   StageConfig cfg;
@@ -162,7 +164,7 @@ class TemplateStage final : public MtpStage {
   std::vector<int64_t> tokenStorage;
   size_t mapped = 0, stateBytes = 0;
   bool verifyWeights;
-  const int slots;
+  const int slots, verifyCapacity;
   int activeSlot = 0;
   uint64_t inputAlignment = 64;
   bool hybrid;
@@ -194,10 +196,10 @@ class TemplateStage final : public MtpStage {
     BJ47FrameRowsV2 rowInfo{validRows};
     BJ47FrameV1 frame{pos, cosine.data(), sine.data(),
                       hybrid ? &rowInfo : nullptr};
-    if (rows == 2 && p.prepare) {
+    if (!prefill && rows > 1 && p.prepare) {
       int stride =
           static_cast<int>(cosine.bytes / (cfg.prefillChunk * sizeof(float)));
-      for (int i = 0; i < 2; ++i)
+      for (int i = 0; i < rows; ++i)
         checked(ropeOne(rope, pos + i, cosine.data() + i * stride,
                         sine.data() + i * stride, nullptr),
                 cfg.startLayer, "prepare verify");
@@ -213,7 +215,7 @@ class TemplateStage final : public MtpStage {
       auto ids = static_cast<int64_t *>(
           std::align(64, rows * sizeof(int64_t), aligned, space));
       std::copy_n(static_cast<const int64_t *>(input), rows, ids);
-      int calls = rows == 2 ? 2 : 1;
+      int calls = prefill ? 1 : rows;
       for (int i = 0; i < calls; ++i)
         checked(p.embedF16 ? p.embedF16(static_cast<const uint16_t *>(table),
                                         ids + i, out + i * cfg.activationWidth)
@@ -231,12 +233,12 @@ class TemplateStage final : public MtpStage {
     for (int i = cfg.startLayer; i < cfg.endLayer; ++i) {
       auto &l = layers[i - cfg.startLayer];
       auto kernel = prefill ? l.prefill : l.decode;
-      BJ47VerifyRows snapshot{{2}, nullptr, nullptr};
-      if (rows == 2) {
+      BJ47VerifyRows snapshot{{rows}, nullptr, nullptr};
+      if (!prefill && rows > 1) {
         kernel = l.verify;
-        if (!l.savedK.empty()) {
-          snapshot.conv_snapshot = l.savedK[activeSlot].data();
-          snapshot.ssm_snapshot = l.savedV[activeSlot].data();
+        if (l.savedK.data()) {
+          snapshot.conv_snapshot = l.savedK.data();
+          snapshot.ssm_snapshot = l.savedV.data();
         }
         frame.aux = &snapshot;
       }
@@ -263,9 +265,11 @@ class TemplateStage final : public MtpStage {
 
 public:
   TemplateStage(const TemplateBundle &bundle, LayerRange range, bool verify,
-                int slotCount, bool enableMtp)
+                int slotCount, bool enableMtp, int maxDraft, bool usePredictor)
       : cfg(bundle.config), verifyWeights(verify), slots(slotCount),
-        hybrid(bundle.hybrid) {
+        verifyCapacity(maxDraft + 1), hybrid(bundle.hybrid) {
+    if (maxDraft < 1 || maxDraft > 3)
+      throw std::invalid_argument("invalid maximum draft length");
     if (slots < 1)
       throw std::invalid_argument("Route B requires at least one KV slot");
     auto [start, end] = range;
@@ -312,10 +316,12 @@ public:
       projection = weights("head", -1, head);
       pre.head = head.symbol<decltype(pre.head)>("lm_head_prefill");
       dec.head = head.symbol<decltype(dec.head)>("lm_head_decode");
-      logits.allocate(size_t(cfg.vocabSize) * (enableMtp ? 2 : 1));
+      logits.allocate(size_t(cfg.vocabSize) * (enableMtp ? maxDraft + 1 : 1));
       if (enableMtp) {
         normalize = head.symbol<decltype(normalize)>("lm_head_normalize");
         project = head.symbol<decltype(project)>("lm_head_linear");
+      }
+      if (enableMtp && usePredictor) {
         mtp.open(bundle, "mtp_layer", 6);
         predictor.weights = weights("mtp", -1, mtp);
         predict = mtp.symbol<decltype(predict)>("mtp_forward");
@@ -355,17 +361,14 @@ public:
       l.prefill = lib.symbol<decltype(l.prefill)>("layer_prefill");
       l.decode = lib.symbol<decltype(l.decode)>("layer_decode");
       if (enableMtp)
-        l.verify = lib.symbol<decltype(l.verify)>("layer_verify_2");
+        l.verify = lib.symbol<decltype(l.verify)>(
+            maxDraft == 1 ? "layer_verify_2" : "layer_verify");
       const size_t stateA = lib.hybrid ? lib.hybrid->state_a_elements : kv;
       const size_t stateB = lib.hybrid ? lib.hybrid->state_b_elements : kv;
       if (enableMtp && type == "gdn") {
-        l.savedK.resize(slots);
-        l.savedV.resize(slots);
-        for (int slot = 0; slot < slots; ++slot) {
-          l.savedK[slot].allocate(stateA, true);
-          l.savedV[slot].allocate(stateB, true);
-          stateBytes += l.savedK[slot].bytes + l.savedV[slot].bytes;
-        }
+        l.savedK.allocate(product({stateA, size_t(maxDraft)}));
+        l.savedV.allocate(product({stateB, size_t(maxDraft)}));
+        stateBytes += l.savedK.bytes + l.savedV.bytes;
       }
       l.k.resize(slots);
       l.v.resize(slots);
@@ -382,8 +385,9 @@ public:
     }
     auto hidden =
         product({size_t(cfg.prefillChunk), size_t(cfg.activationWidth)});
-    if (predict) {
+    if (normalize)
       normalized.allocate(hidden);
+    if (predict) {
       embeddings.allocate(hidden);
       predicted.allocate(hidden);
       if (!rope) {
@@ -421,10 +425,6 @@ public:
     for (auto &layer : layers) {
       layer.k[slot].clear();
       layer.v[slot].clear();
-      if (!layer.savedK.empty()) {
-        layer.savedK[slot].clear();
-        layer.savedV[slot].clear();
-      }
     }
     if (predict) {
       predictor.k[slot].clear();
@@ -432,20 +432,53 @@ public:
     }
   }
   const float *backbone(void *input, int pos, int rows, int valid) override {
-    if (rows != 1 && rows != 2 && rows != cfg.prefillChunk)
+    if ((rows < 1 || rows > verifyCapacity) && rows != cfg.prefillChunk)
       throw std::invalid_argument("invalid speculative frame capacity");
     return static_cast<const float *>(
         run(input, pos, rows == cfg.prefillChunk, false, valid, rows, true));
   }
-  void rewindOne() override {
-    for (auto &l : layers)
-      if (!l.savedK.empty()) {
-        std::memcpy(l.k[activeSlot].data(), l.savedK[activeSlot].data(),
-                    l.k[activeSlot].bytes);
-        std::memcpy(l.v[activeSlot].data(), l.savedV[activeSlot].data(),
-                    l.v[activeSlot].bytes);
+  void commitPrefix(int pos, int kept, int rows) override {
+    if (kept < 1 || kept > rows || rows > 4 || pos < 0 ||
+        pos > cfg.context - rows)
+      throw std::invalid_argument("invalid verification commit");
+    if (kept == rows)
+      return;
+    for (auto &l : layers) {
+      auto &k = l.k[activeSlot], &v = l.v[activeSlot];
+      if (l.savedK.data()) {
+        std::memcpy(k.data(),
+                    l.savedK.data() + (kept - 1) * (k.bytes / sizeof(float)),
+                    k.bytes);
+        std::memcpy(v.data(),
+                    l.savedV.data() + (kept - 1) * (v.bytes / sizeof(float)),
+                    v.bytes);
+      } else {
+        // KV is [head, context, dim]. Restore the unused tail as well as
+        // the logical position, so a slot matches scalar decode bytewise.
+        const auto *info = templates.at("full_attn_layer").info;
+        for (unsigned h = 0; h < info->kv_heads; ++h) {
+          size_t start =
+              (size_t(h) * cfg.context + pos + kept) * info->head_dim;
+          size_t length = size_t(rows - kept) * info->head_dim;
+          std::fill_n(k.data() + start, length, 0.f);
+          std::fill_n(v.data() + start, length, 0.f);
+        }
       }
+    }
   }
+#ifdef BUDDY_TEST_SPECULATIVE_STATE
+  void compareBackboneSlots(int first, int second) const {
+    for (size_t i = 0; i < layers.size(); ++i) {
+      const auto &layer = layers[i];
+      for (auto *buffers : {&layer.k, &layer.v}) {
+        const Buffer &a = buffers->at(first), &b = buffers->at(second);
+        if (std::memcmp(a.data(), b.data(), a.bytes))
+          throw std::runtime_error("cache differs at layer " +
+                                   std::to_string(i));
+      }
+    }
+  }
+#endif
   void gatherShifted(const int64_t *ids, int rows, void *packed) override {
     size_t bytes = size_t(cfg.activationWidth) * (pre.embedF16 ? 2 : 4);
     for (int i = 0; i < rows; ++i) {
@@ -477,7 +510,8 @@ public:
     return predicted.data();
   }
   const float *linear(const float *hidden, int rows) override {
-    if (project(&projection, hidden, logits.data(), rows))
+    if (!project || rows < 1 || rows > verifyCapacity ||
+        project(&projection, hidden, logits.data(), rows))
       throw std::runtime_error("MTP shared head");
     return logits.data();
   }
@@ -499,9 +533,17 @@ public:
   }
 };
 } // namespace
+#ifdef BUDDY_TEST_SPECULATIVE_STATE
+void compareSpeculativeSlots(const MtpStage &stage, int first, int second) {
+  dynamic_cast<const TemplateStage &>(stage).compareBackboneSlots(first,
+                                                                  second);
+}
+#endif
 std::unique_ptr<MtpStage> makeTemplateStage(const TemplateBundle &b,
                                             LayerRange range, bool verify,
-                                            int slots, bool enableMtp) {
-  return std::make_unique<TemplateStage>(b, range, verify, slots, enableMtp);
+                                            int slots, bool enableMtp,
+                                            int maxDraft, bool usePredictor) {
+  return std::make_unique<TemplateStage>(b, range, verify, slots, enableMtp,
+                                         maxDraft, usePredictor);
 }
 } // namespace buddy::runtime

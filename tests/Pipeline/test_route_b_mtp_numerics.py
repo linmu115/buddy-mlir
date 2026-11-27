@@ -184,6 +184,62 @@ def run(checkpoint, bundle, spec, length):
         for a, b in zip(*observed):
             assert torch.equal(a.view(torch.int32), b.view(torch.int32))
         pos += valid
+    # Reuse the same predictor layer and its KV at successively shifted
+    # positions. Feed its post-final-norm hidden directly to the next FC.
+    actual = observed[0][0][valid - 1 : valid].contiguous()
+    expected = expected[-1:].contiguous()
+    k, v = states[0]
+    for depth in (2, 3):
+        expected_logits = expected @ head["lm_head.weight"].T
+        logits = torch.empty(config.vocab_size)
+        assert (
+            linear(ct.byref(hw), actual.data_ptr(), logits.data_ptr(), 1) == 0
+        )
+        compare(f"depth{depth - 1}_logits", logits, expected_logits[0])
+        token = int(logits.argmax())
+        assert token == int(expected_logits.argmax())
+        embedding = emb[token : token + 1].float()
+        x = torch.nn.functional.linear(
+            torch.cat(
+                (
+                    norm(embedding, wt["mtp.pre_fc_norm_embedding.weight"]),
+                    norm(expected, wt["mtp.pre_fc_norm_hidden.weight"]),
+                ),
+                dim=-1,
+            ),
+            wt["mtp.fc.weight"],
+        )[None]
+        cs = rope(x, torch.tensor([[pos]]))
+        expected = norm(
+            layer(x, cs, torch.zeros(1, 1, 1, pos + 1), cache=torch_cache)[0],
+            wt["mtp.norm.weight"],
+        )
+        co, si = [t.contiguous() for t in cs]
+        valid_ptr = ct.c_int64(1)
+        frame = Frame(
+            pos, co.data_ptr(), si.data_ptr(), ct.addressof(valid_ptr)
+        )
+        output = torch.empty_like(actual)
+        assert (
+            predict(
+                ct.byref(mw),
+                embedding.data_ptr(),
+                actual.data_ptr(),
+                k.data_ptr(),
+                v.data_ptr(),
+                ct.byref(frame),
+                output.data_ptr(),
+                1,
+            )
+            == 0
+        )
+        compare(f"chained_hidden_k{depth}", output, expected)
+        for label, state, ref in zip(("K", "V"), (k, v), torch_cache.kv[3]):
+            compare(f"chained_{label}_k{depth}", state[:, : pos + 1], ref[0])
+        actual = output
+        pos += 1
+    assert linear(ct.byref(hw), actual.data_ptr(), logits.data_ptr(), 1) == 0
+    compare("depth3_logits", logits, (expected @ head["lm_head.weight"].T)[0])
     return {"prompt": length, "max_abs": peaks, "padding_bit_diff": 0}
 
 

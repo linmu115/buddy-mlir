@@ -3,13 +3,57 @@
 #pragma once
 #include "../ResidentGenerate.h"
 #include "../TemplateBundle.h"
+#include <array>
+#include <cmath>
 
 namespace buddy::runtime::pipeline {
 namespace mtp {
 using detail::BatchClock;
 using Json = nlohmann::json;
+enum class Mode { Mtp, Ngram, DSpark };
+struct Options {
+  Mode mode = Mode::DSpark;
+  int maxDraft = 3;
+  double tau = .55, minP = .35;
+};
+
+struct Draft {
+  std::array<int, 3> tokens{};
+  int count = 0;
+};
+
+// Longest suffix first, newest completed occurrence first. Only copy
+// observed continuation tokens, including when the occurrences overlap.
+inline Draft lookup(const std::vector<int64_t> &history, int minN, int limit) {
+  Draft draft;
+  for (int n = 5; n >= minN; --n) {
+    int suffix = static_cast<int>(history.size()) - n;
+    for (int i = suffix - 1; i >= 0; --i) {
+      if (std::equal(history.begin() + i, history.begin() + i + n,
+                     history.begin() + suffix)) {
+        draft.count = std::min(limit, suffix - i);
+        std::copy_n(history.begin() + i + n, draft.count, draft.tokens.begin());
+        return draft;
+      }
+    }
+  }
+  return draft;
+}
+
 struct Stream {
-  int prompt = 0, position = 0, limit = 0, draft = 0;
+  int prompt = 0, position = 0, limit = 0;
+  Draft draft;
+  std::vector<int64_t> history;
+  std::array<int, 3> chosen{}, offered{}, matched{};
+  std::array<int, 4> prefixes{};
+  int lookupSteps = 0;
+  // DSpark lookup hits need no predictor. Buffer only its committed inputs
+  // until the first miss, with embeddings still represented by token IDs.
+  int deferredPos = 0, deferredRows = 0;
+  std::vector<float> deferredHidden;
+  std::vector<int64_t> deferredIds;
+  std::array<int, 3> predictorWidths{};
+
   size_t ordinal = 0;
   int proposed = 0, accepted = 0, steps = 0;
   std::string request;
@@ -17,7 +61,19 @@ struct Stream {
   BatchClock::time_point arrival, first;
   int64_t ttft = 0;
   Json stats() const {
-    return {{"mtp_proposed", proposed},
+    std::array<double, 3> rates{};
+    for (int i = 0; i < 3; ++i)
+      rates[i] = offered[i] ? double(matched[i]) / offered[i] : 0.;
+    return {{"draft_k_histogram", chosen},
+            {"draft_depth_proposed", offered},
+            {"draft_depth_accepted", matched},
+            {"draft_depth_accept_rate", rates},
+            {"accepted_prefix_histogram", prefixes},
+            {"ngram_steps", lookupSteps},
+            {"mtp_k_histogram", predictorWidths},
+            {"avg_drafted_k", steps ? double(proposed) / steps : 0.},
+            {"avg_accepted_per_step", steps ? double(accepted) / steps : 0.},
+            {"mtp_proposed", proposed},
             {"mtp_accepted", accepted},
             {"mtp_accept_rate", proposed ? double(accepted) / proposed : 0.0},
             {"avg_tokens_per_step",
@@ -87,8 +143,26 @@ public:
     }
     mpiCheck(MPI_Bcast(tokens, rows, MPI_INT, last, comm));
   }
-  int advance(const int64_t *shifted, const float *hidden, int pos, int rows,
-              int valid, bool propose) {
+  // All accepted IDs are already present on every rank. A prefix length and
+  // one correction/bonus token suffice even for a four-row verify.
+  std::array<int, 2> verify(const float *hidden, const Draft &draft) {
+    std::array<int, 2> reply{};
+    if (rank == last) {
+      auto logits = stage.linear(hidden, draft.count + 1);
+      for (int i = 0; i <= draft.count; ++i) {
+        const float *row = logits + size_t(i) * vocab;
+        int token = int(std::max_element(row, row + vocab) - row);
+        if (i == draft.count || token != draft.tokens[i]) {
+          reply = {i, token};
+          break;
+        }
+      }
+    }
+    mpiCheck(MPI_Bcast(reply.data(), 2, MPI_INT, last, comm));
+    return reply;
+  }
+  const float *advance(const int64_t *shifted, const float *hidden, int pos,
+                       int rows, int valid) {
     const int bytes = valid * width * (halfEmbed ? 2 : 4);
     void *packed = halfEmbed ? static_cast<void *>(halfEmbeddings.data())
                              : floatEmbeddings.data();
@@ -105,9 +179,38 @@ public:
       result = stage.draftHidden(packed, halfEmbed, hidden, pos, rows, valid) +
                (valid - 1) * width;
     }
-    int draft = 0;
-    if (propose)
-      greedy(result, 1, &draft);
+    return result;
+  }
+
+  Draft propose(const Options &opt, const float *hidden, int nextPos,
+                int limit) {
+    Draft draft;
+    double cumulative = 1.;
+    while (draft.count < limit) {
+      int decision[2] = {}; // top token and confidence gate, one reply
+      if (rank == last) {
+        const float *logits = stage.linear(hidden, 1);
+        auto top = std::max_element(logits, logits + vocab);
+        decision[0] = int(top - logits);
+        decision[1] = 1;
+        if (opt.mode == Mode::DSpark) {
+          double sum = 0.;
+          for (int i = 0; i < vocab; ++i)
+            sum += std::exp(double(logits[i]) - *top);
+          const double probability = 1. / sum;
+          cumulative *= probability;
+          decision[1] = probability >= opt.minP && cumulative >= opt.tau;
+        }
+      }
+      mpiCheck(MPI_Bcast(decision, 2, MPI_INT, last, comm));
+      // Always verify one candidate. Discard a failed deeper candidate.
+      if (decision[1] || !draft.count)
+        draft.tokens[draft.count++] = decision[0];
+      if (!decision[1] || draft.count == limit)
+        break;
+      int64_t shifted = decision[0];
+      hidden = advance(&shifted, hidden, nextPos++, 1, 1);
+    }
     return draft;
   }
 };
@@ -115,7 +218,7 @@ public:
 inline void generate(const DistributedGenerateOptions &opts, MtpStage &stage,
                      MPI_Comm comm, int rank, int ranks, bool halfEmbed,
                      bool serve, const std::vector<std::string> &prompts,
-                     const std::string &ranges) {
+                     const std::string &ranges, const Options &opt) {
   const auto &cfg = stage.configuration();
   const int slots = stage.maxSlots(), chunk = cfg.prefillChunk;
   Link link(stage, comm, rank, ranks - 1, halfEmbed,
@@ -232,6 +335,8 @@ inline void generate(const DistributedGenerateOptions &opts, MtpStage &stage,
     auto emit = [&](int token) {
       bool first = s.generated.empty();
       s.generated.push_back(token);
+      if (opt.mode != Mode::Mtp)
+        s.history.push_back(token);
       if (first) {
         s.first = BatchClock::now();
         if (!rank)
@@ -250,12 +355,65 @@ inline void generate(const DistributedGenerateOptions &opts, MtpStage &stage,
              isStopToken(token, cfg.eosId, opts.stopTokenIds) ||
              int(s.generated.size()) == opts.testEosAtStep;
     };
+    // Replay the committed rows with target hidden states. Tentative predictor
+    // KV at nextPos and beyond is overwritten before any later causal read.
+    auto prepareDraft = [&](const float *h, int pos, int rows, int valid,
+                            bool final) {
+      const int nextPos = pos + valid;
+      int limit = final ? std::min({opt.maxDraft, cfg.context - nextPos - 1,
+                                    s.limit - int(s.generated.size()) - 1})
+                        : 0;
+      s.draft = {};
+      if (limit > 0 && opt.mode != Mode::Mtp) {
+        s.draft = lookup(s.history, opt.mode == Mode::DSpark ? 3 : 2, limit);
+        if (s.draft.count)
+          ++s.lookupSteps;
+      }
+      if (opt.mode == Mode::Ngram || (final && limit <= 0))
+        return;
+      if (s.draft.count) {
+        if (!s.deferredRows)
+          s.deferredPos = pos;
+        s.deferredRows += valid;
+        if (!rank)
+          s.deferredIds.insert(s.deferredIds.end(), shifted.begin(),
+                               shifted.begin() + valid);
+        if (rank == ranks - 1)
+          s.deferredHidden.insert(s.deferredHidden.end(), h,
+                                  h + size_t(valid) * cfg.activationWidth);
+        return;
+      }
+      for (int offset = 0; offset < s.deferredRows; offset += chunk) {
+        int n = std::min(chunk, s.deferredRows - offset);
+        link.advance(!rank ? s.deferredIds.data() + offset : nullptr,
+                     rank == ranks - 1
+                         ? s.deferredHidden.data() +
+                               size_t(offset) * cfg.activationWidth
+                         : nullptr,
+                     s.deferredPos + offset, n <= 4 ? n : chunk, n);
+      }
+      s.deferredIds.clear();
+      s.deferredHidden.clear();
+      s.deferredRows = 0;
+      const float *lastHidden =
+          link.advance(shifted.data(), h, pos, rows, valid);
+      if (final) {
+        s.draft = link.propose(opt, lastHidden, nextPos, limit);
+        ++s.predictorWidths[s.draft.count - 1];
+      }
+    };
     if (cmd[1]) {
       if (rank)
         s = Stream{};
       stage.clearSlot(slot);
       s.prompt = s.position = cmd[1];
       s.limit = cmd[2];
+      if (opt.mode != Mode::Mtp) {
+        s.history.resize(s.prompt);
+        if (!rank)
+          std::copy_n(promptIds.begin(), s.prompt, s.history.begin());
+        mpiCheck(MPI_Bcast(s.history.data(), s.prompt, MPI_INT64_T, 0, comm));
+      }
       for (int pos = 0; pos < s.prompt; pos += chunk) {
         int valid = std::min(chunk, s.prompt - pos);
         bool final = pos + valid == s.prompt;
@@ -276,33 +434,38 @@ inline void generate(const DistributedGenerateOptions &opts, MtpStage &stage,
           for (int i = 0; i < valid; ++i)
             shifted[i] =
                 (final && i == valid - 1) ? token : promptIds[pos + i + 1];
-        s.draft = link.advance(shifted.data(), h, pos, chunk, valid, final);
+        prepareDraft(h, pos, chunk, valid, final);
       }
     } else {
-      int rows = s.position + 1 < cfg.context ? 2 : 1;
+      const int k = s.draft.count, rows = k + 1;
       ids[0] = s.generated.back();
-      ids[1] = s.draft;
+      std::copy_n(s.draft.tokens.begin(), k, ids.begin() + 1);
       auto h = link.backbone(ids.data(), s.position, rows, rows);
-      int target[2] = {};
-      link.greedy(h, rows, target);
+      const auto [prefix, correction] = link.verify(h, s.draft);
       ++s.steps;
-      bool accept = rows == 2 && target[0] == s.draft;
-      if (rows == 2) {
-        ++s.proposed;
-        if (accept)
-          ++s.accepted;
-        else
-          stage.rewindOne();
+      s.proposed += k;
+      if (k)
+        ++s.chosen[k - 1];
+      int accepted = 0, committed = 0;
+      for (int i = 0; i < k; ++i)
+        ++s.offered[i];
+      for (int i = 0; i <= prefix; ++i) {
+        ++committed;
+        shifted[i] = i == prefix ? correction : s.draft.tokens[i];
+        emit(static_cast<int>(shifted[i]));
+        if (i == prefix)
+          break;
+        ++accepted;
+        ++s.matched[i];
+        if (done)
+          break;
       }
-      emit(target[0]);
-      if (accept && !done)
-        emit(target[1]);
-      int committed = accept ? 2 : 1;
+      s.accepted += accepted;
+      if (k)
+        ++s.prefixes[accepted];
+      stage.commitPrefix(s.position, committed, rows);
       if (!done) {
-        shifted[0] = target[0];
-        shifted[1] = target[1];
-        s.draft = link.advance(shifted.data(), h, s.position, committed,
-                               committed, true);
+        prepareDraft(h, s.position, committed, committed, true);
       }
       s.position += committed;
     }
