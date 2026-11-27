@@ -263,3 +263,39 @@ by two positions. The service interleaves active slots at step boundaries and
 emits a token event for each committed token. CLI results and resident done
 events include proposal and acceptance counts, their ratio and generated
 decode tokens per verification step. The first prefill token is excluded.
+
+### Hybrid tensor parallelism
+
+Pass `--tp-bundle DIRECTORY --wire f16` to the Route B executable under two
+MPI ranks. The directory contains `tp.json` and a `rankN/route-b.json` for each
+installed rank. Rank order follows the MPI launcher. Both stages process the
+whole layer range. The endpoint rank owns embedding, logits, tokenizer and
+optional MTP. For resident generation, deliver the JSONL stream to the
+endpoint's stdin. The engineering report includes a Hydra launch example.
+
+To reproduce the numerical integration test, use the exporter environment and
+a release tokenizer directory. `PY`, `BUDDY` and `LLVM` select the Python
+interpreter, buddy-opt and LLVM bin directory. Run from the repository root.
+
+```bash
+t="$PWD/build-tp-test"
+mkdir -p "$t"
+"$PY" tests/Pipeline/make_route_b_tp_fixture.py "$t/checkpoint"
+"$PY" tools/buddy-codegen/build_route_b_hybrid.py \
+  --checkpoint "$t/checkpoint" --output "$t/source" --work "$t/codegen" \
+  --llvm-bin "$LLVM" --buddy-opt "$BUDDY" --embed-dtype f16 \
+  --tokenizer-dir "$TOKENIZER" --variant w4g32 --threads 2 --context 128 --model-id tp-test
+"$PY" tools/buddy-codegen/prepare_route_b_tp.py --config "$t/checkpoint/config.json" \
+  --source "$t/source" --output "$t/plan" --llvm-bin "$LLVM" --buddy-opt "$BUDDY"
+python3 tools/buddy-codegen/shard_route_b_tp.py --source "$t/source" --prepared "$t/plan" --output "$t/bundle"
+cmake -G Ninja -S models/deepseek_r1/pipeline/route_b/host -B "$t/host" \
+  -DCMAKE_BUILD_TYPE=Release -DROUTE_B_TP_SOURCE="$t/source/route-b.json" -DROUTE_B_TP_BUNDLE="$t/bundle"
+ninja -C "$t/host" -j6
+ctest --test-dir "$t/host" --output-on-failure
+```
+
+Use `--kv-heads 1 3` for an asymmetric build of this fixture, or `--host-rank 0`
+to move the endpoint. The native test compares prefills, decode, both verifier
+rows, a rejected-token rollback, MTP projections and free-running token IDs.
+See the [27B Phase 1 report](../../../../reports/pp-k3-real/tp2_27b_phase1_report.md)
+for the release byte budget, packed-weight workflow and silicon run commands.

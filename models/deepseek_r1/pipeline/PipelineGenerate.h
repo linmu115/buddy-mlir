@@ -108,20 +108,27 @@ inline void appendUniqueStopToken(std::vector<int> &stopTokenIds, int tokenId) {
 inline pipeline::DistributedGenerateOptions
 makeGenerateOptions(const StageManifest &spec, const std::string &vocabPath,
                     const RunConfig &cfg, const StageConfig &config, int rank,
-                    int size) {
+                    int size, bool tensorParallel = false) {
   pipeline::DistributedGenerateOptions genOpts;
   genOpts.transport = spec.transport;
   genOpts.wireDtype = spec.wireDtype;
   if (rank == 0) {
     const auto wire = resolveWireSpec(config.dtype, spec.wireDtype);
-    std::cerr << "pipeline transport="
-              << (spec.transport == pipeline::Transport::Async ? "async"
-                                                               : "blocking")
-              << " requested_wire="
-              << (spec.wireDtype == pipeline::WireDtype::F16 ? "f16" : "native")
-              << " effective_wire="
-              << (size == 1 ? "none" : pipeline::activationTypeName(wire.dtype))
-              << " version=" << wire.version << '\n';
+    if (tensorParallel) {
+      std::cerr << "tensor_parallel=2 reduction_wire="
+                << (spec.wireDtype == pipeline::WireDtype::F16 ? "f16" : "f32")
+                << '\n';
+    } else
+      std::cerr << "pipeline transport="
+                << (spec.transport == pipeline::Transport::Async ? "async"
+                                                                 : "blocking")
+                << " requested_wire="
+                << (spec.wireDtype == pipeline::WireDtype::F16 ? "f16"
+                                                               : "native")
+                << " effective_wire="
+                << (size == 1 ? "none"
+                              : pipeline::activationTypeName(wire.dtype))
+                << " version=" << wire.version << '\n';
   }
   genOpts.prompt = cfg.prompt;
   genOpts.vocabPath = vocabPath;

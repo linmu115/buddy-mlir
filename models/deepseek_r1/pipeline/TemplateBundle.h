@@ -1,7 +1,9 @@
 #pragma once
+#include "buddy/runtime/pipeline/RouteB.h"
 #include "buddy/runtime/pipeline/Stage.h"
 #include "buddy/runtime/pipeline/StageManifest.h"
 #include <filesystem>
+#include <functional>
 #include <map>
 #include <memory>
 #include <tuple>
@@ -25,6 +27,9 @@ struct TemplateBundle {
   StageConfig config{};
   std::string id, shape, model;
   int kvHeads, headDim;
+  int tpRank = -1, tpHost = -1, bodyKvHeads = 0;
+  std::string bodyShape, tpSource;
+  std::vector<int> tpHeads;
   bool hybrid = false, hasMtp = false;
   std::vector<std::string> layerTypes;
   StageManifest spec{};
@@ -53,8 +58,15 @@ public:
                                    int valid) = 0;
   virtual const float *linear(const float *hidden, int rows) = 0;
 };
+struct TensorHooks {
+  BJ47Reduce reduce;
+  void *context;
+  std::function<void(const float *, int, int, int, int)> dispatch;
+  std::function<void(int)> clear, rewind;
+};
 std::unique_ptr<MtpStage> makeTemplateStage(const TemplateBundle &, LayerRange,
                                             bool verifyWeights = false,
                                             int slots = 1,
-                                            bool enableMtp = false);
+                                            bool enableMtp = false,
+                                            TensorHooks *tp = nullptr);
 } // namespace buddy::runtime

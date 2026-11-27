@@ -198,7 +198,8 @@ void mix(const BJ47WeightsV1 &weights, const float *x, float *keys,
 
 #if HYBRID_ROLE == 4 || (HYBRID_ROLE == 5 || HYBRID_ROLE == 6)
 int32_t layer(const BJ47WeightsV1 *weights, const float *input, float *a,
-              float *b, const BJ47FrameV1 *frame, float *out, int rows) {
+              float *b, const BJ47FrameV1 *frame, float *out, int rows,
+              BJ47Reduce reduce = nullptr, void *collective = nullptr) {
   if (!weights || !weights->f32 || !input || !a || !b || a == b || !frame ||
       !frame->aux || !out || input == out)
     return -1;
@@ -220,6 +221,8 @@ int32_t layer(const BJ47WeightsV1 *weights, const float *input, float *a,
     zeroCenteredNorm(input + t * width, w + inputNorm, width,
                      norm.data() + t * width);
   mix(*weights, norm.data(), a, b, *frame, rows, validRows, residual.data());
+  if (reduce && reduce(collective, residual.data(), validRows * width))
+    return -3;
   for (int t = 0; t < validRows; ++t) {
     float *r = residual.data() + t * width;
     for (int i = 0; i < width; ++i)
@@ -236,6 +239,8 @@ int32_t layer(const BJ47WeightsV1 *weights, const float *input, float *a,
     gate[i] = silu(gate[i]) * up[i];
 #endif
   proj_downProj(*weights, gate.data(), out, rows);
+  if (reduce && reduce(collective, out, validRows * width))
+    return -3;
   for (int i = 0; i < validRows * width; ++i)
     out[i] += residual[i];
   // Wire frames have fixed capacity. Define the tail without touching state.
@@ -323,6 +328,27 @@ extern "C" int32_t mtp_forward(const BJ47WeightsV1 *w, const float *embedding,
   return 0;
 }
 #else
+#ifdef HYBRID_TENSOR_PARALLEL
+extern "C" int32_t layer_tp_rows(const BJ47WeightsV1 *w, const float *in,
+                                 float *a, float *b, const BJ47FrameV1 *frame,
+                                 float *out, int rows, BJ47Reduce reduce,
+                                 void *collective) {
+  if (!reduce || (rows != 1 && rows != 2 && rows != chunk))
+    return -1;
+  if (rows == 2) {
+    if (!frame || !frame->aux)
+      return -1;
+    auto aux = static_cast<const BJ47VerifyRows *>(frame->aux);
+    if (aux->rows.valid_rows != rows)
+      return -2;
+#if HYBRID_ROLE == 4
+    if (!aux->conv_snapshot || !aux->ssm_snapshot)
+      return -1;
+#endif
+  }
+  return layer(w, in, a, b, frame, out, rows, reduce, collective);
+}
+#endif
 extern "C" int32_t layer_verify_2(const BJ47WeightsV1 *w, const float *input,
                                   float *a, float *b, const BJ47FrameV1 *frame,
                                   float *out) {

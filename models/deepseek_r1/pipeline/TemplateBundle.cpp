@@ -140,6 +140,19 @@ TemplateBundle TemplateBundle::load(const std::filesystem::path &index) {
        number(j, "prefill_chunk")};
   b.kvHeads = number(j, "kv_heads");
   b.headDim = number(j, "head_dim");
+  if (j.contains("tp")) {
+    const auto &t = j.at("tp");
+    b.tpRank = number(t, "rank", 0);
+    b.tpHost = number(t, "host", 0);
+    b.tpHeads = t.at("kv_heads").get<std::vector<int>>();
+    require(b.hybrid && b.tpRank < 2 && b.tpHost < 2 && b.tpHeads.size() == 2 &&
+                b.tpHeads[0] > 0 && b.tpHeads[1] > 0 &&
+                int64_t(b.tpHeads[0]) + b.tpHeads[1] == b.kvHeads,
+            "TP head partition");
+    b.bodyKvHeads = b.tpHeads.at(b.tpRank);
+    b.bodyShape = digestField(t, "body_shape");
+    b.tpSource = digestField(t, "source");
+  }
   require(c.prefillChunk == 64 && c.context >= c.prefillChunk &&
               c.eosId < c.vocabSize && b.headDim % 2 == 0,
           "shape");
@@ -199,7 +212,11 @@ TemplateBundle TemplateBundle::load(const std::filesystem::path &index) {
                     digestField(k, "sha256")};
     require(owners.count(role) &&
                 e.layout == digestField(layouts, owners.at(role)) &&
-                digestField(k, "shape_id") == b.shape &&
+                digestField(k, "shape_id") ==
+                    ((b.tpRank >= 0 &&
+                      (role == "gdn_layer" || role == "full_attn_layer"))
+                         ? b.bodyShape
+                         : b.shape) &&
                 e.abi == (b.hybrid || role == "lm_head" ? 2 : 1) &&
                 paths.insert(e.path).second &&
                 b.kernels.emplace(role, e).second,

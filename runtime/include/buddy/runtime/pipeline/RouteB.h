@@ -57,6 +57,14 @@ int32_t layer_prefill(const BJ47WeightsV1 *w, const float *in, float *k,
 int32_t layer_decode(const BJ47WeightsV1 *w, const float *in, float *k,
                      float *v, const BJ47FrameV1 *frame, float *out);
 
+/* TP body DSO. Reduce precisely valid_rows * width fp32 partials in place.
+ * The row capacity selects the projection variant independently of valid_rows.
+ */
+typedef int32_t (*BJ47Reduce)(void *context, float *partials, int64_t count);
+int32_t layer_tp_rows(const BJ47WeightsV1 *, const float *, float *, float *,
+                      const BJ47FrameV1 *, float *, int rows, BJ47Reduce,
+                      void *context);
+
 /* B4 hybrid templates. GDN verifies both rows in one projection pass and
  * saves state after the first token. Attention only needs a logical rewind. */
 typedef struct {
