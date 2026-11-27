@@ -1,8 +1,9 @@
 {
-  "before": "628131f54465c6148288e8bbaaa69d84b07181ac4a93be397901af13e057a789",
-  "after": "6ab906cb94da83083a9d35e24ba6af19f9bcc76b216b29ef92395632712f18d4",
+  "before": "baa97ccb8498897b600090e244c9cd2820d085a21c4632295dda878200d19daa",
+  "after": "01945ad448dda685d6774c3cfb7789843a66c3053f9cd8eba04b4588a667f73a",
   "manifest_changed": [
     "templates",
+    "runtime_sha256",
     "bundle_id"
   ],
   "pack": "qwen3_5-w4g32/2",
@@ -31,7 +32,7 @@
       ]
     },
     "gdn_layer.so": {
-      "sha256": "501532f7a139634393d897c4a849e907fb2c789ddf70581d717d757c0b29cea5",
+      "sha256": "2d9dcb30cb63d452323c00a4cec2d2184aa89180c0ff8a0e2cce1eaedaca7b9b",
       "descriptor_sha256": "3095649c3e61c75a24a37e5a4a3f289f955e5bf6463fb38b8986f8ff51242772",
       "exports": [
         "bj47_kernel_info_v1",
@@ -41,7 +42,7 @@
       ]
     },
     "full_attn_layer.so": {
-      "sha256": "dcd5908011ffa225e2a409cc88534ca751342fe22ebc821c72dd5b57ac1d3836",
+      "sha256": "8a5c9d5a254da87c1dae16350d60f4203ce99fab90454a7d59df6bc79c9116d6",
       "descriptor_sha256": "0b7854b82619b9c3e8b4414f2a0f04db578488049ab8e10536173b912b7e5781",
       "exports": [
         "bj47_kernel_info_v1",
@@ -53,7 +54,7 @@
       ]
     },
     "mtp_layer.so": {
-      "sha256": "2a1379ee605cafd9133f790f2c38390057dc58a5943459814060b5336c11c9f5",
+      "sha256": "e9f17e528fc4e949e47a2696c02bd4c2816b69fd15987f08e7a5544b9fd09561",
       "descriptor_sha256": "5a3b94750ca446f28ea304ed453e9dbd43480bb972fb1936765aced629765330",
       "exports": [
         "bj47_kernel_info_v1",
@@ -65,13 +66,13 @@
   },
   "functions": {
     "gdn_layer:_ZN12_GLOBAL__N_13mixERK13BJ47WeightsV1PKfPfS5_RK11BJ47FrameV1iiS4_S5_": {
-      "pc": "0000000000002b66",
+      "pc": "0000000000002b46",
       "rvv": {},
       "whole_register_memory_sites": [],
       "allocator_vector_spills_reloads": []
     },
     "gdn_layer:_ZN12_GLOBAL__N_13mixERK13BJ47WeightsV1PKfPfS5_RK11BJ47FrameV1iiS4_S5_.omp_outlined": {
-      "pc": "0000000000002da0",
+      "pc": "0000000000002d80",
       "rvv": {
         "vsetivli": 2,
         "vmv.s.x": 2,
@@ -87,7 +88,7 @@
       "allocator_vector_spills_reloads": []
     },
     "gdn_layer:_ZN12_GLOBAL__N_114gateProjectionILi4EEEvPKfS2_S2_PfS3_": {
-      "pc": "0000000000003414",
+      "pc": "00000000000033f4",
       "rvv": {
         "vsetivli": 2,
         "vmv.v.i": 8,
@@ -102,7 +103,7 @@
       "allocator_vector_spills_reloads": []
     },
     "gdn_layer:_ZN12_GLOBAL__N_114gateProjectionILi2EEEvPKfS2_S2_PfS3_": {
-      "pc": "0000000000003522",
+      "pc": "0000000000003502",
       "rvv": {
         "vsetivli": 2,
         "vmv.v.i": 4,
@@ -117,7 +118,7 @@
       "allocator_vector_spills_reloads": []
     },
     "gdn_layer:_ZN12_GLOBAL__N_114gateProjectionILi1EEEvPKfS2_S2_PfS3_": {
-      "pc": "00000000000035b8",
+      "pc": "0000000000003598",
       "rvv": {
         "vsetivli": 2,
         "vmv.v.i": 2,
@@ -132,7 +133,7 @@
       "allocator_vector_spills_reloads": []
     },
     "gdn_layer:_ZN12_GLOBAL__N_113recurrentStepEPfPKfS2_S2_S0_ff": {
-      "pc": "0000000000003616",
+      "pc": "00000000000035f6",
       "rvv": {
         "vsetvli": 1,
         "vmv.v.i": 2,
@@ -146,7 +147,7 @@
       "allocator_vector_spills_reloads": []
     },
     "gdn_layer:_ZN6hybrid8chunkGDNEPKfS1_S1_iS1_S1_iPfS2_iiii": {
-      "pc": "0000000000004110",
+      "pc": "00000000000040f0",
       "rvv": {
         "vsetivli": 3,
         "vmv.s.x": 3,
@@ -164,7 +165,7 @@
       "allocator_vector_spills_reloads": []
     },
     "gdn_layer:_ZN12_GLOBAL__N_112gatedNormRowEPfPKfS2_": {
-      "pc": "00000000000036b0",
+      "pc": "0000000000003690",
       "rvv": {
         "vsetivli": 1,
         "vmv.s.x": 1,
@@ -181,7 +182,7 @@
       "allocator_vector_spills_reloads": []
     },
     "gdn_layer:_ZN12_GLOBAL__N_18convolveEPfS0_PKfiS0_": {
-      "pc": "00000000000037f6",
+      "pc": "00000000000037d6",
       "rvv": {
         "vsetvli": 1,
         "vlseg4e32.v": 2,
@@ -196,7 +197,7 @@
       "allocator_vector_spills_reloads": []
     },
     "full_attn_layer:_ZN12_GLOBAL__N_13mixERK13BJ47WeightsV1PKfPfS5_RK11BJ47FrameV1iiS4_S5_": {
-      "pc": "0000000000002c00",
+      "pc": "0000000000002be0",
       "rvv": {
         "vsetvli": 6,
         "vmv.s.x": 2,
@@ -216,13 +217,53 @@
       "allocator_vector_spills_reloads": []
     },
     "full_attn_layer:_ZN12_GLOBAL__N_13mixERK13BJ47WeightsV1PKfPfS5_RK11BJ47FrameV1iiS4_S5_.omp_outlined": {
-      "pc": "000000000000332e",
+      "pc": "000000000000331a",
       "rvv": {},
       "whole_register_memory_sites": [],
       "allocator_vector_spills_reloads": []
     },
+    "full_attn_layer:_ZN12_GLOBAL__N_111decodeGroupILi4EEEvPfPKfS3_S3_S3_S3_iS1_": {
+      "pc": "0000000000003474",
+      "rvv": {
+        "vsetvli": 7,
+        "vmv.s.x": 2,
+        "vsetivli": 2,
+        "vmv2r.v": 5,
+        "vle32.v": 22,
+        "vfmul.vv": 10,
+        "vfredosum.vs": 5,
+        "vfmv.f.s": 5,
+        "vfmul.vf": 5,
+        "vfadd.vf": 1,
+        "vse32.v": 7,
+        "vfsub.vv": 1,
+        "vfadd.vv": 5
+      },
+      "whole_register_memory_sites": [],
+      "allocator_vector_spills_reloads": []
+    },
+    "full_attn_layer:_ZN12_GLOBAL__N_111decodeGroupILi2EEEvPfPKfS3_S3_S3_S3_iS1_": {
+      "pc": "0000000000003b7c",
+      "rvv": {
+        "vsetvli": 11,
+        "vmv.s.x": 3,
+        "vmv2r.v": 4,
+        "vle32.v": 25,
+        "vfmul.vv": 14,
+        "vfredosum.vs": 4,
+        "vfmv.f.s": 4,
+        "vfmul.vf": 4,
+        "vfadd.vf": 2,
+        "vse32.v": 8,
+        "vfsub.vv": 2,
+        "vfadd.vv": 4,
+        "vsetivli": 2
+      },
+      "whole_register_memory_sites": [],
+      "allocator_vector_spills_reloads": []
+    },
     "full_attn_layer:_ZN12_GLOBAL__N_13mixERK13BJ47WeightsV1PKfPfS5_RK11BJ47FrameV1iiS4_S5_.omp_outlined.1": {
-      "pc": "0000000000004226",
+      "pc": "00000000000041f2",
       "rvv": {
         "vsetvli": 4,
         "vmv.s.x": 1,
@@ -240,7 +281,7 @@
       "allocator_vector_spills_reloads": []
     },
     "full_attn_layer:_ZN12_GLOBAL__N_115onlineAttentionEPKfS1_S1_iPfS2_S2_": {
-      "pc": "0000000000004606",
+      "pc": "00000000000045d2",
       "rvv": {
         "vsetivli": 5,
         "vmv.s.x": 3,
@@ -260,7 +301,7 @@
       "allocator_vector_spills_reloads": []
     },
     "mtp_layer:_ZN12_GLOBAL__N_13mixERK13BJ47WeightsV1PKfPfS5_RK11BJ47FrameV1iiS4_S5_": {
-      "pc": "00000000000035c4",
+      "pc": "0000000000003584",
       "rvv": {
         "vsetvli": 6,
         "vmv.s.x": 2,
@@ -280,13 +321,53 @@
       "allocator_vector_spills_reloads": []
     },
     "mtp_layer:_ZN12_GLOBAL__N_13mixERK13BJ47WeightsV1PKfPfS5_RK11BJ47FrameV1iiS4_S5_.omp_outlined": {
-      "pc": "0000000000003d5c",
+      "pc": "0000000000003d14",
       "rvv": {},
       "whole_register_memory_sites": [],
       "allocator_vector_spills_reloads": []
     },
+    "mtp_layer:_ZN12_GLOBAL__N_111decodeGroupILi4EEEvPfPKfS3_S3_S3_S3_iS1_": {
+      "pc": "0000000000003e6e",
+      "rvv": {
+        "vsetvli": 7,
+        "vmv.s.x": 2,
+        "vsetivli": 2,
+        "vmv2r.v": 5,
+        "vle32.v": 22,
+        "vfmul.vv": 10,
+        "vfredosum.vs": 5,
+        "vfmv.f.s": 5,
+        "vfmul.vf": 5,
+        "vfadd.vf": 1,
+        "vse32.v": 7,
+        "vfsub.vv": 1,
+        "vfadd.vv": 5
+      },
+      "whole_register_memory_sites": [],
+      "allocator_vector_spills_reloads": []
+    },
+    "mtp_layer:_ZN12_GLOBAL__N_111decodeGroupILi2EEEvPfPKfS3_S3_S3_S3_iS1_": {
+      "pc": "0000000000004576",
+      "rvv": {
+        "vsetvli": 11,
+        "vmv.s.x": 3,
+        "vmv2r.v": 4,
+        "vle32.v": 25,
+        "vfmul.vv": 14,
+        "vfredosum.vs": 4,
+        "vfmv.f.s": 4,
+        "vfmul.vf": 4,
+        "vfadd.vf": 2,
+        "vse32.v": 8,
+        "vfsub.vv": 2,
+        "vfadd.vv": 4,
+        "vsetivli": 2
+      },
+      "whole_register_memory_sites": [],
+      "allocator_vector_spills_reloads": []
+    },
     "mtp_layer:_ZN12_GLOBAL__N_13mixERK13BJ47WeightsV1PKfPfS5_RK11BJ47FrameV1iiS4_S5_.omp_outlined.1": {
-      "pc": "0000000000004c54",
+      "pc": "0000000000004bec",
       "rvv": {
         "vsetvli": 4,
         "vmv.s.x": 1,
@@ -304,7 +385,7 @@
       "allocator_vector_spills_reloads": []
     },
     "mtp_layer:_ZN12_GLOBAL__N_115onlineAttentionEPKfS1_S1_iPfS2_S2_": {
-      "pc": "0000000000005034",
+      "pc": "0000000000004fcc",
       "rvv": {
         "vsetivli": 5,
         "vmv.s.x": 3,
@@ -322,6 +403,17 @@
       },
       "whole_register_memory_sites": [],
       "allocator_vector_spills_reloads": []
+    }
+  },
+  "dense_p64": {
+    "gdn_layer": {
+      "smt.vmadot.hp": 8
+    },
+    "full_attn_layer": {
+      "smt.vmadot.hp": 8
+    },
+    "mtp_layer": {
+      "smt.vmadot.hp": 8
     }
   }
 }

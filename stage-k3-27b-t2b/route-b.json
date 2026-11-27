@@ -136,8 +136,8 @@
     },
     {
       "path": "gdn_layer.so",
-      "nbytes": 102248,
-      "sha256": "501532f7a139634393d897c4a849e907fb2c789ddf70581d717d757c0b29cea5",
+      "nbytes": 102048,
+      "sha256": "2d9dcb30cb63d452323c00a4cec2d2184aa89180c0ff8a0e2cce1eaedaca7b9b",
       "symbols": [
         "bj47_kernel_info_v1",
         "layer_prefill",
@@ -153,8 +153,8 @@
     },
     {
       "path": "full_attn_layer.so",
-      "nbytes": 106272,
-      "sha256": "dcd5908011ffa225e2a409cc88534ca751342fe22ebc821c72dd5b57ac1d3836",
+      "nbytes": 106072,
+      "sha256": "8a5c9d5a254da87c1dae16350d60f4203ce99fab90454a7d59df6bc79c9116d6",
       "symbols": [
         "bj47_kernel_info_v1",
         "layer_prefill",
@@ -172,8 +172,8 @@
     },
     {
       "path": "mtp_layer.so",
-      "nbytes": 124640,
-      "sha256": "2a1379ee605cafd9133f790f2c38390057dc58a5943459814060b5336c11c9f5",
+      "nbytes": 124440,
+      "sha256": "e9f17e528fc4e949e47a2696c02bd4c2816b69fd15987f08e7a5544b9fd09561",
       "symbols": [
         "bj47_kernel_info_v1",
         "mtp_forward",
@@ -1668,5 +1668,5 @@
   "runtime": "libbj47_kernel_runtime.so",
   "runtime_sha256": "c1c8de9bc971494891fcedb070dff5627ecdba8ef58a261beeefe278ac7ad87e",
   "threads": 8,
-  "bundle_id": "6ab906cb94da83083a9d35e24ba6af19f9bcc76b216b29ef92395632712f18d4"
+  "bundle_id": "01945ad448dda685d6774c3cfb7789843a66c3053f9cd8eba04b4588a667f73a"
 }

@@ -1,40 +1,54 @@
-# T2b · Qwen hybrid 27B on K3
+# T2b-clean · Qwen3.8-27B Stage S2b handoff
 
-**The seven RISC-V binaries are staged.** The final 27B GDN and attention layer outputs and caller-owned state matched the Wave 1–3 baseline byte for byte in QEMU. Silicon timing awaits the dual-board lock. The candidate source is `00dc59b016df`. The source baseline is `804a3fd0`. EXP-18 measured `4832e11f`, an earlier deployment.
+Kernel source `17e56c2c` is based on T2b `70e04c4f`. Its comparison release is EXP-16/18 `4832e11f`, which EXP-19 restored on both ranks. The staged bundle ID is `01945ad448dda685d6774c3cfb7789843a66c3053f9cd8eba04b4588a667f73a`. All timings below come from EXP-19. Candidate latency and the two long-prompt greedy sequences await the Stage S2b board run.
 
-## Changes and numerical checks
+## Changes driven by silicon measurements
 
-- **GDN A/B.** One eight-thread workshare owns the 16 key-head groups. Each worker handles six value heads. For each head a four-row tile loads each A/B weight once per K slice and uses one input load for both products. Two-row and one-row tails cover every valid length. The eight-lane reduction order matches MLIR. The final ELF matched the independent oracle on the actual layer-0 f32 gates for **all 48 heads at M=1, 2, 3, 4, 64** with maximum absolute difference zero. The predictor uses full attention and has no A/B gates.
-- **GDN state.** The same worker shifts its convolution channels, normalizes Q/K, evaluates the gates, updates S and writes its snapshot slices. Four-tap RVV segment loads/stores preserve the caller's channel-major history. The recurrent update and gated norm use 32 independent f32 lanes at VLEN 1024. P64 retains the chunk delta-rule algorithm. The workshare has one team join. Final real-weight layer-0 QEMU traces matched over **832,512 / 1,665,024 / 1,155,072 floats** at M=1/2/64, including the two-row rollback image.
-- **Full attention.** Prefill installs valid KV rows first. Each worker handles three query heads and respects each query's causal endpoint. RVV scores 256-wide Q·K, reduces the softmax denominator in order, divides probabilities and accumulates P·V in 32-position tiles. If a later tile raises the maximum, the kernel replays earlier exponents at most once. The libm exponential and division before the value product preserve baseline rounding. A discarded single-pass approximation passed the isolated threshold but reached **0.01155** final-layer error at prior KV 64. On the final build, **all 8,716,288 floats** of layer-3 P64 output and KV matched at **each** prior KV of 64, 256 and 1024. Two-row verification also matched at 1024. Independent core tests exercised every causal row with ordinary and sharply peaked scores. Maximum absolute difference was zero.
-- **Native and ELF checks.** Tiny packed x86 backbone and MTP traces matched the baseline over 4,415,512 and 3,800,576 bytes. Partial M=3/4, verify-row snapshots, accepted/rejected proposals and two-slot reuse passed. The real-weight 27B MTP predictor matched all 102,035,456 bytes of hidden output and KV through P64→M2→M1 from prior KV 1024. The staged embedding and head also matched on real rows and logits. See [trace sizes and SHA-256](checks/parity.json). The staged RISC-V host produced the baseline's 13 tokens and 1/11 acceptance on the tiny MTP fixture under QEMU. CTest passed 6 host/MPI and 2 component tests. Lit passed all 496 supported tests, with 4 unsupported. Objdump and allocator assembly cover 17 changed mixer functions and workers across the three DSOs. They show RVV instructions and **zero vector-register spill/reload sites** in this scope. Instruction histograms and per-function PCs are in [the ELF audit](checks/elf-audit.json).
+- **Dense P64** now selects the original half-precision IME step in GDN, FullAttn and MTP. Each linked DSO contains eight `smt.vmadot.hp` instructions and zero integer `smt.vmadot` instructions. The same 144-byte blocks feed the restored kernel. EXP-19 measured the GDN GLU at 13.173 ms with HP and 41.610 ms with T2 integer dots. That experiment also observed higher three-chunk TTFT and token divergence on the 164- and 384-token prompts.
+- **Two-row attention** uses the same grouped kernel as decode in both the backbone verifier and the predictor. T2 dispatched it only for M=1. T2b already grouped both rows, but a worker processed them serially at one group size. The new workshare schedules independent (row, KV head, query group) items. At prior KV 383, row zero uses three pairs at visible length 384 and row one uses four plus two at 385. Each reads only its causal prefix and uses its own rotary row. The linked two- and four-query kernels contain RVV instructions in both DSOs. The allocator audit found zero vector spill/reload sites in the 21 inspected mixer functions and workers. T2b's P64 attention, GDN gate projections, convolution, norms and recurrence remain active. EXP-19 measured M=1 at KV 1024 at 25.546 → 11.512 ms, and M=2 at 41.680 → 43.411 ms.
+- **Two-row GLU** restores the baseline full-width accumulator for the 5120 → 17408 gate and up projections. Each traverses its packed tile once for both rows. The one-row helper, streamed M=1/2 head, final-workshare barrier removal and fused residual stores are preserved. EXP-19's eight M=2 samples ranged from 4.443–4.519 ms on baseline and 4.404–4.607 ms on T2. Their medians were 4.475 and 4.525 ms. The overlap makes the silicon remeasurement important. The M=1 GLU medians were 4.277 and 4.138 ms.
 
-## Estimated time saved
+## Offline acceptance
 
-The planning estimate assumes **six effective workers out of eight** for formerly serial work. The model credits no further speedup to the already-parallel recurrent core, weight reuse, or earlier waves. Figures below are reductions in summed layer time against EXP-18. Pipeline overlap, cache behavior and the actual Wave 1–3 latency affect the wall-clock result.
+The production reference DSOs match the EXP-19 baseline SHA-256 inventory. Native reference templates were compiled from `git archive 4832e11f` using the same tiny fixture and toolchain as the candidate. Candidate and baseline used the same packed weights. All 20 trace pairs match byte for byte across **467,630,624 compared bytes**. [Per-case byte counts and SHA-256](checks/parity.json) · [Linked ELF and descriptor checks](checks/elf-audit.json)
 
-| Target | Case | Saved per layer (ms) | Saved across affected layers (ms) |
-| --- | --- | ---: | ---: |
-| A/B projections | M=1 / 2 / 64 | 1.033 / 2.076 / 67.565 | 49.56 / 99.64 / 3,243.12 |
-| GDN preparation and recurrence | M=1 / 2 / 64 | 0.758 / 1.515 / 45.679 | 36.40 / 72.72 / 2,192.60 |
-| Full attention P64 | Prior KV 64 / 256 / 1024 | 80.467 / 243.580 / 880.964 | 1,287.47 / 3,897.29 / 14,095.43 |
+- **x86 tiny hybrid.** A 73-token backbone trace exercises full and partial P64 followed by M=1, logging hidden rows, GDN state, KV, logits and token IDs. The MTP trace runs P64 → M=2 → M=1. A separate verifier rejects the second row, restores the row-zero GDN snapshot, overwrites the rejected KV position and compares the replacement output and complete state against single-row decode. Mixed-speculation service tests cover accepted and rejected drafts, two slots and slot reuse.
+- **Production QEMU, RVV VLEN 1024.** GDN layer 0 at M=1/2/64, FullAttn layer 3 at every combination of M=1/2/64 and prior KV=64/256/1024, plus M=2 at prior KV 383. The M=2/KV=1024 trace covers 33,595,392 bytes including both output rows and the complete KV arrays. MTP starts at prior KV 1024 and advances through P64 → M=2 → M=1, comparing 102,035,456 bytes of output and KV. Head decode and two-row linear produce 2,979,840 bytes of logits. Embedding and the isolated M=2 GLU are checked separately. All 34,816 GLU output floats match.
+- **Scalar oracles.** The two-row grouped kernels in both production attention DSOs match all six query heads byte for byte at prior KV 64/256/383/1024. Tests include normalization, partial RoPE, softmax, the V reduction and output gate. P64 attention and GDN A/B tests also pass. [Probe source](checks/operators.cpp)
+- **Payload.** Five template DSOs, the runtime and the host were cross-compiled. All 134 original `qwen3_5-w4g32/2` weight records match, including on-disk SHA-256 for all 31,208,607,872 bytes. The rebuilt manifest changes only template receipts, runtime digest and bundle ID. Local rehearsal exercised repeated prepare/activate, rollback, and recovery from a mixed installation. The restored full receipt SHA-256 is `80a11acef3bd1fad9d1743a119e2953eb292cb2eccdb2c568e4bdebbfa9548cf`.
+- **Regression suites.** CTest passed all six host/MPI tests and both component tests. Lit discovered 500 tests, passed all 496 supported cases and marked four unsupported. The hybrid generator selection regression also passed its focused run. The final GLU board probe completed its two warmups and eight timed calls for each row count under QEMU.
 
-A/B uses five sixths of the isolated 1.239 / 2.491 / 81.078 ms. Its two matrices total 1,966,080 bytes, giving a cold one-read floor of 0.08192 ms at 24 GB/s. At M=64 there are also 31,457,280 multiply-adds. The modeled candidate A/B times are 0.207 / 0.415 / 13.513 ms. The sub-0.10 / sub-2 ms targets need silicon measurements.
+The worktree retains the build and replay inputs under `build-t2b/`. From its root, the local rebuild and comparison commands are:
 
-GDN preparation uses five sixths of EXP-18's pre-core gap after removing A/B (0.910 / 1.818 / 54.815 ms). For attention the KV64→1024 secant is 1.000622 ms per extra cached position per P64 layer. Applying that slope to the 96.5 mean visible positions at KV64 gives an estimated 96.560 ms attention component. For longer contexts add the measured whole-layer increase above KV64, then multiply by five sixths. The modeled reduction in the **KV64→1024 growth alone** is 12,807.96 ms across 16 layers.
+```bash
+source build-t2b/env
+"$P" "$T/compile.py" clean k3
+"$P" "$T/compile.py" clean tiny
+ninja -j6 -C "$T/cross" buddy-pp-route-b
+"$T/clean/replay" base "$B"
+"$T/clean/replay" clean "$PWD/stage-k3-27b-t2b"
+QEMU_RUN="$T/qrun" PROBE="$T/clean/operators" GDN_F32="$B/gdn-0.f32" \
+  stage-k3-27b-t2b/checks/run-operators
+"$P" "$T/clean/parity.py"
+```
 
-## Payload and dual-K3 acceptance
+The replay command regenerates the production GDN, FullAttn and MTP traces. The comparison also reads the retained head, embedding, isolated GLU and native fixtures. The Git-tracked receipts identify the staged ELFs and exact comparison data. The seven executables and DSOs are local build artifacts under the stage directory.
 
-`SHA256SUMS` covers five template DSOs, the kernel runtime, the host and `route-b.json`. The old and new descriptors and dynamic exports match. The manifest changed only template receipts and the derived bundle ID. All **134 original weight files, totaling 31,208,607,872 bytes**, passed SHA-256 verification, with the original `qwen3_5-w4g32/2` receipts. The new bundle ID is `6ab906cb94da83083a9d35e24ba6af19f9bcc76b216b29ef92395632712f18d4`.
+## Stage S2b dual-K3 acceptance
 
-After S2/S3 release the lock, drain both ranks and start with Wave 1–3 installed. Run the following in WSL from this staged directory. The packaged `peers.env` sets the rank-0 and rank-1 SSH aliases. The coordinator uses the installed EXP-18 harness and prompts. The operator probe calls public layer entries, so it works on either ELF without projection-symbol offsets.
+Run from the staged directory in WSL **after S3 #160 releases the board lock**, with both ranks drained and the EXP-16/18 release installed. The coordinator uses the EXP-19 quality and clean-grid harnesses, the 28/36 split, f32 wire and eight workers. The MTP-off and MTP-on quality runs use the same four prompts. The grid uses the original shorter budgets to measure warm TTFT and decode throughput.
 
 ```bash
 set -euo pipefail
 source checks/peers.env
 sha256sum --strict -c SHA256SUMS
-tag="t2b-$(date -u +%Y%m%dT%H%M%SZ)"
+sha256sum --strict -c checks/probes.sha256
+tag="s2b-clean-$(date -u +%Y%m%dT%H%M%SZ)"
+out="../build-t2b/acceptance/$tag"
+mkdir -p "$out"
+
 checks/bench-dual prepare
+trap 'checks/bench-dual rollback' EXIT
 checks/bench-dual run "$tag-A1"
 checks/bench-dual activate
 checks/bench-dual run "$tag-B1"
@@ -43,6 +57,24 @@ checks/bench-dual run "$tag-A2"
 checks/bench-dual activate
 checks/bench-dual run "$tag-B2"
 checks/bench-dual rollback
+trap - EXIT
+for node in "$K3_R0" "$K3_R1"; do
+  ssh "$node" 'cd ~/route-b-qwen38-27b-release && sha256sum --strict -c ~/t2b-incoming/baseline.sha256 && sha256sum SHA256SUMS' \
+    | tee "$out/$node-rollback.log"
+done
+
+for phase in A1 B1 A2 B2; do
+  label="$tag-$phase"
+  for mode in off on; do
+    for workload in quality grid; do
+      scp "$K3_R0:exp19-s2/28-$mode-f32-$workload-$label.json" "$out/"
+    done
+  done
+  scp "$K3_R1:t2b-incoming/$label-operators.log" "$out/"
+done
+python3 checks/compare-runs.py "$out" "$tag"
 ```
 
-Each pass records eight operator samples after two warmups for M=1/2/64 and the three attention contexts. Rank 1 writes `~/t2b-incoming/<label>-operators.log`. Rank 0 writes `~/exp18-s1/28-<off|on>-f32-<trace|grid>-<label>.json` for the 28/36 split. Compare medians, individual samples, token sequences, acceptance and TTFT across both A/B pairs. The final rollback returns the ranks to Wave 1–3. Local rehearsal covered repeated prepare/activate, interrupted activation followed by rollback, and byte-exact restoration of the complete receipt file.
+The checker requires identical input lengths, quality-run input IDs, every output ID through EOS or the generation cap, stop reason, and MTP accepted/proposed counts across A1/B1/A2/B2. It prints TTFT and decode throughput in that order. Local replay against the EXP-19 records rejects T2 at the 164-token prompt.
+
+Compare the eight raw samples per operator after two warmups. Use paired medians and ranges to assess P64 GLU and three-chunk TTFT recovery, M=2 FullAttn at KV 1024, boundary behavior at prior KV 383, and MTP verify. Inspect M=1 FullAttn, MTP, head and GLU alongside them to check the existing decode gains. The operator logs also include the M=2 head and isolated M=2 GLU. Record both rank receipt checks after the final rollback. Keep quality failures and timing deltas separate in the acceptance record.

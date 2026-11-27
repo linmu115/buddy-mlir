@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <dlfcn.h>
 #include <fstream>
 #include <stdexcept>
@@ -77,6 +78,80 @@ void gates(char **args) {
       throw std::runtime_error("gate mismatch");
   }
 }
+void scalarAttention(const float *q, const Vec &keys, const Vec &values, int n,
+                     Vec &ref) {
+  constexpr int dim = 256;
+  Vec scores(n);
+  for (int t = 0; t < n; ++t) {
+    float dot = 0;
+    for (int i = 0; i < dim; ++i)
+      dot += q[i] * keys[t * dim + i];
+    scores[t] = dot / 16;
+  }
+  float max = *std::max_element(scores.begin(), scores.end()), denom = 0;
+  for (auto &s : scores) {
+    s = std::exp(s - max);
+    denom += s;
+  }
+  for (int t = 0; t < n; ++t) {
+    float p = scores[t] / denom;
+    for (int i = 0; i < dim; ++i)
+      ref[i] += p * values[t * dim + i];
+  }
+}
+
+// Include query normalization, RoPE and the output gate in the oracle.
+// Each row has different query and rotary data, and a different causal end.
+void verifyGroups(char **args) {
+  constexpr int dim = 256, rotary = 64, heads = 6;
+  using Group = void (*)(float *, const float *, const float *, const float *,
+                         const float *, const float *, int, float *);
+  Image layer(args[0]);
+  auto pair = layer.get<Group>(args[1]), four = layer.get<Group>(args[2]);
+  for (int prior : {64, 256, 383, 1024}) {
+    Vec keys((prior + 2) * dim), values(keys.size()), norm(dim);
+    fill(keys, prior + 5);
+    fill(values, prior + 11);
+    fill(norm, 37);
+    for (int r = 0; r < 2; ++r) {
+      int n = prior + r + 1;
+      Vec q(heads * 2 * dim), cos(rotary), sin(rotary), out(heads * dim);
+      fill(q, 17 + r);
+      fill(cos, 71 + r);
+      fill(sin, 83 + r);
+      Vec original = q;
+      for (int h = 0; h < heads;) {
+        int count = n > 384 && h == 0 ? 4 : 2;
+        (count == 4 ? four : pair)(q.data() + h * 2 * dim, norm.data(),
+                                   cos.data(), sin.data(), keys.data(),
+                                   values.data(), n, out.data() + h * dim);
+        h += count;
+      }
+      for (int h = 0; h < heads; ++h) {
+        auto *x = original.data() + h * 2 * dim;
+        float sum = 0;
+        for (int i = 0; i < dim; ++i)
+          sum += x[i] * x[i];
+        float scale = 1.f / std::sqrt(sum / dim + 1e-6f);
+        for (int i = 0; i < dim; ++i)
+          x[i] = (x[i] * scale) * (1.f + norm[i]);
+        for (int i = 0; i < rotary / 2; ++i) {
+          float l = x[i], u = x[i + rotary / 2];
+          x[i] = l * cos[i] - u * sin[i];
+          x[i + rotary / 2] = u * cos[i] + l * sin[i];
+        }
+        Vec ref(dim);
+        scalarAttention(x, keys, values, n, ref);
+        for (int i = 0; i < dim; ++i)
+          ref[i] *= 1.f / (1.f + std::exp(-x[dim + i]));
+        if (std::memcmp(ref.data(), out.data() + h * dim, dim * sizeof(float)))
+          throw std::runtime_error("grouped verify differs from scalar oracle");
+      }
+    }
+    printf("grouped M=2 prior KV=%d both rows, six heads: bit_diff=0\n", prior);
+  }
+}
+
 void attention(char **args) {
   constexpr int dim = 256;
   using Attn = void (*)(const float *, const float *, const float *, int,
@@ -99,32 +174,17 @@ void attention(char **args) {
       if (r % 3 == 2)
         for (int i = 0; i < dim; ++i)
           q[i] *= 100;
-      Vec out(dim), ref(dim), scores(n);
+      Vec out(dim), ref(dim);
       Vec scratch(2 * n);
       fn(q, keys.data(), values.data(), n, out.data(), scratch.data(),
          scratch.data() + n);
-      for (int t = 0; t < n; ++t) {
-        float dot = 0;
-        for (int i = 0; i < dim; ++i)
-          dot += q[i] * keys[t * dim + i];
-        scores[t] = dot / 16;
-      }
-      float max = *std::max_element(scores.begin(), scores.end()), denom = 0;
-      for (auto &s : scores) {
-        s = std::exp(s - max);
-        denom += s;
-      }
-      for (int t = 0; t < n; ++t) {
-        float p = scores[t] / denom;
-        for (int i = 0; i < dim; ++i)
-          ref[i] += p * values[t * dim + i];
-      }
+      scalarAttention(q, keys, values, n, ref);
       for (int i = 0; i < dim; ++i)
         check(out[i], ref[i], worst);
     }
     printf("attention P64 prior KV=%d all 64 causal rows: max_abs=%.9g\n",
            prior, worst);
-    if (!(worst < 1e-5f))
+    if (worst != 0)
       throw std::runtime_error("attention mismatch");
   }
 }
@@ -132,6 +192,8 @@ void attention(char **args) {
 int main(int argc, char **argv) {
   if (argc == 7 && std::string(argv[1]) == "gate")
     gates(argv + 2);
+  else if (argc == 5 && std::string(argv[1]) == "verify")
+    verifyGroups(argv + 2);
   else if (argc == 4 && std::string(argv[1]) == "attention")
     attention(argv + 2);
   else

@@ -80,9 +80,17 @@ struct Layer {
   }
 };
 
+template <typename T> void dump(std::ostream &out, const T *p, size_t count) {
+  if (!out.write(reinterpret_cast<const char *>(p), count * sizeof(T)))
+    throw std::runtime_error("write failed");
+}
+
 // Compare both rows and recurrent snapshots at the DSO boundary, before
 // argmax can conceal rounding or a state transition error.
-void verifyRows(const fs::path &dir) {
+void verifyRows(const fs::path &dir, const fs::path &trace = {}) {
+  std::ofstream output;
+  if (!trace.empty())
+    output.open(trace, std::ios::binary);
   Kernel full(dir / "full_attn_layer.so"), gdn(dir / "gdn_layer.so");
   size_t width = full.info->base.width, rotary = full.info->rotary_dim;
   Buffer<float> x(2 * width), one(2 * width), both(2 * width);
@@ -108,6 +116,7 @@ void verifyRows(const fs::path &dir) {
     for (size_t i = 0; i < ref.b.size; ++i)
       ref.b.data()[i] = test.b.data()[i] = float(i % 11) / 19;
     Buffer<float> sa(ref.a.size), sb(ref.b.size);
+    Buffer<float> firstA(ref.a.size), firstB(ref.b.size);
     BJ47VerifyRows aux{{2}, sa.data(), sb.data()};
     BJ47FrameV1 frame{13, cos.data(), sin.data(), &aux};
     BJ47WeightsV1 w{test.w.data(), test.q4.data()};
@@ -120,6 +129,10 @@ void verifyRows(const fs::path &dir) {
                       &single};
       ref.run(false, x.data() + i * width, row, one.data() + i * width);
       equal(one.data() + i * width, both.data() + i * width, width);
+      if (!i) {
+        std::copy_n(ref.a.data(), ref.a.size, firstA.data());
+        std::copy_n(ref.b.data(), ref.b.size, firstB.data());
+      }
       if (!i && kernel == &gdn) {
         equal(ref.a.data(), sa.data(), sa.size);
         equal(ref.b.data(), sb.data(), sb.size);
@@ -127,13 +140,31 @@ void verifyRows(const fs::path &dir) {
     }
     equal(ref.a.data(), test.a.data(), ref.a.size);
     equal(ref.b.data(), test.b.data(), ref.b.size);
-  }
-  std::cout << "verify rows 0/1, GDN snapshot and final GDN/KV: bit_diff=0\n";
-}
 
-template <typename T> void dump(std::ostream &out, const T *p, size_t count) {
-  if (!out.write(reinterpret_cast<const char *>(p), count * sizeof(T)))
-    throw std::runtime_error("write failed");
+    // Reject the draft. Rewind the recurrent state to the row-zero snapshot;
+    // attention overwrites the rejected KV slot at the same cache position.
+    std::copy_n(firstA.data(), ref.a.size, ref.a.data());
+    std::copy_n(firstB.data(), ref.b.size, ref.b.data());
+    if (kernel == &gdn) {
+      std::copy_n(sa.data(), sa.size, test.a.data());
+      std::copy_n(sb.data(), sb.size, test.b.data());
+    }
+    BJ47FrameV1 replacement{14, cos.data() + rotary, sin.data() + rotary,
+                            &single};
+    if (!trace.empty())
+      dump(output, both.data(), both.size);
+    ref.run(false, x.data(), replacement, one.data());
+    test.run(false, x.data(), replacement, both.data());
+    equal(one.data(), both.data(), width);
+    equal(ref.a.data(), test.a.data(), ref.a.size);
+    equal(ref.b.data(), test.b.data(), ref.b.size);
+    if (!trace.empty()) {
+      dump(output, both.data(), width);
+      dump(output, test.a.data(), test.a.size);
+      dump(output, test.b.data(), test.b.size);
+    }
+  }
+  std::cout << "verify rows, rejected-row replacement and GDN/KV: bit_diff=0\n";
 }
 
 // Compare an individual production layer across two builds without loading
@@ -207,6 +238,44 @@ void layerTrace(const fs::path &dir, const fs::path &weight, const char *role,
   if (rows == 2 && !info.rotary_dim) {
     dump(out, sa.data(), sa.size);
     dump(out, sb.data(), sb.size);
+  }
+}
+
+// Use the offset from the matching release ELF (the projection is private).
+void gluProbe(const fs::path &dir, const fs::path &weight, const char *offset,
+              const fs::path &trace) {
+  Kernel kernel(dir / "gdn_layer.so");
+  Layer layer(kernel, weight);
+  BJ47WeightsV1 weights{layer.w.data(), layer.q4.data()};
+  Dl_info image{};
+  if (!dladdr(kernel.symbol<void *>("bj47_kernel_info_v1"), &image))
+    throw std::runtime_error("GLU image address");
+  using Glu = void (*)(const BJ47WeightsV1 &, const float *, float *, int);
+  auto glu = reinterpret_cast<Glu>(static_cast<char *>(image.dli_fbase) +
+                                   std::stoul(offset, nullptr, 16));
+  // This probe measures the production 27B shape used by EXP-19.
+  Buffer<float> x(64 * 5120), out(64 * 17408);
+  for (size_t i = 0; i < x.size; ++i)
+    x.data()[i] = (int(i % 251) - 125) * 0.0009f;
+  if (!trace.empty()) {
+    std::ofstream stream(trace, std::ios::binary);
+    glu(weights, x.data(), out.data(), 2);
+    dump(stream, out.data(), 2 * 17408);
+    return;
+  }
+  for (int rows : {1, 2, 64}) {
+    std::cout << "q4_glu M=" << rows << " ns";
+    for (int rep = -2; rep < 8; ++rep) {
+      auto start = std::chrono::steady_clock::now();
+      glu(weights, x.data(), out.data(), rows);
+      auto elapsed = std::chrono::steady_clock::now() - start;
+      if (rep >= 0)
+        std::cout << ' '
+                  << std::chrono::duration_cast<std::chrono::nanoseconds>(
+                         elapsed)
+                         .count();
+    }
+    std::cout << '\n';
   }
 }
 
@@ -317,14 +386,19 @@ void probe(const fs::path &dir, const fs::path &input, const fs::path &output,
 
 int main(int argc, char **argv) {
   try {
+    if ((argc == 5 && std::string(argv[1]) == "--glu-bench") ||
+        (argc == 6 && std::string(argv[1]) == "--glu-trace-2")) {
+      gluProbe(argv[2], argv[3], argv[4], argc == 6 ? argv[5] : "");
+      return 0;
+    }
     bool benchmark = argc == 7 && std::string(argv[1]) == "--layer-bench";
     if (benchmark || (argc == 8 && std::string(argv[1]) == "--layer-trace")) {
       layerTrace(argv[2], argv[3], argv[4], std::stoi(argv[5]),
                  std::stoi(argv[6]), benchmark ? "" : argv[7], benchmark);
       return 0;
     }
-    if (argc == 3 && std::string(argv[1]) == "--verify-rows") {
-      verifyRows(argv[2]);
+    if ((argc == 3 || argc == 4) && std::string(argv[1]) == "--verify-rows") {
+      verifyRows(argv[2], argc == 4 ? argv[3] : "");
       return 0;
     }
     if (argc != 7)

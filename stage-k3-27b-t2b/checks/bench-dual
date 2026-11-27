@@ -9,11 +9,18 @@ case ${1:-} in
     for node in "$K3_R0" "$K3_R1"; do
       ssh "$node" 'mkdir -p ~/t2b-incoming/checks'
       rsync -a "$stage/"*.so "$stage"/{buddy-pp-route-b,route-b.json,SHA256SUMS,baseline.sha256,s2b-update} "$node:t2b-incoming/"
-      rsync -a "$stage/checks/"{layer-probe,probes.sha256} "$node:t2b-incoming/checks/"
+      rsync -a "$stage/checks/"{layer-probe,glu-offsets,probes.sha256} "$node:t2b-incoming/checks/"
       ssh "$node" 'cd ~/t2b-incoming && sha256sum --quiet -c checks/probes.sha256 && ./s2b-update prepare'
     done
     ;;
-  activate|rollback)
+  rollback)
+    status=0
+    for node in "$K3_R0" "$K3_R1"; do
+      ssh "$node" 'bash ~/t2b-incoming/s2b-update rollback' || status=1
+    done
+    exit "$status"
+    ;;
+  activate)
     for node in "$K3_R0" "$K3_R1"; do
       ssh "$node" "bash ~/t2b-incoming/s2b-update $1"
     done
@@ -28,7 +35,7 @@ out="$HOME/t2b-incoming/$1-operators.log"
 set -o noclobber
 exec > "$out"
 echo 0 > /proc/set_ai_thread
-./vlen
+vlen=$(./vlen 2>&1); echo "$vlen"; [[ "$vlen" == *vlen=1024* ]]
 export OMP_NUM_THREADS=8 BUDDY_THREAD_POOL_THREADS=8
 export LD_LIBRARY_PATH="$PWD:$(dirname "$(cat mpiexec.path)")/../lib:${LD_LIBRARY_PATH:-}"
 probe=$HOME/t2b-incoming/checks/layer-probe
@@ -39,15 +46,25 @@ for m in 1 2 64; do
     "$probe" --layer-bench . full_attn-3.f32 full_attn_layer "$m" "$pos"
   done
 done
+"$probe" --layer-bench . full_attn-3.f32 full_attn_layer 2 383
+for role in mtp_layer lm_head; do
+  "$HOME/exp18-s1/micro" "$role" "$HOME/exp18-s1/projections.txt"
+done
+# This public test entry resolves only the GLU tile wrapper, whose signature
+# is identical in both releases. Match its offset to the active ELF digest.
+hash=$(sha256sum gdn_layer.so | cut -d' ' -f1)
+offset=$(awk -v h="$hash" '$1 == h {print $2}' "$HOME/t2b-incoming/checks/glu-offsets")
+[[ "$offset" =~ ^[0-9a-f]+$ ]]
+"$probe" --glu-bench . gdn-0.f32 "$offset"
 BOARD
     ssh "$K3_R0" bash -s -- "$tag" <<'BOARD'
 set -euo pipefail
-cd "$HOME/exp18-s1"
+cd "$HOME/exp19-s2"
 for mode in off on; do
-  for workload in trace grid; do
-    test ! -e "28-$mode-f32-$workload-$1.json"
-    python3 bench.py 28 "$mode" f32 "$workload" "$1"
-  done
+  test ! -e "28-$mode-f32-quality-$1.json"
+  python3 bench.py 28 "$mode" f32 quality "$1"
+  test ! -e "28-$mode-f32-grid-$1.json"
+  python3 clean.py 28 "$mode" f32 grid "$1"
 done
 BOARD
     ;;

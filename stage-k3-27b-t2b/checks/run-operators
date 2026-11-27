@@ -9,3 +9,7 @@ g=$stage/gdn_layer.so
 a=$stage/full_attn_layer.so
 "$QEMU_RUN" "$PROBE" gate "$g" "$(symbol "$g" 'gateProjection<1>')" "$(symbol "$g" 'gateProjection<2>')" "$(symbol "$g" 'gateProjection<4>')" "$GDN_F32"
 "$QEMU_RUN" "$PROBE" attention "$a" "$(symbol "$a" '::onlineAttention(')"
+for role in full_attn_layer mtp_layer; do
+  image="$stage/$role.so"
+  "$QEMU_RUN" "$PROBE" verify "$image" "$(symbol "$image" '::decodeGroup<2>')" "$(symbol "$image" '::decodeGroup<4>')"
+done

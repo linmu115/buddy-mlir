@@ -7,7 +7,8 @@ root=${2:-"$HOME/route-b-qwen38-27b-release"}
 cd "$root"
 exec 9<.
 flock -x 9
-id=$(sha256sum "$kit/route-b.json" | cut -c1-16)
+# Include the host and rollback payload in the transaction identity.
+id=$(cat "$kit/baseline.sha256" "$kit/SHA256SUMS" | sha256sum | cut -c1-16)
 state=".s2b-$id"
 payload=(embed.so lm_head.so gdn_layer.so full_attn_layer.so mtp_layer.so libbj47_kernel_runtime.so buddy-pp-route-b route-b.json)
 verify() { (cd "$1" && sha256sum --strict --quiet -c "$2"); }
