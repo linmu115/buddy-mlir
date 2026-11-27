@@ -121,8 +121,8 @@ def projection_code(args, owner, schema, positions):
             if residual:
                 spec.update(residual=True, residual_rhs=True)
                 spec["name"] += "_res_rhs"
-            if matrix and schema.get("glu", (None, None))[1] == (17408, 5120):
-                spec["exact_dense_dot"] = True
+            if name == "glu" and rows == 2 and (n, k) == (17408, 5120):
+                spec["full_width_glu"] = True
             symbol = spec["name"]
             extra_arg = ", Descriptor<2>*" if residual else ""
             res_desc = (

@@ -1581,10 +1581,17 @@ def _tile_fn(ty, spec):
             ]
             if spec["kind"] == "glu":
                 tg = _muli(a["wt"], fn.idx(2))
-                gate = _tile_accumulator(fn, ty, spec["k"], a, tg, rows, "glu")
-                up = _tile_accumulator(
-                    fn, ty, spec["k"], a, _addi(tg, fn.idx(1)), rows, "glu"
-                )
+                tu = _addi(tg, fn.idx(1))
+                if spec.get("full_width_glu"):
+                    gate = _accumulate(fn, ty, spec, a, tg, rows)
+                    up = _accumulate(fn, ty, spec, a, tu, rows)
+                else:
+                    gate = _tile_accumulator(
+                        fn, ty, spec["k"], a, tg, rows, "glu"
+                    )
+                    up = _tile_accumulator(
+                        fn, ty, spec["k"], a, tu, rows, "glu"
+                    )
                 vals = [_silu_mul(fn, ty, g, u, NB) for g, u in zip(gate, up)]
             else:
                 if spec.get("stream_head") and len(rows) == 2:

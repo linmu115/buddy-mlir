@@ -426,20 +426,27 @@ void mix(const BJ47WeightsV1 &weights, const float *x, float *keys,
   }
 #ifdef HYBRID_THREADS
   if (rows <= 2 && attentionHeads / kvHeads == 6 && headDim == 256) {
-    int position = frame.cache_position;
-    const int group = position < 384 ? 2 : 4;
-    const int items = (6 + group - 1) / group;
+    // A verify call can straddle visible lengths 384 and 385. Partition
+    // each row independently, sharing a single team across both rows.
+    const int position = frame.cache_position;
+    auto itemsPerKv = [](int pos) { return pos < 384 ? 3 : 2; };
+    const int firstRow = kvHeads * itemsPerKv(position);
+    const int total =
+        firstRow + (valid == 2 ? kvHeads * itemsPerKv(position + 1) : 0);
 #pragma omp parallel for schedule(static) num_threads(HYBRID_THREADS)
-    for (uint64_t item = 0; item < uint64_t(kvHeads * items); ++item) {
-      const int kv = item / items, first = (item % items) * group;
+    for (uint64_t item = 0; item < uint64_t(total); ++item) {
+      const int r = item >= uint64_t(firstRow);
+      const int index = int(item) - r * firstRow;
+      const int items = itemsPerKv(position + r);
+      const int group = items == 3 ? 2 : 4;
+      const int kv = index / items, first = (index % items) * group;
       const int h = kv * 6 + first;
       auto apply = (group == 4 && first == 0) ? decodeGroup<4> : decodeGroup<2>;
-      for (int r = 0; r < valid; ++r)
-        apply(query.data() + (r * attentionHeads + h) * 2 * headDim, w + qNorm,
-              frame.cos_rows + r * rotaryDim, frame.sin_rows + r * rotaryDim,
-              keys + size_t(kv) * context * headDim,
-              values + size_t(kv) * context * headDim, position + r + 1,
-              cores.data() + (r * attentionHeads + h) * headDim);
+      apply(query.data() + (r * attentionHeads + h) * 2 * headDim, w + qNorm,
+            frame.cos_rows + r * rotaryDim, frame.sin_rows + r * rotaryDim,
+            keys + size_t(kv) * context * headDim,
+            values + size_t(kv) * context * headDim, position + r + 1,
+            cores.data() + (r * attentionHeads + h) * headDim);
     }
   } else
 #endif

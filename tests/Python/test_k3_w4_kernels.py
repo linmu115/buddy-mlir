@@ -13,6 +13,7 @@ import os
 import platform
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import numpy
 from buddy.compiler.graph.transform import k3_w4
@@ -28,6 +29,7 @@ sys.path.insert(
     0, os.path.join(os.environ["BUDDY_SRC_ROOT"], "tools", "buddy-codegen")
 )
 import compile_pipeline  # noqa: E402
+from route_b_hybrid_w4 import offsets, projection_code  # noqa: E402
 
 BUDDY_OPT, OMP_DIR = sys.argv[1], sys.argv[2]
 THREADS = 3
@@ -549,3 +551,17 @@ exact = dict(dense, exact_dense_dot=True, name="hybrid_exact_test")
 ime = k3_w4.gen_kernels([dense, exact], part="ime")
 assert "@k3_ime_i32_step" in ime and "@k3_ime_hp_step" in ime
 assert '"ime.intr.vmadot"' in ime and '"ime.intr.vmadot.hp"' in ime
+
+# The production hybrid owners share the same dense GLU geometry. The packed
+# P64 ABI selects HP dots, and only the two-row GLU restores the full tile.
+quant = {"glu": ("unused", (17408, 5120))}
+positions, _ = offsets(quant, True)
+_, specs = projection_code(
+    SimpleNamespace(chunk=64, threads=8), "gdn", quant, positions
+)
+one, two, prefill = specs
+assert not one.get("full_width_glu") and two["full_width_glu"]
+ime = k3_w4.gen_kernels([prefill], part="ime")
+assert '"ime.intr.vmadot.hp"' in ime and '"ime.intr.vmadot"' not in ime
+print("hybrid P64 HP and two-row GLU selection passed")
+# CHECK: hybrid P64 HP and two-row GLU selection passed

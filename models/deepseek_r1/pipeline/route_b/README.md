@@ -275,9 +275,8 @@ per group through visible length 384. Longer contexts split each KV head's
 six queries into groups of four and two.
 
 With `--prefill-ime`, the 64-row dense projections consume the existing
-144-byte IME blocks and accumulate the two K16 dots into an integer G32
-sum. Weight and activation scales are widened before the FP32 update.
-This changes prefill rounding relative to the earlier half-precision dot.
+144-byte IME blocks using the original `smt.vmadot.hp` arithmetic. The
+two-row 27B GLU uses the full-width RVV tile for each gate and up projection.
 The weight offsets, pack version and exported kernel signatures are stable.
 A binary upgrade also needs the matching template sizes, digests, runtime
 digest and bundle ID in `route-b.json`.
@@ -289,7 +288,8 @@ slices immediately after the first row. Padded rows leave state untouched.
 The A/B kernel retains the MLIR projection's eight K accumulators and rounds
 products and additions separately.
 
-The 27B verifier uses grouped attention for both rows. Prefill appends valid
+The verifier schedules both rows in one workshare. Each row selects its own
+group size and causal endpoint, including when it crosses visible length 384. Prefill appends valid
 KV rows, assigns query heads to workers and scores only through each row's
 position. Its tiled softmax recomputes an earlier prefix when the running
 maximum rises. This preserves the ordered denominator and rounds probabilities
