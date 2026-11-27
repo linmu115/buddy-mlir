@@ -13,6 +13,8 @@ using namespace buddy::v4;
 using Clock = std::chrono::steady_clock;
 static std::mt19937 rng(4106);
 static volatile float checksum;
+static bool smoke = false;
+static int fp8Block = 128;
 Vec values(size_t n, float scale = .02f) {
   Vec a(n);
   std::uniform_real_distribution<float> dist(-scale, scale);
@@ -20,8 +22,14 @@ Vec values(size_t n, float scale = .02f) {
     v = dist(rng);
   return a;
 }
-template <class F> void measure(const std::string &name, F run, int reps = 5) {
-  checksum = run();
+template <class F>
+void measure(const std::string &name, F run, int reps = 5,
+             size_t weightBytes = 0) {
+  if (smoke)
+    reps = 1;
+  else
+    checksum = run();
+  std::vector<double> elapsed;
   std::cout << "{\"name\":\"" << name << "\",\"ms\":[";
   for (int i = 0; i < reps; i++) {
     auto start = Clock::now();
@@ -30,9 +38,20 @@ template <class F> void measure(const std::string &name, F run, int reps = 5) {
         std::chrono::duration<double, std::milli>(Clock::now() - start).count();
     if (!std::isfinite(checksum))
       throw std::runtime_error("nonfinite checksum");
+    elapsed.push_back(ms);
     std::cout << (i ? "," : "") << ms;
   }
-  std::cout << "],\"checksum\":" << checksum << "}" << std::endl;
+  if (weightBytes) {
+    std::cout << "],\"weight_bytes\":" << weightBytes
+              << ",\"effective_GB_s\":[";
+    for (size_t i = 0; i < elapsed.size(); ++i)
+      std::cout << (i ? "," : "") << weightBytes / (elapsed[i] * 1e6);
+  }
+  std::cout << "],\"checksum\":" << checksum;
+  if (name.rfind("csa_", 0) == 0 || name.rfind("engram_", 0) == 0 ||
+      name == "moe_native")
+    std::cout << ",\"fp8_weight_block\":" << fp8Block;
+  std::cout << "}" << std::endl;
 }
 struct W4 {
   int k, n;
@@ -45,7 +64,7 @@ struct W4 {
         std::memcpy(bytes.data() + i + j, &state, 4);
       }
       for (int j = 2048; j < 2304; j += 2) {
-        _Float16 sc = .002f;
+        _Float16 sc = static_cast<_Float16>(.002f);
         std::memcpy(bytes.data() + i + j, &sc, 2);
       }
     }
@@ -56,12 +75,41 @@ struct W4 {
     return y;
   }
 };
-struct FP8 {
+struct FP4 {
   int k, n;
   std::vector<uint8_t> data, scale;
+  FP4(int k, int n)
+      : k(k), n(n), data(size_t(k / 2) * n), scale(size_t(k / 32) * n) {
+    std::uniform_int_distribution<unsigned> byte(0, 255);
+    for (auto &b : data)
+      b = byte(rng);
+    for (auto &b : scale)
+      b = 117 + (byte(rng) % 5);
+  }
+  Vec apply(const Vec &x) const {
+    Vec y(n);
+    fp4MatVec(x.data(), data.data(), scale.data(), k, n, y.data());
+    return y;
+  }
+};
+void benchFP4() {
+  for (auto shape :
+       {std::pair{5120, 2304}, std::pair{2304, 5120}, std::pair{5120, 1280}}) {
+    auto [k, n] = shape;
+    FP4 w(k, n);
+    auto x = values(k);
+    measure(
+        "fp4_k" + std::to_string(k) + "_n" + std::to_string(n),
+        [&] { return w.apply(x).back(); }, 5, w.data.size() + w.scale.size());
+  }
+}
+struct FP8 {
+  int k, n, block;
+  std::vector<uint8_t> data, scale;
   FP8(int k, int n)
-      : k(k), n(n), data(size_t(k) * n),
-        scale(size_t((n + 31) / 32) * (k / 32), 119) {
+      : k(k), n(n), block(fp8Block), data(size_t(k) * n),
+        scale(size_t((n + block - 1) / block) * ((k + block - 1) / block),
+              119) {
     uint32_t state = rng();
     for (size_t i = 0; i < data.size(); i += 4) {
       state = 1664525 * state + 1013904223;
@@ -70,26 +118,11 @@ struct FP8 {
     }
   }
   Vec apply(Vec x) const {
-    static const auto lut = [] {
-      std::array<float, 256> a{};
-      for (int i = 0; i < 256; i++)
-        a[i] = e4m3(i);
-      return a;
-    }();
     quantize(x.data(), k, 32, Format::E4);
     Vec out(n);
-#pragma omp parallel for
-    for (int j = 0; j < n; j++) {
-      float sum = 0;
-      for (int g = 0; g < k / 32; g++) {
-        float part = 0;
-        auto p = data.data() + size_t(j) * k + 32 * g;
-        for (int t = 0; t < 32; t++)
-          part += x[g * 32 + t] * lut[p[t]];
-        sum += part * ue8m0(scale[size_t(j / 32) * (k / 32) + g]);
-      }
-      out[j] = bf16(sum);
-    }
+    fp8MatVec(x.data(), data.data(), scale.data(), k, n, block, out.data());
+    for (float &v : out)
+      v = bf16(v);
     return out;
   }
 };
@@ -116,23 +149,51 @@ void benchMoE() {
   Vec scores(384), coef;
   linear(x.data(), router.data(), h, 384, scores.data());
   auto active = route(scores, bias.data(), 6, 1, 1.5f, coef);
-  std::vector<W4> mats;
-  for (int i = 0; i < 7; i++) {
-    mats.emplace_back(h, d);
-    mats.emplace_back(h, d);
-    mats.emplace_back(d, h);
+  {
+    std::vector<W4> mats;
+    for (int i = 0; i < 7; i++) {
+      mats.emplace_back(h, d);
+      mats.emplace_back(h, d);
+      mats.emplace_back(d, h);
+    }
+    measure("moe", [&] {
+      linear(x.data(), router.data(), h, 384, scores.data());
+      auto project = [&](int id, int branch, const Vec &v) {
+        int slot = id == 384 ? 6
+                             : int(std::find(active.begin(), active.end(), id) -
+                                   active.begin());
+        return mats[3 * slot + (branch == 1   ? 0
+                                : branch == 3 ? 1
+                                              : 2)]
+            .apply(v);
+      };
+      auto out = moeV4(x, scores, bias.data(), 6, 1, 1.5f, 10, project,
+                       [](float v) { return v; });
+      return out.back();
+    });
   }
-  measure("moe", [&] {
+  std::vector<FP4> experts;
+  for (int i = 0; i < 6; ++i) {
+    experts.emplace_back(h, d);
+    experts.emplace_back(h, d);
+    experts.emplace_back(d, h);
+  }
+  std::array<FP8, 3> shared{FP8(h, d), FP8(h, d), FP8(d, h)};
+  measure("moe_native", [&] {
     linear(x.data(), router.data(), h, 384, scores.data());
     auto project = [&](int id, int branch, const Vec &v) {
-      int slot = id == 384 ? 6
-                           : int(std::find(active.begin(), active.end(), id) -
-                                 active.begin());
-      return mats[3 * slot + (branch == 1 ? 0 : branch == 3 ? 1 : 2)].apply(v);
+      int b = branch == 1 ? 0 : branch == 3 ? 1 : 2;
+      if (id == 384)
+        return shared[b].apply(v);
+      int slot = std::find(active.begin(), active.end(), id) - active.begin();
+      Vec act = v;
+      quantize(act.data(), act.size(), 32, Format::E4);
+      Vec y = experts[3 * slot + b].apply(act);
+      for (float &f : y)
+        f = bf16(f);
+      return y;
     };
-    auto out = moeV4(x, scores, bias.data(), 6, 1, 1.5f, 10, project,
-                     [](float v) { return v; });
-    return out.back();
+    return moeV4(x, scores, bias.data(), 6, 1, 1.5f, 10, project, bf16).back();
   });
 }
 struct BFMatrix {
@@ -152,12 +213,28 @@ struct BFMatrix {
       auto a = x.data() + (j / (n / groups)) * k;
       float sum = 0;
       auto p = data.data() + size_t(j) * k;
+#if defined(__riscv_v_intrinsic)
+      size_t width = __riscv_vsetvl_e32m4(k);
+      auto acc = __riscv_vfmv_v_f_f32m4(0, width);
+      for (int i = 0; i < k;) {
+        size_t vl = std::min<size_t>(width, k - i);
+        auto bits =
+            __riscv_vwcvtu_x_x_v_u32m4(__riscv_vle16_v_u16m2(p + i, vl), vl);
+        auto w = __riscv_vreinterpret_v_u32m4_f32m4(
+            __riscv_vsll_vx_u32m4(bits, 16, vl));
+        acc = __riscv_vfmacc_vv_f32m4_tu(acc, w,
+                                         __riscv_vle32_v_f32m4(a + i, vl), vl);
+        i += vl;
+      }
+      sum = reduceSum(acc, width);
+#else
       for (int i = 0; i < k; i++) {
         uint32_t bits = uint32_t(p[i]) << 16;
         float f;
         std::memcpy(&f, &bits, 4);
         sum += a[i] * f;
       }
+#endif
       y[j] = rounded ? bf16(sum) : sum;
     }
     return y;
@@ -360,7 +437,21 @@ void benchEngram(const char *file) {
 int main(int argc, char **argv) {
   if (argc < 2)
     return 2;
+  while (argc > 2) {
+    std::string option = argv[argc - 1];
+    if (option == "--smoke")
+      smoke = true;
+    else if (option == "--fp8-block=32")
+      fp8Block = 32;
+    else if (option == "--fp8-block=128")
+      fp8Block = 128;
+    else
+      break;
+    --argc;
+  }
   std::string m = argv[1];
+  if (argc != (m == "engram" ? 3 : 2))
+    return 2;
   if (m == "hc") {
     benchHC(1);
     benchHC(64);
@@ -378,6 +469,10 @@ int main(int argc, char **argv) {
     }
   } else if (m == "moe")
     benchMoE();
+  else if (m == "fp4")
+    benchFP4();
+  else if (m == "csa")
+    benchCSA("full2");
   else if (m == "engram" && argc == 3)
     benchEngram(argv[2]);
   else if (m == "swa" || m == "reindex" || m == "reuse" || m == "full1" ||

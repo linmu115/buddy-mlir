@@ -93,3 +93,42 @@ the strict plan. If there are too few boards it also solves for cuts that
 transfer live source state. Throughputs are steady-state predictions at
 context 4096. V4 uses shape-scaled V4.1 timing, and the output head uses
 a measured 4096-row projection extrapolated to the vocabulary size.
+
+## Native FP4 and FP8 on RVV
+
+The Tiny runner consumes row-major checkpoint FP4 directly. Its packed row
+starts with the even K element in the low nibble and has one UE8M0 scale per
+32 elements. FP8 linear weights share a scale across a square tile. The Tiny
+checkpoint uses 32×32 tiles. The benchmark defaults to 128×128 weight tiles;
+pass `--fp8-block=32` to compare with the original V4.1 benchmark. Both use
+groups of 32 for activation quantization. Explicit w4g32 weights retain their
+original integer path.
+
+To build the three standalone drivers with GCC and run the quantization test
+on a Linux host with QEMU 8.2, first generate the two fixtures described above.
+Use an out-of-tree binary directory for the following commands.
+
+```sh
+D=tests/Models/Inputs/deepseek_v41
+mkdir -p "$OUT/bin"
+for name in DeepSeekV41Tiny DeepSeekV4QuantTest DeepSeekV4Bench; do
+  riscv64-linux-gnu-g++ -std=c++17 -O3 -fopenmp -ffp-contract=off -static \
+    -march=rv64gcv_zfh_zvfh_zba_zbb_zbc_zbs -Iruntime/include \
+    "$D/$name.cpp" -o "$OUT/bin/$name"
+done
+export OMP_NUM_THREADS=8 OMP_DYNAMIC=false
+qemu-riscv64 -cpu rv64,v=true,vlen=1024,vext_spec=v1.0,zfh=true,x-zvfh=true \
+  "$OUT/bin/DeepSeekV4QuantTest" "$OUT/quant"
+```
+
+The quantization driver checks all 256 unscaled E4M3 bit patterns including
+signed zeros and signed NaNs, both FP8 tile sizes, and the native FP4 relative
+L2 against a double-precision dot of independently decoded weights.
+
+`fp4` measures gate/up, down, and attention projection shapes. Each sample
+reports milliseconds and effective decimal GB/s based on packed weight and
+scale bytes. `moe` emits the existing w4g32 result followed by a native FP4
+routed / FP8 shared-expert measurement. `csa` runs the ratio-two full source
+layer (`full2`). For one real-shape iteration without warmup, append
+`--smoke` to any mode. Supply a new local file path before the flags for
+`engram`. Use repeated runs on silicon for latency and bandwidth.

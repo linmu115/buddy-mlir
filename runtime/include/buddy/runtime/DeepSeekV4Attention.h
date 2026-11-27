@@ -47,17 +47,49 @@ inline void quantize(float *x, int n, int block, Format format) {
 }
 inline void norm(Vec &x, const float *w, float eps = 1e-20f) {
   float inv = 1 / std::sqrt(dot(x.data(), x.data(), x.size()) / x.size() + eps);
+#if defined(__riscv_v_intrinsic)
+  for (size_t i = 0; i < x.size();) {
+    size_t vl = __riscv_vsetvl_e32m4(x.size() - i);
+    auto y = __riscv_vfmul_vf_f32m4(__riscv_vle32_v_f32m4(x.data() + i, vl),
+                                    inv, vl);
+    y = __riscv_vfmul_vv_f32m4(y, __riscv_vle32_v_f32m4(w + i, vl), vl);
+    __riscv_vse32_v_f32m4(x.data() + i, bf16Vector(y, vl), vl);
+    i += vl;
+  }
+#else
   for (size_t j = 0; j < x.size(); j++)
     x[j] = bf16(w[j] * (x[j] * inv));
+#endif
 }
 inline void rotate(float *tail, const float *freq, int rd,
                    bool inverse = false) {
+#if defined(__riscv_v_intrinsic)
+  for (int j = 0; j < rd;) {
+    size_t vl = __riscv_vsetvl_e32m4((rd - j) / 2);
+    auto a = __riscv_vlse32_v_f32m4(tail + j, 2 * sizeof(float), vl);
+    auto b = __riscv_vlse32_v_f32m4(tail + j + 1, 2 * sizeof(float), vl);
+    auto c = __riscv_vlse32_v_f32m4(freq + j, 2 * sizeof(float), vl);
+    auto s = __riscv_vlse32_v_f32m4(freq + j + 1, 2 * sizeof(float), vl);
+    if (inverse)
+      s = __riscv_vfneg_v_f32m4(s, vl);
+    auto real = __riscv_vfsub_vv_f32m4(__riscv_vfmul_vv_f32m4(a, c, vl),
+                                       __riscv_vfmul_vv_f32m4(b, s, vl), vl);
+    auto imag = __riscv_vfadd_vv_f32m4(__riscv_vfmul_vv_f32m4(a, s, vl),
+                                       __riscv_vfmul_vv_f32m4(b, c, vl), vl);
+    __riscv_vsse32_v_f32m4(tail + j, 2 * sizeof(float), bf16Vector(real, vl),
+                           vl);
+    __riscv_vsse32_v_f32m4(tail + j + 1, 2 * sizeof(float),
+                           bf16Vector(imag, vl), vl);
+    j += 2 * vl;
+  }
+#else
   for (int j = 0; j < rd; j += 2) {
     float a = tail[j], b = tail[j + 1], c = freq[j],
           s = inverse ? -freq[j + 1] : freq[j + 1];
     tail[j] = bf16(a * c - b * s);
     tail[j + 1] = bf16(a * s + b * c);
   }
+#endif
 }
 inline std::vector<uint8_t> candidates(const Vec &score, int len, int blocks,
                                        int size) {
@@ -88,7 +120,8 @@ inline Ids selectIndex(Vec scores, int len, int k, int offset,
 }
 inline void sparse(const float *q, const std::vector<const float *> &keys,
                    int h, int d, const float *sink, float *out) {
-#pragma omp parallel for if (h * d >= 8192)
+  const float invSqrtD = 1 / std::sqrt(float(d));
+#pragma omp parallel for schedule(static) if (h * d >= 8192)
   for (int head = 0; head < h; head++) {
     float max = -1e30f, den = 0;
     float *o = out + head * d;
@@ -98,29 +131,46 @@ inline void sparse(const float *q, const std::vector<const float *> &keys,
       float s[64], old = max;
       for (int j = 0; j < n; j++) {
         auto v = keys[off + j];
-        s[j] =
-            v ? dot(q + head * d, v, d) * (1 / std::sqrt(float(d))) : -INFINITY;
+        s[j] = v ? dot(q + head * d, v, d) * invSqrtD : -INFINITY;
         max = std::max(max, s[j]);
       }
       float adj = std::exp(old - max);
       den *= adj;
+#if defined(__riscv_v_intrinsic)
+      for (int k = 0; k < d;) {
+        size_t vl = __riscv_vsetvl_e32m4(d - k);
+        auto v = __riscv_vle32_v_f32m4(o + k, vl);
+        __riscv_vse32_v_f32m4(o + k, __riscv_vfmul_vf_f32m4(v, adj, vl), vl);
+        k += vl;
+      }
+#else
       for (int k = 0; k < d; k++)
         o[k] *= adj;
+#endif
       float sum = 0;
       for (int j = 0; j < n; j++) {
         float exp = std::exp(s[j] - max);
         sum += exp;
         if (auto v = keys[off + j]) {
           float p = bf16(exp);
-          for (int k = 0; k < d; k++)
-            o[k] += p * v[k];
+          addScaled(o, v, p, d);
         }
       }
       den += sum;
     }
     den += std::exp(sink[head] - max);
+#if defined(__riscv_v_intrinsic)
+    for (int k = 0; k < d;) {
+      size_t vl = __riscv_vsetvl_e32m4(d - k);
+      auto v = __riscv_vle32_v_f32m4(o + k, vl);
+      __riscv_vse32_v_f32m4(
+          o + k, bf16Vector(__riscv_vfdiv_vf_f32m4(v, den, vl), vl), vl);
+      k += vl;
+    }
+#else
     for (int k = 0; k < d; k++)
       o[k] = bf16(o[k] / den);
+#endif
   }
 }
 } // namespace buddy::v4

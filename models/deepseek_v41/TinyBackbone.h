@@ -96,25 +96,10 @@ struct Weights : Store {
     else {
       quantize(x.data(), k, 32, Format::E4);
       auto &s = (*this)[key + ".scale"];
-      static const auto lut = [] {
-        std::array<float, 256> a{};
-        for (int i = 0; i < 256; i++)
-          a[i] = e4m3(i);
-        return a;
-      }();
-      bool fp4 = w.type == "fp4";
-      for (int r = 0; r < n; r++) {
-        auto p = w.u() + r * w.shape[1];
-        for (int j = 0; j < k; j += 32) {
-          float sum = 0;
-          for (int t = j; t < j + 32; t++) {
-            float b = fp4 ? E2M1[(p[t / 2] >> (4 * (t % 2))) & 15] : lut[p[t]];
-            sum += x[t] * b;
-          }
-          out[r] +=
-              sum * ue8m0(s.u()[(fp4 ? r : r / 32) * s.shape[1] + j / 32]);
-        }
-      }
+      if (w.type == "fp4")
+        fp4MatVec(x.data(), w.u(), s.u(), k, n, out.data());
+      else
+        fp8MatVec(x.data(), w.u(), s.u(), k, n, 32, out.data());
     }
     if (rounded)
       roundBF(out);
