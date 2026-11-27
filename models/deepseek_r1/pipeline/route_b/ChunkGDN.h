@@ -1,6 +1,7 @@
 // One head of the fp32 gated delta rule. Q and K have already been
 // normalized, and Q includes the inverse square root of the key dimension.
 #pragma once
+#include "HybridVector.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
@@ -24,11 +25,6 @@ public:
 } // namespace hybrid
 
 namespace hybrid {
-inline void addScaled(float *dst, const float *src, int n, float scale) {
-  for (int i = 0; i < n; ++i)
-    dst[i] += scale * src[i];
-}
-
 inline void chunkGDN(const float *q, const float *k, const float *v, int stride,
                      const float *logDecay, const float *beta, int heads,
                      float *state, float *out, int outStride, int length,
@@ -56,12 +52,9 @@ inline void chunkGDN(const float *q, const float *k, const float *v, int stride,
       y[i] *= decay;
     }
     for (int s = 0; s <= t; ++s) {
-      float kk = 0, qk = 0;
       const float *ks = k + s * stride;
-      for (int j = 0; j < dk; ++j) {
-        kk += kt[j] * ks[j];
-        qk += qt[j] * ks[j];
-      }
+      float kk = orderedDot(kt, ks, dk);
+      float qk = orderedDot(qt, ks, dk);
       float relative = std::exp(cumulative[t] - cumulative[s]);
       const float *previous = corrections.data() + s * dv;
       if (s < t)

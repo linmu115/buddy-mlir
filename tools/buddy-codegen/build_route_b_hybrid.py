@@ -314,10 +314,14 @@ inline int32_t embed<{rows}>(const EmbedElement *table, const int64_t *ids, floa
 """
     else:
         header += "template <int R, int N, int K> void project(const float *, const float *, float *);\n"
-        projections = sorted(
-            {shape for _, shape in schema.values() if len(shape) == 2}
-        )
-        for n, k in projections:
+        # GDN computes A and B together inside its head workshare.
+        projections = {
+            name: shape
+            for name, (_, shape) in schema.items()
+            if len(shape) == 2
+            and not (owner == "gdn" and name in ("inProjA", "inProjB"))
+        }
+        for n, k in sorted(set(projections.values())):
             for rows in [1, 2] if owner == "head" else [1, 2, d["chunk"]]:
                 mlir.append(ir.projection(n, k, rows))
                 header += f"""
@@ -329,10 +333,8 @@ inline void project<{rows}, {n}, {k}>(const float *w, const float *x, float *y) 
   _mlir_ciface_project_{rows}_{n}_{k}(&weights, &input, &out);
 }}
 """
-        for name, (_, dims) in schema.items():
-            if len(dims) == 2:
-                n, k = dims
-                header += f"""
+        for name, (n, k) in projections.items():
+            header += f"""
 inline void proj_{name}(const BJ47WeightsV1 &w, const float *x, float *y, int rows) {{
   if (rows == 1) project<1, {n}, {k}>(w.f32 + {name}, x, y);
   else if (rows == 2) project<2, {n}, {k}>(w.f32 + {name}, x, y);

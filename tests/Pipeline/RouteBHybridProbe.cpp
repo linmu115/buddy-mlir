@@ -136,6 +136,80 @@ template <typename T> void dump(std::ostream &out, const T *p, size_t count) {
     throw std::runtime_error("write failed");
 }
 
+// Compare an individual production layer across two builds without loading
+// the other 63 layers. Include the caller-owned caches and rollback image.
+void layerTrace(const fs::path &dir, const fs::path &weight, const char *role,
+                int rows, int position, const fs::path &trace, bool benchmark) {
+  Kernel kernel(dir / (std::string(role) + ".so"));
+  auto &info = *kernel.info;
+  int capacity = rows <= 2 ? rows : info.base.chunk;
+  if (rows < 1 || rows > capacity || position < 0 ||
+      position + capacity > int(info.base.context))
+    throw std::runtime_error("invalid layer trace range");
+  Layer layer(kernel, weight);
+  Buffer<float> x(capacity * info.base.width), y(x.size), sa(layer.a.size),
+      sb(layer.b.size), cosine(capacity * info.rotary_dim),
+      sine(capacity * info.rotary_dim);
+  auto seed = [](Buffer<float> &buffer, unsigned int state, float scale) {
+    for (size_t i = 0; i < buffer.size; ++i) {
+      state = state * 1664525u + 1013904223u;
+      buffer.data()[i] = (int(state >> 16) - 32768) * scale;
+    }
+  };
+  seed(x, 1, 1.f / 32768);
+  seed(layer.a, 2, 1.f / 65536);
+  seed(layer.b, 3, 1.f / 65536);
+  if (info.rotary_dim) {
+    Buffer<float> inv(info.base.rope_elements);
+    inv.read(weight.parent_path() / "rope.f32");
+    auto prep = kernel.symbol<decltype(&prepare_decode)>("prepare_decode");
+    for (int t = 0; t < rows; ++t)
+      if (prep(inv.data(), position + t, cosine.data() + t * info.rotary_dim,
+               sine.data() + t * info.rotary_dim, nullptr))
+        throw std::runtime_error("RoPE failed");
+  }
+  BJ47VerifyRows aux{{rows}, sa.data(), sb.data()};
+  BJ47FrameV1 frame{position, cosine.data(), sine.data(), &aux};
+  BJ47WeightsV1 w{layer.w.data(), layer.q4.data()};
+  auto run = rows == 2
+                 ? kernel.symbol<decltype(&layer_decode)>("layer_verify_2")
+             : rows == 1 ? layer.decode
+                         : layer.prefill;
+  auto call = [&] {
+    if (run(&w, x.data(), layer.a.data(), layer.b.data(), &frame, y.data()))
+      throw std::runtime_error("layer call failed");
+  };
+  if (benchmark) {
+    // Reset caller state outside each timed interval. Report all eight samples.
+    std::array<int64_t, 8> elapsed;
+    for (int i = -2; i < int(elapsed.size()); ++i) {
+      seed(layer.a, 2, 1.f / 65536);
+      seed(layer.b, 3, 1.f / 65536);
+      auto start = std::chrono::steady_clock::now();
+      call();
+      auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - start)
+                    .count();
+      if (i >= 0)
+        elapsed[i] = ns;
+    }
+    std::cout << role << " M=" << rows << " prior=" << position << " ns";
+    for (auto ns : elapsed)
+      std::cout << ' ' << ns;
+    std::cout << '\n';
+    return;
+  }
+  call();
+  std::ofstream out(trace, std::ios::binary);
+  dump(out, y.data(), y.size);
+  dump(out, layer.a.data(), layer.a.size);
+  dump(out, layer.b.data(), layer.b.size);
+  if (rows == 2 && !info.rotary_dim) {
+    dump(out, sa.data(), sa.size);
+    dump(out, sb.data(), sb.size);
+  }
+}
+
 void probe(const fs::path &dir, const fs::path &input, const fs::path &output,
            int rows, int steps, int64_t padding) {
   Kernel embed(dir / "embed.so"), gdn(dir / "gdn_layer.so"),
@@ -243,6 +317,12 @@ void probe(const fs::path &dir, const fs::path &input, const fs::path &output,
 
 int main(int argc, char **argv) {
   try {
+    bool benchmark = argc == 7 && std::string(argv[1]) == "--layer-bench";
+    if (benchmark || (argc == 8 && std::string(argv[1]) == "--layer-trace")) {
+      layerTrace(argv[2], argv[3], argv[4], std::stoi(argv[5]),
+                 std::stoi(argv[6]), benchmark ? "" : argv[7], benchmark);
+      return 0;
+    }
     if (argc == 3 && std::string(argv[1]) == "--verify-rows") {
       verifyRows(argv[2]);
       return 0;

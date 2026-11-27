@@ -281,3 +281,16 @@ This changes prefill rounding relative to the earlier half-precision dot.
 The weight offsets, pack version and exported kernel signatures are stable.
 A binary upgrade also needs the matching template sizes, digests, runtime
 digest and bundle ID in `route-b.json`.
+
+GDN assigns each key head and its associated value heads to the same worker.
+This workshare includes the paired f32 gate projections, depthwise convolution,
+normalization and state update. The two-row entry snapshots each worker's state
+slices immediately after the first row. Padded rows leave state untouched.
+The A/B kernel retains the MLIR projection's eight K accumulators and rounds
+products and additions separately.
+
+The 27B verifier uses grouped attention for both rows. Prefill appends valid
+KV rows, assigns query heads to workers and scores only through each row's
+position. Its tiled softmax recomputes an earlier prefix when the running
+maximum rises. This preserves the ordered denominator and rounds probabilities
+before the value product, including at the input boundary to the W4 mixer.
