@@ -83,19 +83,21 @@ struct Library {
       throw std::runtime_error(e.path.string() + ": " + dlerror());
     info = symbol<decltype(&bj47_kernel_info_v1)>("bj47_kernel_info_v1")();
     auto &c = b.config;
+    const bool shard = b.tpRank >= 0 && (id == 4 || id == 5);
+    const auto heads = shard ? b.bodyKvHeads : b.kvHeads;
     const auto infoBytes = b.hybrid ? sizeof(BJ47KernelInfoV2) : sizeof(*info);
     if (!info || info->struct_bytes != infoBytes || info->role != id ||
         info->abi_version != unsigned(e.abi) ||
         info->chunk != unsigned(c.prefillChunk) ||
         info->context != unsigned(c.context) ||
         info->width != unsigned(c.activationWidth) ||
-        info->kv_heads != unsigned(b.kvHeads) ||
+        info->kv_heads != unsigned(heads) ||
         info->head_dim != unsigned(b.headDim) ||
         info->vocab_size != unsigned(c.vocabSize) ||
         hexDigest(info->layout_id) != e.layout ||
-        hexDigest(info->shape_id) != b.shape || info->aux_prefill_bytes ||
-        info->aux_decode_bytes || !info->required_alignment ||
-        64 % info->required_alignment ||
+        hexDigest(info->shape_id) != (shard ? b.bodyShape : b.shape) ||
+        info->aux_prefill_bytes || info->aux_decode_bytes ||
+        !info->required_alignment || 64 % info->required_alignment ||
         (!b.hybrid &&
          info->rope_elements != (id == 2 ? unsigned(b.headDim) / 2 : 0)) ||
         (id == 1 && info->i8_elements))
@@ -104,7 +106,7 @@ struct Library {
       return;
     hybrid = reinterpret_cast<const BJ47KernelInfoV2 *>(info);
     const auto kv =
-        product({size_t(c.context), size_t(b.kvHeads), size_t(b.headDim)});
+        product({size_t(c.context), size_t(heads), size_t(b.headDim)});
     const auto rope = hybrid->rotary_dim;
     const auto dtype = hybrid->embed_dtype;
     const bool validState =
@@ -139,6 +141,7 @@ struct Layer {
   decltype(&layer_prefill) prefill;
   decltype(&layer_decode) decode;
   decltype(&layer_verify_2) verify{};
+  decltype(&layer_tp_rows) tensor{};
   std::vector<Buffer> k, v;
   // Verification and commit finish before switching slots.
   Buffer savedK, savedV;
@@ -163,6 +166,9 @@ class TemplateStage final : public MtpStage {
   Buffer a, b, cosine, sine, logits;
   std::vector<int64_t> tokenStorage;
   size_t mapped = 0, stateBytes = 0;
+  TensorHooks *tp;
+  std::vector<Mapping *> bodyPacks;
+  bool usedPrefill = false;
   bool verifyWeights;
   const int slots, verifyCapacity;
   int activeSlot = 0;
@@ -173,7 +179,9 @@ class TemplateStage final : public MtpStage {
     if (e.elements != count)
       throw std::runtime_error("DSO weight elements: " + e.path.string());
     mappings.push_back(std::make_unique<Mapping>(e));
-    if (verifyWeights &&
+    if (verifyWeights && tp)
+      verifyFileDigest(e.path, e.digest, "TP weight");
+    if (verifyWeights && !tp &&
         contentDigest(mappings.back()->addr, e.bytes) != e.digest)
       throw std::runtime_error("weight digest: " + e.path.string());
     mapped += e.bytes;
@@ -230,6 +238,16 @@ class TemplateStage final : public MtpStage {
       std::copy_n(in, size_t(rows) * cfg.activationWidth, b.data());
       in = b.data();
     }
+    if (tp && tp->dispatch)
+      tp->dispatch(in, static_cast<const int64_t *>(input), activeSlot, pos,
+                   rows, validRows);
+    if (!bodyPacks.empty() && usedPrefill != prefill) {
+      // Release the other packed layout's resident pages at phase boundaries.
+      for (auto pack : bodyPacks)
+        if (madvise(pack->addr, pack->bytes, MADV_DONTNEED))
+          throw std::runtime_error("discard cold packed layout");
+      usedPrefill = prefill;
+    }
     for (int i = cfg.startLayer; i < cfg.endLayer; ++i) {
       auto &l = layers[i - cfg.startLayer];
       auto kernel = prefill ? l.prefill : l.decode;
@@ -242,9 +260,15 @@ class TemplateStage final : public MtpStage {
         }
         frame.aux = &snapshot;
       }
-      checked(kernel(&l.weights, in, l.k[activeSlot].data(),
-                     l.v[activeSlot].data(), &frame, out),
-              i, "layer");
+      if (l.tensor)
+        checked(l.tensor(&l.weights, in, l.k[activeSlot].data(),
+                         l.v[activeSlot].data(), &frame, out, rows, tp->reduce,
+                         tp->context),
+                i, "TP layer");
+      else
+        checked(kernel(&l.weights, in, l.k[activeSlot].data(),
+                       l.v[activeSlot].data(), &frame, out),
+                i, "layer");
       in = out;
       out = (out == a.data() ? b.data() : a.data());
     }
@@ -265,11 +289,15 @@ class TemplateStage final : public MtpStage {
 
 public:
   TemplateStage(const TemplateBundle &bundle, LayerRange range, bool verify,
-                int slotCount, bool enableMtp, int maxDraft, bool usePredictor)
-      : cfg(bundle.config), verifyWeights(verify), slots(slotCount),
+                int slotCount, bool enableMtp, int maxDraft, bool usePredictor,
+                TensorHooks *hooks)
+      : cfg(bundle.config), tp(hooks), verifyWeights(verify), slots(slotCount),
         verifyCapacity(maxDraft + 1), hybrid(bundle.hybrid) {
     if (maxDraft < 1 || maxDraft > 3)
       throw std::invalid_argument("invalid maximum draft length");
+    if ((bundle.tpRank >= 0) != bool(tp) || (tp && !tp->reduce))
+      throw std::invalid_argument("TP bundle requires a tensor collective");
+    const bool endpoints = !tp || bundle.tpRank == bundle.tpHost;
     if (slots < 1)
       throw std::invalid_argument("Route B requires at least one KV slot");
     auto [start, end] = range;
@@ -295,7 +323,7 @@ public:
             map(bundle.weights.at({owner, id, "q4"}), lib.info->i8_elements));
       return w;
     };
-    if (start == 0) {
+    if (endpoints && start == 0) {
       embed.open(bundle, "embed", 1);
       if (embed.hybrid && embed.hybrid->embed_dtype == 2) {
         table = map(bundle.weights.at({"embed", -1, "f16"}),
@@ -311,7 +339,7 @@ public:
       }
       tokenStorage.resize(size_t(cfg.prefillChunk) + 8);
     }
-    if (end == cfg.totalLayers) {
+    if (endpoints && end == cfg.totalLayers) {
       head.open(bundle, "lm_head", 3);
       projection = weights("head", -1, head);
       pre.head = head.symbol<decltype(pre.head)>("lm_head_prefill");
@@ -358,6 +386,11 @@ public:
       }
       auto &l = layers[i - start];
       l.weights = weights(bundle.hybrid ? type : "decoder", i, lib);
+      if (tp) {
+        l.tensor = lib.symbol<decltype(l.tensor)>("layer_tp_rows");
+        if (l.weights.q4)
+          bodyPacks.push_back(mappings.back().get());
+      }
       l.prefill = lib.symbol<decltype(l.prefill)>("layer_prefill");
       l.decode = lib.symbol<decltype(l.decode)>("layer_decode");
       if (enableMtp)
@@ -422,6 +455,8 @@ public:
   }
   void clearSlot(int slot) override {
     checkSlot(slot);
+    if (tp && tp->clear)
+      tp->clear(slot);
     for (auto &layer : layers) {
       layer.k[slot].clear();
       layer.v[slot].clear();
@@ -441,6 +476,8 @@ public:
     if (kept < 1 || kept > rows || rows > 4 || pos < 0 ||
         pos > cfg.context - rows)
       throw std::invalid_argument("invalid verification commit");
+    if (tp && tp->commit && rows > 1)
+      tp->commit(activeSlot, pos, kept, rows);
     if (kept == rows)
       return;
     for (auto &l : layers) {
@@ -542,8 +579,9 @@ void compareSpeculativeSlots(const MtpStage &stage, int first, int second) {
 std::unique_ptr<MtpStage> makeTemplateStage(const TemplateBundle &b,
                                             LayerRange range, bool verify,
                                             int slots, bool enableMtp,
-                                            int maxDraft, bool usePredictor) {
+                                            int maxDraft, bool usePredictor,
+                                            TensorHooks *tp) {
   return std::make_unique<TemplateStage>(b, range, verify, slots, enableMtp,
-                                         maxDraft, usePredictor);
+                                         maxDraft, usePredictor, tp);
 }
 } // namespace buddy::runtime

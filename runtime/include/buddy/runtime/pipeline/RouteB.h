@@ -57,6 +57,14 @@ int32_t layer_prefill(const BJ47WeightsV1 *w, const float *in, float *k,
 int32_t layer_decode(const BJ47WeightsV1 *w, const float *in, float *k,
                      float *v, const BJ47FrameV1 *frame, float *out);
 
+/* TP body DSO. Reduce precisely valid_rows * width fp32 partials in place.
+ * The row capacity selects the projection variant independently of valid_rows.
+ */
+typedef int32_t (*BJ47Reduce)(void *context, float *partials, int64_t count);
+int32_t layer_tp_rows(const BJ47WeightsV1 *, const float *, float *, float *,
+                      const BJ47FrameV1 *, float *, int rows, BJ47Reduce,
+                      void *context);
+
 /* Dynamic verify accepts 2..4 rows. Each GDN snapshot array holds rows-1
  * complete states in prefix order. Attention uses the committed position. */
 typedef struct {
@@ -64,6 +72,10 @@ typedef struct {
   float *conv_snapshot, *ssm_snapshot;
 } BJ47VerifyRows;
 int32_t layer_verify_2(const BJ47WeightsV1 *, const float *, float *, float *,
+                       const BJ47FrameV1 *, float *);
+int32_t layer_verify_3(const BJ47WeightsV1 *, const float *, float *, float *,
+                       const BJ47FrameV1 *, float *);
+int32_t layer_verify_4(const BJ47WeightsV1 *, const float *, float *, float *,
                        const BJ47FrameV1 *, float *);
 int32_t layer_verify(const BJ47WeightsV1 *, const float *, float *, float *,
                      const BJ47FrameV1 *, float *);

@@ -3,6 +3,7 @@
 
 import argparse
 import codecs
+import hashlib
 import json
 import os
 import queue
@@ -63,7 +64,7 @@ def mpi_command(args):
     if not args.hosts:
         return [args.mpiexec, "-n", str(args.ranks), args.binary]
     hosts = args.hosts.split(",")
-    root = str(args.bundle.parent)
+    root = str(getattr(args, "tp_bundle", None) or args.bundle.parent)
     mpi_lib = str(Path(args.mpiexec).resolve().parent.parent / "lib")
     env = {
         "FI_PROVIDER": "tcp",
@@ -513,9 +514,20 @@ class Handler(BaseHTTPRequestHandler):
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--bundle", type=Path, required=True)
+    bundle = parser.add_mutually_exclusive_group(required=True)
+    bundle.add_argument("--bundle", type=Path)
+    bundle.add_argument("--tp-bundle", type=Path)
+    parser.add_argument("--spec-mode", choices=["mtp", "ngram", "dspark"])
+    parser.add_argument("--max-draft", type=int, choices=range(1, 4))
+    parser.add_argument("--dspark-tau", type=float)
+    parser.add_argument("--dspark-min-p", type=float)
     parser.add_argument("--binary", default="buddy-pp-route-b-serve")
-    parser.add_argument("--ranges", required=True)
+    parser.add_argument("--ranges")
+    parser.add_argument(
+        "--vocab-file",
+        type=Path,
+        help="Local vocabulary for a remote TP endpoint",
+    )
     parser.add_argument("--wire", default="f16", choices=["f16", "f32"])
     parser.add_argument("--slots", type=int, default=2, choices=range(1, 9))
     parser.add_argument("--bind", default="127.0.0.1")
@@ -532,7 +544,17 @@ def parse_args():
     parser.add_argument("--startup-timeout", type=float, default=120)
     parser.add_argument("--shutdown-timeout", type=float, default=120)
     args = parser.parse_args()
-    args.bundle = args.bundle.resolve()
+    if args.tp_bundle:
+        args.tp_bundle = args.tp_bundle.resolve()
+        if args.ranges or (args.hosts and len(args.hosts.split(",")) != 2):
+            parser.error(
+                "TP requires exactly two ranks and owns its layer ranges"
+            )
+        args.ranks = 2
+    else:
+        args.bundle = args.bundle.resolve()
+        if not args.ranges:
+            parser.error("--bundle requires --ranges")
     if args.hosts and (
         not args.vlen_probe or not Path(args.mpiexec).is_absolute()
     ):
@@ -543,18 +565,25 @@ def parse_args():
 
 
 def main(args):
-    manifest = json.loads(args.bundle.read_text(encoding="utf-8"))
-    command = mpi_command(args) + [
-        "--bundle",
-        str(args.bundle),
-        "--ranges",
-        args.ranges,
-        "--wire",
-        args.wire,
-        "--serve",
-        "--slots",
-        str(args.slots),
-    ]
+    if args.tp_bundle:
+        # Each board can contain just its rank manifest.
+        path = next(args.tp_bundle.glob("rank[01]/route-b.json"), None)
+        if path is None:
+            raise FileNotFoundError(f"no TP rank manifest in {args.tp_bundle}")
+        model_args = ["--tp-bundle", str(args.tp_bundle), "--launcher-stdin"]
+    else:
+        path = args.bundle
+        model_args = ["--bundle", str(path), "--ranges", args.ranges]
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    command = (
+        mpi_command(args)
+        + model_args
+        + ["--wire", args.wire, "--serve", "--slots", str(args.slots)]
+    )
+    for name in ("spec_mode", "max_draft", "dspark_tau", "dspark_min_p"):
+        value = getattr(args, name)
+        if value is not None:
+            command.extend(["--" + name.replace("_", "-"), str(value)])
     stopping = threading.Event()
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda *_: stopping.set())
@@ -567,7 +596,15 @@ def main(args):
         if not stopping.is_set():
             if not engine.info or engine.exited.is_set():
                 raise RuntimeError("Route B engine did not become ready")
-            vocab = read_vocab(engine.info["vocab"])
+            vocab_path = args.vocab_file or Path(engine.info["vocab"])
+            if args.vocab_file:
+                with vocab_path.open("rb") as source:
+                    digest = hashlib.file_digest(source, "sha256").hexdigest()
+                if digest != manifest["vocab_sha256"]:
+                    raise ValueError(
+                        "local vocabulary digest differs from the bundle"
+                    )
+            vocab = read_vocab(vocab_path)
             with Gateway(
                 (args.bind, args.port), engine, manifest, vocab
             ) as server:

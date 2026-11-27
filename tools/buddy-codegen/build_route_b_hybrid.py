@@ -375,6 +375,8 @@ inline void deltaStep(float *s, const float *q, const float *k, const float *v,
                     "layer_prefill",
                     "layer_decode",
                     "layer_verify_2",
+                    "layer_verify_3",
+                    "layer_verify_4",
                     "layer_verify",
                 ]
             )

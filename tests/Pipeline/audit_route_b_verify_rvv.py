@@ -10,7 +10,7 @@ from pathlib import Path
 sys.path.insert(
     0, str(Path(__file__).resolve().parents[2] / "tools/buddy-codegen")
 )
-from build_route_b import ATTRS
+from build_route_b import ATTRS, elide_final_workshare_barriers
 from compile_pipeline import build_stages, run_pipeline
 
 
@@ -44,7 +44,16 @@ def check(args):
         stages[-1][1].append("-combiner-store-merging=false")
         with tempfile.TemporaryDirectory(dir=args.work) as tmp:
             obj = Path(tmp) / "verify.o"
-            source = work / "w4-verify.mlir"
+            source = Path(tmp) / "verify-lowered.mlir"
+            run_pipeline(
+                stages[:1],
+                work / "w4-verify.mlir",
+                source,
+                args.buddy_opt,
+                args.llvm_bin,
+            )
+            elide_final_workshare_barriers(source)
+            stages = stages[1:]
             run_pipeline(stages, source, obj, args.buddy_opt, args.llvm_bin)
             assert obj.read_bytes() == (work / "w4-verify.o").read_bytes()
             stages[-1][1][stages[-1][1].index("-filetype=obj")] = (

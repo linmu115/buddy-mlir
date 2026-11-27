@@ -98,9 +98,10 @@ def pack(path, checkpoint, index, prefix, schema, positions):
                     out.write(tiles)
 
 
-def projection_code(args, owner, schema, positions):
+def projection_code(args, owner, schema, positions, *, fuse_residual=True):
     from buddy.compiler.graph.transform import k3_w4
 
+    cross = any("target=riscv64" in flag for flag in args.cxx_flag)
     specs = {}
     code = []
     for name, (_, (n, k)) in schema.items():
@@ -119,12 +120,19 @@ def projection_code(args, owner, schema, positions):
                 args.threads,
                 matrix,
             )
-            residual = name in ("mixerOut", "downProj")
+            residual = fuse_residual and name in ("mixerOut", "downProj")
             if residual:
                 spec.update(residual=True, residual_rhs=True)
                 spec["name"] += "_res_rhs"
-            if name == "glu" and rows == 2 and (n, k) == (17408, 5120):
-                spec["full_width_glu"] = True
+            if (
+                cross
+                and not matrix
+                and name != "lmHead"
+                and (rows == 2 or (rows == 1 and name == "glu"))
+            ):
+                spec["strip_lanes"] = 64
+            if matrix and name == "glu":
+                spec["narrow_ime_epilogue"] = True
             if rows in (3, 4):
                 spec["verify"] = True
             symbol = spec["name"]
@@ -154,6 +162,8 @@ def projection_code(args, owner, schema, positions):
             + "".join(branches)
             + "\n}"
         )
+    if fuse_residual and "glu" in schema:
+        code.insert(0, "#define HYBRID_FUSED_RESIDUAL 1")
     if "glu" in schema:
         code.insert(0, "#define HYBRID_FUSED_GLU 1")
     return "\n".join(code), list(specs.values())
@@ -187,17 +197,21 @@ def compile_kernels(args, dest, specs):
         stages = build_stages(
             pipeline, args.threads, ATTRS if cross else "", "w4g32", arena=True
         )
-        if part == "verify":
+        if cross and part != "ime":
             # Otherwise LLVM combines adjacent scalar descriptor fields into
             # an RVV register and spills it across the arena allocation call.
             stages[-1][1].append("-combiner-store-merging=false")
         path = dest / f"w4-{part}.mlir"
         path.write_text(
-            k3_w4.gen_kernels(selected, part="ime" if part == "ime" else "main", fixed_vlen=cross)
+            k3_w4.gen_kernels(
+                selected,
+                part="ime" if part == "ime" else "main",
+                fixed_vlen=cross,
+            )
         )
         obj = path.with_suffix(".o")
         if part in ("main", "verify"):
-            lowered = dest / "w4-workshares.mlir"
+            lowered = dest / f"w4-{part}-workshares.mlir"
             run_pipeline(
                 stages[:1], path, lowered, args.buddy_opt, args.llvm_bin
             )

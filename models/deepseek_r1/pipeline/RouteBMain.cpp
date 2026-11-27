@@ -3,6 +3,7 @@
 #include "TemplateBundle.h"
 #include "route_b/ChatTokenizer.h"
 #include "route_b/MtpGenerate.h"
+#include "route_b/TensorParallel.h"
 #include <optional>
 #include <thread>
 
@@ -11,7 +12,9 @@ namespace {
 void run(int argc, char **argv, int rank, int size) {
   RunConfig cfg;
   cfg.maxNewTokens = 0;
-  std::string bundle;
+  std::string bundle, tpBundle;
+  const int physicalRank = rank;
+  MPI_Comm generatorComm = MPI_COMM_WORLD;
   std::vector<std::string> prompts;
   auto wire = pipeline::WireDtype::Native; // Route B computes in f32.
   auto transport = pipeline::Transport::Blocking;
@@ -19,6 +22,7 @@ void run(int argc, char **argv, int rank, int size) {
   pipeline::mtp::Options spec;
   bool legacyMtp = false, explicitDepth = false;
   int slots = 2;
+  bool launcherInput = false;
   std::optional<bool> thinking;
   std::optional<std::string> list, single;
   for (int i = 1; i < argc; ++i) {
@@ -30,6 +34,10 @@ void run(int argc, char **argv, int rank, int size) {
     if (opt == "--mtp") {
       mtp = legacyMtp = true;
       spec.mode = pipeline::mtp::Mode::Mtp;
+      continue;
+    }
+    if (opt == "--launcher-stdin") {
+      launcherInput = true;
       continue;
     }
     if (opt == "--serve") {
@@ -45,6 +53,8 @@ void run(int argc, char **argv, int rank, int size) {
     std::string val = argv[i];
     if (opt == "--bundle")
       bundle = val;
+    else if (opt == "--tp-bundle")
+      tpBundle = val;
     else if (opt == "--ranges")
       list = val;
     else if (opt == "--spec-mode") {
@@ -112,10 +122,30 @@ void run(int argc, char **argv, int rank, int size) {
     throw std::invalid_argument("expected 1 to 8 --prompt arguments");
   const int streamCount = static_cast<int>(prompts.size());
   const int slotCount = serve ? slots : streamCount;
-  auto b = TemplateBundle::load(bundle);
   if (legacyMtp && !explicitDepth)
     spec.maxDraft = 1;
   const bool predictor = spec.mode != pipeline::mtp::Mode::Ngram;
+  if (launcherInput && (tpBundle.empty() || !serve))
+    throw std::invalid_argument(
+        "--launcher-stdin requires --tp-bundle and --serve");
+  if (!tpBundle.empty() && (!bundle.empty() || list || single))
+    throw std::invalid_argument("--tp-bundle owns both complete layer ranges");
+  auto launch =
+      nlohmann::json::array({mtp, serve, slotCount, int(wire), int(transport),
+                             int(spec.mode), spec.maxDraft, spec.tau, spec.minP,
+                             launcherInput})
+          .dump();
+  auto b = tpBundle.empty() ? TemplateBundle::load(bundle)
+                            : TensorParallel::load(tpBundle, rank, size, launch,
+                                                   MPI_COMM_WORLD);
+  std::unique_ptr<TensorParallel> tp;
+  if (!tpBundle.empty()) {
+    tp = std::make_unique<TensorParallel>(MPI_COMM_WORLD, rank, b,
+                                          wire == pipeline::WireDtype::F16);
+    rank = 0;
+    size = 1;
+    generatorComm = MPI_COMM_SELF;
+  }
   if (mtp && !b.hybrid)
     throw std::invalid_argument("speculation requires a hybrid bundle");
   if (mtp && predictor && !b.hasMtp)
@@ -149,14 +179,51 @@ void run(int argc, char **argv, int rank, int size) {
   check.transport = b.spec.transport = transport;
   check.modelName = planIdentity;
   check.requireModelName = true;
-  pipeline::checkAllStages(MPI_COMM_WORLD, rank, size, b.config, check);
-  if (rank == 0)
+  pipeline::checkAllStages(generatorComm, rank, size, b.config, check);
+  if (rank == 0 && (!tp || physicalRank == b.tpHost))
     b.verifyVocab();
-  auto stage = makeTemplateStage(b, range, verify, slotCount, mtp,
-                                 spec.maxDraft, predictor);
+  auto stage =
+      makeTemplateStage(b, range, verify, slotCount, mtp, spec.maxDraft,
+                        predictor, tp ? &tp->hooks : nullptr);
+  std::vector<int> pids;
+  if (tp && serve) {
+    pids.resize(2);
+    int pid = getpid();
+    mpiCheck(MPI_Allgather(&pid, 1, MPI_INT, pids.data(), 1, MPI_INT,
+                           MPI_COMM_WORLD));
+  }
+  if (tp && physicalRank != b.tpHost) {
+    std::thread relay;
+    if (launcherInput && physicalRank == 0) {
+      relay = std::thread([&] {
+        try {
+          tp->relayInput();
+        } catch (const std::exception &e) {
+          pipeline::detail::abortBatch(MPI_COMM_WORLD, physicalRank,
+                                       "TP input relay", e.what());
+        }
+      });
+    }
+    try {
+      tp->worker(*stage);
+    } catch (const std::exception &e) {
+      pipeline::detail::abortBatch(MPI_COMM_WORLD, physicalRank, "TP worker",
+                                   e.what());
+    }
+    if (relay.joinable())
+      relay.join();
+    tp->reportMemory();
+    reportPipelineMemory(physicalRank);
+    return;
+  }
   checkLocalConfig(b.spec, stage->configuration());
   auto opts = makeGenerateOptions(b.spec, b.vocab.string(), cfg,
-                                  stage->configuration(), rank, size);
+                                  stage->configuration(), rank, size, bool(tp));
+  opts.servePids = std::move(pids);
+  if (launcherInput && b.tpHost != 0)
+    opts.readServeLine = [&](std::string &line) {
+      return tp->receiveInput(line);
+    };
   if (thinking && b.tokenizerAssets.empty())
     throw std::invalid_argument("thinking requires a chat template");
   std::unique_ptr<ChatTokenizer> tokenizer;
@@ -178,32 +245,40 @@ void run(int argc, char **argv, int rank, int size) {
   }
   if (mtp) {
     pipeline::mtp::generate(
-        opts, *stage, MPI_COMM_WORLD, rank, size,
+        opts, *stage, generatorComm, rank, size,
         b.weights.count({"embed", -1, "f16"}), serve, prompts,
         list.value_or(single.value_or("0:" + std::to_string(total))), spec);
   } else if (serve) {
     pipeline::generateResident(
-        opts, *stage, MPI_COMM_WORLD, rank, size, slots,
+        opts, *stage, generatorComm, rank, size, slots,
         list.value_or(single.value_or("0:" + std::to_string(total))));
   } else if (streamCount == 1) {
     opts.prompt = std::move(prompts.front());
-    pipeline::generateDistributed(opts, *stage, MPI_COMM_WORLD, rank, size);
+    pipeline::generateDistributed(opts, *stage, generatorComm, rank, size);
   } else {
-    pipeline::generateDistributedBatch(opts, prompts, *stage, MPI_COMM_WORLD,
+    pipeline::generateDistributedBatch(opts, prompts, *stage, generatorComm,
                                        rank, size);
   }
-  reportPipelineMemory(rank);
+  if (tp) {
+    tp->stop();
+    tp->reportMemory();
+  }
+  reportPipelineMemory(physicalRank);
 }
 } // namespace
 int main(int argc, char **argv) {
   int threading;
-  MPI_Init_thread(&argc, &argv, MPI_THREAD_FUNNELED, &threading);
+  int required = MPI_THREAD_FUNNELED;
+  for (int i = 1; i < argc; ++i)
+    if (std::string_view(argv[i]) == "--launcher-stdin")
+      required = MPI_THREAD_MULTIPLE;
+  MPI_Init_thread(&argc, &argv, required, &threading);
   int rank, size;
   MPI_Comm_rank(MPI_COMM_WORLD, &rank);
   MPI_Comm_size(MPI_COMM_WORLD, &size);
   try {
-    if (threading < MPI_THREAD_FUNNELED)
-      throw std::runtime_error("Route B requires MPI_THREAD_FUNNELED");
+    if (threading < required)
+      throw std::runtime_error("MPI lacks the requested thread support");
     run(argc, argv, rank, size);
   } catch (const std::exception &e) {
     std::fprintf(stderr, "Route B rank %d: %s\n", rank, e.what());

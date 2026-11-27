@@ -218,8 +218,9 @@ void mix(const BJ47WeightsV1 &weights, const float *x, float *convState,
   proj_inProjQKV(weights, x, qkvBuffer.data(), rows);
   proj_inProjZ(weights, x, z.data(), rows);
   constexpr int group = valueHeads / keyHeads;
-  const auto *snapshot =
-      rows >= 2 && rows <= 4 ? static_cast<const BJ47VerifyRows *>(frame.aux) : nullptr;
+  const auto *snapshot = rows >= 2 && rows <= 4
+                             ? static_cast<const BJ47VerifyRows *>(frame.aux)
+                             : nullptr;
 #ifdef HYBRID_THREADS
 #pragma omp parallel for schedule(static) num_threads(HYBRID_THREADS)
 #endif
@@ -230,7 +231,8 @@ void mix(const BJ47WeightsV1 &weights, const float *x, float *convState,
       convolve(qkvBuffer.data() + t * convDim + offset, convState + base,
                w + convWeight + base, n,
                snapshot && t + 1 < valid
-                   ? snapshot->conv_snapshot + size_t(t) * convDim * convKernel + base
+                   ? snapshot->conv_snapshot +
+                         size_t(t) * convDim * convKernel + base
                    : nullptr);
     };
     for (int t = 0; t < valid; ++t) {
@@ -282,9 +284,9 @@ void mix(const BJ47WeightsV1 &weights, const float *x, float *convState,
                         v + t * convDim, head + t * valueWidth, b[t],
                         std::exp(a[t]));
           if (snapshot && t + 1 < valid)
-            std::copy_n(
-                state, keyDim * valueDim,
-                snapshot->ssm_snapshot + (size_t(t) * valueHeads + h) * keyDim * valueDim);
+            std::copy_n(state, keyDim * valueDim,
+                        snapshot->ssm_snapshot +
+                            (size_t(t) * valueHeads + h) * keyDim * valueDim);
         }
       } else
         hybrid::chunkGDN(q, k, v, convDim, a, b, 1, state, head, valueWidth,
@@ -294,7 +296,7 @@ void mix(const BJ47WeightsV1 &weights, const float *x, float *convState,
                      z.data() + t * valueWidth + h * valueDim, w + gatedNorm);
     }
   }
-#ifdef HYBRID_FUSED_GLU
+#ifdef HYBRID_FUSED_RESIDUAL
   proj_mixerOut(weights, core.data(), out, rows, residual);
 #else
   proj_mixerOut(weights, core.data(), out, rows);
@@ -455,8 +457,7 @@ void mix(const BJ47WeightsV1 &weights, const float *x, float *keys,
 #endif
   {
     // The complete KV suffix is now visible. Each row reads its causal prefix.
-    constexpr bool online =
-        headDim == 256 && attentionHeads / kvHeads == 6;
+    constexpr bool online = headDim == 256 && attentionHeads / kvHeads == 6;
     const int stride = frame.cache_position + valid;
     hybrid::Scratch scratch(size_t(attentionHeads) * stride * (online ? 2 : 1));
 #ifdef HYBRID_THREADS
@@ -507,7 +508,7 @@ void mix(const BJ47WeightsV1 &weights, const float *x, float *keys,
       }
     }
   }
-#ifdef HYBRID_FUSED_GLU
+#ifdef HYBRID_FUSED_RESIDUAL
   proj_mixerOut(weights, cores.data(), out, rows, residual);
 #else
   proj_mixerOut(weights, cores.data(), out, rows);
@@ -517,7 +518,8 @@ void mix(const BJ47WeightsV1 &weights, const float *x, float *keys,
 
 #if HYBRID_ROLE == 4 || (HYBRID_ROLE == 5 || HYBRID_ROLE == 6)
 int32_t layer(const BJ47WeightsV1 *weights, const float *input, float *a,
-              float *b, const BJ47FrameV1 *frame, float *out, int rows) {
+              float *b, const BJ47FrameV1 *frame, float *out, int rows,
+              BJ47Reduce reduce = nullptr, void *collective = nullptr) {
   if (!weights || !weights->f32 || !input || !a || !b || a == b || !frame ||
       !frame->aux || !out || input == out)
     return -1;
@@ -539,7 +541,7 @@ int32_t layer(const BJ47WeightsV1 *weights, const float *input, float *a,
     zeroCenteredNorm(input + t * width, w + inputNorm, width,
                      norm.data() + t * width);
   const float *skip = input;
-#ifdef HYBRID_FUSED_GLU
+#ifdef HYBRID_FUSED_RESIDUAL
   // The fused projection reads a full tile. Only valid input rows belong
   // to the caller on a padded final chunk.
   if (validRows < rows) {
@@ -549,9 +551,11 @@ int32_t layer(const BJ47WeightsV1 *weights, const float *input, float *a,
 #endif
   mix(*weights, norm.data(), a, b, *frame, rows, validRows, skip,
       residual.data());
+  if (reduce && reduce(collective, residual.data(), validRows * width))
+    return -3;
   for (int t = 0; t < validRows; ++t) {
     float *r = residual.data() + t * width;
-#ifndef HYBRID_FUSED_GLU
+#ifndef HYBRID_FUSED_RESIDUAL
     for (int i = 0; i < width; ++i)
       r[i] += input[t * width + i];
 #endif
@@ -566,10 +570,12 @@ int32_t layer(const BJ47WeightsV1 *weights, const float *input, float *a,
   for (int i = 0; i < validRows * intermediate; ++i)
     gate[i] = silu(gate[i]) * up[i];
 #endif
-#ifdef HYBRID_FUSED_GLU
+#ifdef HYBRID_FUSED_RESIDUAL
   proj_downProj(*weights, gate.data(), out, rows, residual.data());
 #else
   proj_downProj(*weights, gate.data(), out, rows);
+  if (reduce && reduce(collective, out, validRows * width))
+    return -3;
   for (int i = 0; i < validRows * width; ++i)
     out[i] += residual[i];
 #endif
@@ -658,6 +664,27 @@ extern "C" int32_t mtp_forward(const BJ47WeightsV1 *w, const float *embedding,
   return 0;
 }
 #else
+#ifdef HYBRID_TENSOR_PARALLEL
+extern "C" int32_t layer_tp_rows(const BJ47WeightsV1 *w, const float *in,
+                                 float *a, float *b, const BJ47FrameV1 *frame,
+                                 float *out, int rows, BJ47Reduce reduce,
+                                 void *collective) {
+  if (!reduce || ((rows < 1 || rows > 4) && rows != chunk))
+    return -1;
+  if (rows >= 2 && rows <= 4) {
+    if (!frame || !frame->aux)
+      return -1;
+    auto aux = static_cast<const BJ47VerifyRows *>(frame->aux);
+    if (aux->rows.valid_rows != rows)
+      return -2;
+#if HYBRID_ROLE == 4
+    if (!aux->conv_snapshot || !aux->ssm_snapshot)
+      return -1;
+#endif
+  }
+  return layer(w, in, a, b, frame, out, rows, reduce, collective);
+}
+#endif
 extern "C" int32_t layer_verify(const BJ47WeightsV1 *w, const float *input,
                                 float *a, float *b, const BJ47FrameV1 *frame,
                                 float *out) {
@@ -678,6 +705,22 @@ extern "C" int32_t layer_verify_2(const BJ47WeightsV1 *w, const float *input,
                                   float *out) {
   if (!frame || !frame->aux ||
       static_cast<const BJ47FrameRowsV2 *>(frame->aux)->valid_rows != 2)
+    return -2;
+  return layer_verify(w, input, a, b, frame, out);
+}
+extern "C" int32_t layer_verify_3(const BJ47WeightsV1 *w, const float *input,
+                                  float *a, float *b, const BJ47FrameV1 *frame,
+                                  float *out) {
+  if (!frame || !frame->aux ||
+      static_cast<const BJ47FrameRowsV2 *>(frame->aux)->valid_rows != 3)
+    return -2;
+  return layer_verify(w, input, a, b, frame, out);
+}
+extern "C" int32_t layer_verify_4(const BJ47WeightsV1 *w, const float *input,
+                                  float *a, float *b, const BJ47FrameV1 *frame,
+                                  float *out) {
+  if (!frame || !frame->aux ||
+      static_cast<const BJ47FrameRowsV2 *>(frame->aux)->valid_rows != 4)
     return -2;
   return layer_verify(w, input, a, b, frame, out);
 }

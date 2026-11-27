@@ -44,3 +44,7 @@ llm_config.yaml
 
 # Locally staged 27B speculative-decoding DSOs and host executable.
 /stage-k3-27b-spec/
+
+# Locally staged M1 release payloads.
+/stage-k3-pp-ultimate/
+/stage-k3-tp2-ultimate/

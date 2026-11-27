@@ -552,16 +552,24 @@ ime = k3_w4.gen_kernels([dense, exact], part="ime")
 assert "@k3_ime_i32_step" in ime and "@k3_ime_hp_step" in ime
 assert '"ime.intr.vmadot"' in ime and '"ime.intr.vmadot.hp"' in ime
 
-# The production hybrid owners share the same dense GLU geometry. The packed
-# P64 ABI selects HP dots, and only the two-row GLU restores the full tile.
+# Production hybrid GLU selects bounded verifier strips at VLEN 1024.
+# The narrower P64 epilogue retains the HP dot and original packed layout.
 quant = {"glu": ("unused", (17408, 5120))}
 positions, _ = offsets(quant, True)
 _, specs = projection_code(
-    SimpleNamespace(chunk=64, threads=8), "gdn", quant, positions
+    SimpleNamespace(
+        chunk=64, threads=8, cxx_flag=["--target=riscv64-unknown-linux-gnu"]
+    ),
+    "gdn",
+    quant,
+    positions,
 )
-one, two, prefill = specs
-assert not one.get("full_width_glu") and two["full_width_glu"]
+assert [spec["m"] for spec in specs] == [1, 2, 3, 4, 64]
+one, two, three, four, prefill = specs
+assert one["strip_lanes"] == two["strip_lanes"] == 64
+assert three["verify"] and four["verify"]
+assert prefill["ime"] and prefill["narrow_ime_epilogue"]
 ime = k3_w4.gen_kernels([prefill], part="ime")
 assert '"ime.intr.vmadot.hp"' in ime and '"ime.intr.vmadot"' not in ime
-print("hybrid P64 HP and two-row GLU selection passed")
-# CHECK: hybrid P64 HP and two-row GLU selection passed
+print("hybrid P64 HP and multi-row GLU selection passed")
+# CHECK: hybrid P64 HP and multi-row GLU selection passed

@@ -92,6 +92,8 @@ enum class TokenizerKind {
 
 struct DistributedGenerateOptions {
   std::function<std::vector<int64_t>(const std::string &, bool)> chatEncode;
+  std::function<bool(std::string &)> readServeLine;
+  std::vector<int> servePids;
   std::string prompt;
   std::string vocabPath;
   TokenizerKind tokenizer = TokenizerKind::DeepSeekR1;

@@ -330,3 +330,49 @@ options. The fresh output directory contains the template DSOs, runtime (W4)
 and updated index. The compiler checks the descriptor layouts and copies
 weight receipts verbatim. Install the new index alongside the DSOs when both
 ranks are offline. A deployment must keep the existing tokenizer and weights.
+
+### Hybrid tensor parallelism
+
+Pass `--tp-bundle DIRECTORY --wire f16` to the Route B executable under two
+MPI ranks. The directory contains `tp.json` and a `rankN/route-b.json` for each
+installed rank. Rank order follows the MPI launcher. Both stages process the
+whole layer range. The endpoint rank owns embedding, logits, tokenizer and
+optional MTP and DSpark. The verifier reduces two row-parallel projections
+per layer. Each collective covers the valid rows times the hidden width.
+Both ranks commit the same prefix and restore their local GDN and KV state.
+
+For direct resident generation, send JSONL to the endpoint stdin. Hydra
+normally forwards stdin to rank 0. In that setup pass `--launcher-stdin`
+to forward requests to the endpoint when it resides on rank 1. The relay
+uses `MPI_THREAD_MULTIPLE`. The HTTP gateway enables it with
+`server.py --tp-bundle DIRECTORY --spec-mode dspark --max-draft 3`.
+A gateway on another node can read the original pack's vocabulary via
+`--vocab-file`.
+
+To reproduce the numerical integration test, use the exporter environment and
+a release tokenizer directory. `PY`, `BUDDY` and `LLVM` select the Python
+interpreter, buddy-opt and LLVM bin directory. Run from the repository root.
+
+```bash
+t="$PWD/build-tp-test"
+mkdir -p "$t"
+"$PY" tests/Pipeline/make_route_b_tp_fixture.py "$t/checkpoint"
+"$PY" tools/buddy-codegen/build_route_b_hybrid.py \
+  --checkpoint "$t/checkpoint" --output "$t/source" --work "$t/codegen" \
+  --llvm-bin "$LLVM" --buddy-opt "$BUDDY" --embed-dtype f16 \
+  --tokenizer-dir "$TOKENIZER" --variant w4g32 --threads 2 --context 128 --model-id tp-test
+"$PY" tools/buddy-codegen/prepare_route_b_tp.py --config "$t/checkpoint/config.json" \
+  --source "$t/source" --output "$t/plan" --llvm-bin "$LLVM" --buddy-opt "$BUDDY"
+python3 tools/buddy-codegen/shard_route_b_tp.py --source "$t/source" --prepared "$t/plan" --output "$t/bundle"
+cmake -G Ninja -S models/deepseek_r1/pipeline/route_b/host -B "$t/host" \
+  -DCMAKE_BUILD_TYPE=Release -DROUTE_B_TP_SOURCE="$t/source/route-b.json" -DROUTE_B_TP_BUNDLE="$t/bundle"
+ninja -C "$t/host" -j6
+ctest --test-dir "$t/host" --output-on-failure
+```
+
+Use `--kv-heads 1 3` for an asymmetric build of this fixture, or `--host-rank 0`
+to move the endpoint. The native test compares prefill, decode, 2–4 row
+verification, MTP projections and free-running token IDs. It compares each
+rank's complete cache bytes after every admissible verifier commit.
+See the [27B Phase 1 report](../../../../reports/pp-k3-real/tp2_27b_phase1_report.md)
+for the release byte budget, packed-weight workflow and silicon run commands.

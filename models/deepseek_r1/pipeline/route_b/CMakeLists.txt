@@ -70,7 +70,9 @@ if(BUILD_TESTING)
     "${repo}/tests/Pipeline/test_route_b_counts_and_roles.py")
   add_test(NAME test_route_b_pack_layout COMMAND "${Python3_EXECUTABLE}"
     "${repo}/tests/Pipeline/test_route_b_pack_layout.py" --self-test)
-  set_tests_properties(test_route_b_counts_and_roles test_route_b_pack_layout
+  add_test(NAME test_route_b_tp_tiles COMMAND "${Python3_EXECUTABLE}"
+    "${repo}/tests/Pipeline/test_route_b_tp_tiles.py")
+  set_tests_properties(test_route_b_tp_tiles test_route_b_counts_and_roles test_route_b_pack_layout
     PROPERTIES LABELS route-b TIMEOUT 240)
 endif()
 

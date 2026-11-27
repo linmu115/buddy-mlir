@@ -25,9 +25,10 @@ class ServeInbox {
   bool closed = false;
 
 public:
-  void read() {
+  void read(const std::function<bool(std::string &)> &receive) {
     try {
-      for (std::string line; std::getline(std::cin, line);) {
+      for (std::string line;
+           receive ? receive(line) : bool(std::getline(std::cin, line));) {
         auto arrival = BatchClock::now();
         auto command = ServeJson::parse(line, nullptr, false);
         if (command.is_object() && command.contains("cmd") &&
@@ -234,8 +235,8 @@ void runResident(const DistributedGenerateOptions &opts, Stage &stage,
                {"vocab", opts.vocabPath},
                {"wire", opts.wireDtype == WireDtype::F16 ? "f16" : "f32"},
                {"ranges", ranges},
-               {"pids", pids}});
-    reader = std::thread([&] { inbox.read(); });
+               {"pids", opts.servePids.empty() ? pids : opts.servePids}});
+    reader = std::thread([&] { inbox.read(opts.readServeLine); });
 
     std::deque<int> free, ready;
     for (int slot = 0; slot < slots; ++slot)

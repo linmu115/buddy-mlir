@@ -241,8 +241,8 @@ inline void generate(const DistributedGenerateOptions &opts, MtpStage &stage,
            {"vocab", opts.vocabPath},
            {"wire", opts.wireDtype == WireDtype::F16 ? "f16" : "f32"},
            {"ranges", ranges},
-           {"pids", pids}});
-      reader = std::thread([&] { inbox.read(); });
+           {"pids", opts.servePids.empty() ? pids : opts.servePids}});
+      reader = std::thread([&] { inbox.read(opts.readServeLine); });
     }
   }
   size_t next = 0;

@@ -1450,7 +1450,14 @@ def _residual_sum(fn, ty, spec, val, mem, at):
     )
 
 
-def _stream_head_tile(fn, ty, spec, a, tile, row, start=None, initial=None):
+def _stream_head_scratch(fn, ty):
+    with ir.InsertionPoint.at_block_begin(fn.entry):
+        return memref.AllocaOp(
+            _memref([1, NB], ty.f32), [], [], alignment=128
+        ).result
+
+
+def _stream_head_tile(fn, ty, spec, a, tile, row, start=None, scratch=None):
     """VLEN=1024, one row. Fetch four 512-byte banks before the MACs.
     Four independent i16 partial sums add modulo 65536. Each G32 still
     updates the f32 accumulator exactly once, in the original group order.
@@ -1469,17 +1476,14 @@ def _stream_head_tile(fn, ty, spec, a, tile, row, start=None, initial=None):
         memref.ExtractAlignedPointerAsIndexOp(a["xs"]).result,
         _muli(row, fn.idx(k // G * 4)),
     )
-    # Reuse fixed scratch across every K window of this tile.
-    with ir.InsertionPoint.at_block_begin(fn.entry):
-        scratch = memref.AllocaOp(
-            _memref([1, NB], ty.f32), [], [], alignment=128
-        ).result
+    # Each streamed row owns a fixed tile buffer across all K windows.
+    if scratch is None:
+        scratch = _stream_head_scratch(fn, ty)
     out = memref.ExtractAlignedPointerAsIndexOp(scratch).result
     if start is not None:
         w = _addi(w, _muli(start, fn.idx(tile_bytes(G))))
         q = _addi(q, _muli(start, fn.idx(G)))
         s = _addi(s, _muli(start, fn.idx(4)))
-        vector.StoreOp(initial, scratch, [fn.idx(0), fn.idx(0)])
     args = [arith.IndexCastOp(ty.i64, v).result for v in (w, q, s, out)]
     asm = [
         "mv t0,$0",
@@ -1553,6 +1557,8 @@ def _stream_head_tile(fn, ty, spec, a, tile, row, start=None, initial=None):
         ",".join(["r"] * 4 + ["~{" + r + "}" for r in clobbers]),
         has_side_effects=True,
     )
+    if start is not None:
+        return
     return vector.LoadOp(
         _vec(NB, ty.f32), scratch, [fn.idx(0), fn.idx(0)]
     ).result
@@ -1573,10 +1579,12 @@ def _tile_fn(ty, spec):
     fn = _Fn(f"{spec['name']}__tile", _tile_types(ty, spec), [], public=False)
     a = dict(zip(names, fn.args))
     vf = _vec(NB, ty.f32)
-    if spec.get("verify"):
+    if spec.get("strip_lanes") or spec.get("verify"):
         # Strip-mine the 128 columns so four fp32 sums and four gated
         # results fit in the RVV register file. Each byte belongs to one strip.
-        lanes = 32 if spec["kind"] == "glu" and m == 4 else 64
+        lanes = spec.get(
+            "strip_lanes", 32 if spec["kind"] == "glu" and m == 4 else 64
+        )
         with ir.InsertionPoint(fn.entry):
             strips = scf.ForOp(fn.idx(0), fn.idx(NB), fn.idx(lanes))
             with ir.InsertionPoint(strips.body):
@@ -1584,9 +1592,18 @@ def _tile_fn(ty, spec):
                 rows = [fn.idx(r) for r in range(m)]
                 if spec["kind"] == "glu":
                     tg = _muli(a["wt"], fn.idx(2))
-                    gate = _accumulate(fn, ty, spec, a, tg, rows, lanes=lanes, column=col)
+                    gate = _accumulate(
+                        fn, ty, spec, a, tg, rows, lanes=lanes, column=col
+                    )
                     up = _accumulate(
-                        fn, ty, spec, a, _addi(tg, fn.idx(1)), rows, lanes=lanes, column=col
+                        fn,
+                        ty,
+                        spec,
+                        a,
+                        _addi(tg, fn.idx(1)),
+                        rows,
+                        lanes=lanes,
+                        column=col,
                     )
                     vals = [
                         _silu_mul(fn, ty, g, u, lanes) for g, u in zip(gate, up)
@@ -1612,16 +1629,8 @@ def _tile_fn(ty, spec):
             if spec["kind"] == "glu":
                 tg = _muli(a["wt"], fn.idx(2))
                 tu = _addi(tg, fn.idx(1))
-                if spec.get("full_width_glu"):
-                    gate = _accumulate(fn, ty, spec, a, tg, rows)
-                    up = _accumulate(fn, ty, spec, a, tu, rows)
-                else:
-                    gate = _tile_accumulator(
-                        fn, ty, spec["k"], a, tg, rows, "glu"
-                    )
-                    up = _tile_accumulator(
-                        fn, ty, spec["k"], a, tu, rows, "glu"
-                    )
+                gate = _tile_accumulator(fn, ty, spec["k"], a, tg, rows, "glu")
+                up = _tile_accumulator(fn, ty, spec["k"], a, tu, rows, "glu")
                 vals = [_silu_mul(fn, ty, g, u, NB) for g, u in zip(gate, up)]
             else:
                 if spec.get("stream_head") and len(rows) == 2:
@@ -1629,31 +1638,27 @@ def _tile_fn(ty, spec):
                     # advancing. Preserve one f32 FMA per group and row.
                     groups = spec["k"] // G
                     assert groups % 8 == 0
-                    window = scf.ForOp(
-                        fn.idx(0),
-                        fn.idx(groups),
-                        fn.idx(8),
-                        [fn.const(vf, 0.0)] * 2,
-                    )
+                    scratch = [_stream_head_scratch(fn, ty) for _ in rows]
+                    at = [fn.idx(0), fn.idx(0)]
+                    for buf in scratch:
+                        vector.StoreOp(fn.const(vf, 0.0), buf, at)
+                    window = scf.ForOp(fn.idx(0), fn.idx(groups), fn.idx(8))
                     with ir.InsertionPoint(window.body):
-                        scf.YieldOp(
-                            [
-                                _stream_head_tile(
-                                    fn,
-                                    ty,
-                                    spec,
-                                    a,
-                                    a["wt"],
-                                    row,
-                                    window.induction_variable,
-                                    acc,
-                                )
-                                for row, acc in zip(
-                                    rows, window.inner_iter_args
-                                )
-                            ]
-                        )
-                    vals = window.results
+                        for row, buf in zip(rows, scratch):
+                            _stream_head_tile(
+                                fn,
+                                ty,
+                                spec,
+                                a,
+                                a["wt"],
+                                row,
+                                window.induction_variable,
+                                buf,
+                            )
+                        scf.YieldOp([])
+                    vals = [
+                        vector.LoadOp(vf, buf, at).result for buf in scratch
+                    ]
                 elif spec.get("stream_head"):
                     vals = [
                         _stream_head_tile(fn, ty, spec, a, a["wt"], rows[0])
@@ -3711,19 +3716,34 @@ def _ime_tile_fn(ty, spec):
                 nb = nl.induction_variable
                 col = _addi(a["ocol"], _muli(nb, fn.idx(8)))
                 base = _muli(nb, fn.idx(256))
-                # SiLU(gate) * up over a half block (32 rows x 8) at once
-                v256 = _vec(256, ty.f32)
+                # Eight rows keep the SiLU epilogue at LMUL 2 at VLEN 1024.
+                # Accumulator layout, HP dot steps and K order are unchanged.
+                rows_per_strip = 8 if spec.get("narrow_ime_epilogue") else 32
+                lanes = rows_per_strip * 8
+                vf = _vec(lanes, ty.f32)
                 for h in (0, 1):
-                    gate_at = _addi(base, fn.idx(h * half))
-                    up_at = _addi(gate_at, fn.idx(nbw * 256))
-                    gate = vector.LoadOp(v256, acc, [gate_at]).result
-                    up = vector.LoadOp(v256, acc, [up_at]).result
-                    val = _silu_mul(fn, ty, gate, up, 256)
-                    for r in range(32):
-                        row = vector.ExtractStridedSliceOp(
-                            v8f, val, [r * 8], [8], [1]
-                        ).result
-                        vector.StoreOp(row, a["out"], [fn.idx(32 * h + r), col])
+                    strip = scf.ForOp(
+                        fn.idx(0), fn.idx(32), fn.idx(rows_per_strip)
+                    )
+                    with ir.InsertionPoint(strip.body):
+                        r0 = strip.induction_variable
+                        gate_at = _addi(
+                            _addi(base, fn.idx(h * half)), _muli(r0, fn.idx(8))
+                        )
+                        up_at = _addi(gate_at, fn.idx(nbw * 256))
+                        gate = vector.LoadOp(vf, acc, [gate_at]).result
+                        up = vector.LoadOp(vf, acc, [up_at]).result
+                        val = _silu_mul(fn, ty, gate, up, lanes)
+                        for r in range(rows_per_strip):
+                            row = vector.ExtractStridedSliceOp(
+                                v8f, val, [r * 8], [8], [1]
+                            ).result
+                            vector.StoreOp(
+                                row,
+                                a["out"],
+                                [_addi(r0, fn.idx(32 * h + r)), col],
+                            )
+                        scf.YieldOp([])
                 scf.YieldOp([])
         else:
 
