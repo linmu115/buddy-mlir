@@ -106,7 +106,9 @@ def projection_code(args, owner, schema, positions):
     for name, (_, (n, k)) in schema.items():
         tiles, ime, size = positions[name]
         branches = []
-        for rows in [1, 2] if owner == "head" else [1, 2, args.chunk]:
+        for rows in (
+            [1, 2, 3, 4] if owner == "head" else [1, 2, 3, 4, args.chunk]
+        ):
             matrix = tiles != ime and rows == args.chunk
             spec = k3_w4.kernel_spec(
                 "glu" if name == "glu" else "plain",
@@ -123,6 +125,8 @@ def projection_code(args, owner, schema, positions):
                 spec["name"] += "_res_rhs"
             if name == "glu" and rows == 2 and (n, k) == (17408, 5120):
                 spec["full_width_glu"] = True
+            if rows in (3, 4):
+                spec["verify"] = True
             symbol = spec["name"]
             extra_arg = ", Descriptor<2>*" if residual else ""
             res_desc = (
@@ -160,7 +164,17 @@ def compile_kernels(args, dest, specs):
 
     cross = any("target=riscv64" in flag for flag in args.cxx_flag)
     objects = []
-    for part in ["main"] + (["ime"] if any(s["ime"] for s in specs) else []):
+    parts = [("main", specs)]
+    if cross:
+        parts = [
+            ("main", [s for s in specs if not s.get("verify")]),
+            ("verify", [s for s in specs if s.get("verify")]),
+        ]
+    if any(s["ime"] for s in specs):
+        parts.append(("ime", specs))
+    for part, selected in parts:
+        if not selected:
+            continue
         pipeline = (
             "kernels_ime"
             if part == "ime"
@@ -173,10 +187,16 @@ def compile_kernels(args, dest, specs):
         stages = build_stages(
             pipeline, args.threads, ATTRS if cross else "", "w4g32", arena=True
         )
+        if part == "verify":
+            # Otherwise LLVM combines adjacent scalar descriptor fields into
+            # an RVV register and spills it across the arena allocation call.
+            stages[-1][1].append("-combiner-store-merging=false")
         path = dest / f"w4-{part}.mlir"
-        path.write_text(k3_w4.gen_kernels(specs, part=part, fixed_vlen=cross))
+        path.write_text(
+            k3_w4.gen_kernels(selected, part="ime" if part == "ime" else "main", fixed_vlen=cross)
+        )
         obj = path.with_suffix(".o")
-        if part == "main":
+        if part in ("main", "verify"):
             lowered = dest / "w4-workshares.mlir"
             run_pipeline(
                 stages[:1], path, lowered, args.buddy_opt, args.llvm_bin

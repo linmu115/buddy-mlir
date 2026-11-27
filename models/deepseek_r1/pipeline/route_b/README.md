@@ -294,3 +294,39 @@ KV rows, assigns query heads to workers and scores only through each row's
 position. Its tiled softmax recomputes an earlier prefix when the running
 maximum rises. This preserves the ordered denominator and rounds probabilities
 before the value product, including at the input boundary to the W4 mixer.
+### Multi-step greedy speculation
+
+Use `--spec-mode dspark` for adaptive greedy verification (default depth 3,
+`--dspark-tau 0.55 --dspark-min-p 0.35`). Use `--spec-mode mtp` for fixed
+predictor depth or `--spec-mode ngram` for lookup without loading predictor
+weights. All three accept `--max-draft 1|2|3`. The legacy `--mtp` keeps depth
+one. Omitting speculative options runs the ordinary greedy baseline.
+
+DSpark tries the most recent continuation of the longest matching suffix
+(length 5 down to 3). Pure lookup also tries length 2 and uses scalar decode
+on a miss. Each MTP step consumes the shifted embedding and normalized hidden
+from the previous step. DSpark always retains its first proposal and drops a
+deeper proposal when either the top probability or its running product falls
+below the matching threshold. Lookup hits defer predictor KV updates until
+MTP is needed again. Both the remaining token budget and context bound depth.
+
+Verification sends exactly one to four hidden rows per stage hop; the reply
+contains the accepted prefix length and one target token. GDN checkpoints
+both convolution and recurrent state after each possible non-final prefix.
+Attention clears rejected KV rows and advances by the committed prefix.
+Only the active verification needs checkpoint storage, shared across slots.
+Compare greedy tokens within the same wire precision.
+
+Per-request JSON includes three-element arrays `draft_k_histogram`,
+`mtp_k_histogram`, `draft_depth_proposed`, `draft_depth_accepted` and
+`draft_depth_accept_rate` in order of increasing depth. Rates count
+prefix-accepted tokens divided by all proposals at that depth.
+`avg_drafted_k` and `avg_accepted_per_step` include lookup misses and scalar
+tail steps in the step denominator.
+
+To refresh an existing pack, pass its `route-b.json` as `--template-index` to
+`build_route_b_hybrid.py` with the matching config, shape, dtype and IME
+options. The fresh output directory contains the template DSOs, runtime (W4)
+and updated index. The compiler checks the descriptor layouts and copies
+weight receipts verbatim. Install the new index alongside the DSOs when both
+ranks are offline. A deployment must keep the existing tokenizer and weights.

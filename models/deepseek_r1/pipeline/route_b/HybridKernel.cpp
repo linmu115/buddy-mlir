@@ -219,7 +219,7 @@ void mix(const BJ47WeightsV1 &weights, const float *x, float *convState,
   proj_inProjZ(weights, x, z.data(), rows);
   constexpr int group = valueHeads / keyHeads;
   const auto *snapshot =
-      rows == 2 ? static_cast<const BJ47VerifyRows *>(frame.aux) : nullptr;
+      rows >= 2 && rows <= 4 ? static_cast<const BJ47VerifyRows *>(frame.aux) : nullptr;
 #ifdef HYBRID_THREADS
 #pragma omp parallel for schedule(static) num_threads(HYBRID_THREADS)
 #endif
@@ -229,7 +229,9 @@ void mix(const BJ47WeightsV1 &weights, const float *x, float *convState,
       auto base = offset * convKernel;
       convolve(qkvBuffer.data() + t * convDim + offset, convState + base,
                w + convWeight + base, n,
-               snapshot && t == 0 ? snapshot->conv_snapshot + base : nullptr);
+               snapshot && t + 1 < valid
+                   ? snapshot->conv_snapshot + size_t(t) * convDim * convKernel + base
+                   : nullptr);
     };
     for (int t = 0; t < valid; ++t) {
       prepare(t, kh * keyDim, keyDim);
@@ -270,7 +272,7 @@ void mix(const BJ47WeightsV1 &weights, const float *x, float *convState,
       const auto *v = qkvBuffer.data() + 2 * keyWidth + h * valueDim;
       float *state = ssmState + h * keyDim * valueDim;
       float *head = core.data() + h * valueDim;
-      if (rows <= 2
+      if (rows <= 4
 #ifdef HYBRID_RECURRENT_REFERENCE
           || rows == chunk
 #endif
@@ -279,11 +281,10 @@ void mix(const BJ47WeightsV1 &weights, const float *x, float *convState,
           recurrentStep(state, q + t * convDim, k + t * convDim,
                         v + t * convDim, head + t * valueWidth, b[t],
                         std::exp(a[t]));
-          if (rows == 2 && t == 0)
+          if (snapshot && t + 1 < valid)
             std::copy_n(
                 state, keyDim * valueDim,
-                static_cast<const BJ47VerifyRows *>(frame.aux)->ssm_snapshot +
-                    h * keyDim * valueDim);
+                snapshot->ssm_snapshot + (size_t(t) * valueHeads + h) * keyDim * valueDim);
         }
       } else
         hybrid::chunkGDN(q, k, v, convDim, a, b, 1, state, head, valueWidth,
@@ -425,18 +426,20 @@ void mix(const BJ47WeightsV1 &weights, const float *x, float *keys,
     }
   }
 #ifdef HYBRID_THREADS
-  if (rows <= 2 && attentionHeads / kvHeads == 6 && headDim == 256) {
+  if (rows <= 4 && attentionHeads / kvHeads == 6 && headDim == 256) {
     // A verify call can straddle visible lengths 384 and 385. Partition
-    // each row independently, sharing a single team across both rows.
+    // each row independently, sharing a single team across all verifier rows.
     const int position = frame.cache_position;
     auto itemsPerKv = [](int pos) { return pos < 384 ? 3 : 2; };
-    const int firstRow = kvHeads * itemsPerKv(position);
-    const int total =
-        firstRow + (valid == 2 ? kvHeads * itemsPerKv(position + 1) : 0);
+    int offset[5] = {};
+    for (int r = 0; r < valid; ++r)
+      offset[r + 1] = offset[r] + kvHeads * itemsPerKv(position + r);
 #pragma omp parallel for schedule(static) num_threads(HYBRID_THREADS)
-    for (uint64_t item = 0; item < uint64_t(total); ++item) {
-      const int r = item >= uint64_t(firstRow);
-      const int index = int(item) - r * firstRow;
+    for (uint64_t item = 0; item < uint64_t(offset[valid]); ++item) {
+      int r = 0;
+      while (int(item) >= offset[r + 1])
+        ++r;
+      const int index = int(item) - offset[r];
       const int items = itemsPerKv(position + r);
       const int group = items == 3 ? 2 : 4;
       const int kv = index / items, first = (index % items) * group;
@@ -453,7 +456,7 @@ void mix(const BJ47WeightsV1 &weights, const float *x, float *keys,
   {
     // The complete KV suffix is now visible. Each row reads its causal prefix.
     constexpr bool online =
-        headDim == 256 && attentionHeads == 24 && kvHeads == 4;
+        headDim == 256 && attentionHeads / kvHeads == 6;
     const int stride = frame.cache_position + valid;
     hybrid::Scratch scratch(size_t(attentionHeads) * stride * (online ? 2 : 1));
 #ifdef HYBRID_THREADS
@@ -602,7 +605,7 @@ extern "C" int32_t lm_head_normalize(const BJ47WeightsV1 *w, const float *input,
 }
 extern "C" int32_t lm_head_linear(const BJ47WeightsV1 *w, const float *input,
                                   float *out, int rows) {
-  if (!w || !input || !out || input == out || (rows != 1 && rows != 2) ||
+  if (!w || !input || !out || input == out || (rows < 1 || rows > 4) ||
       (kernelInfo.base.i8_elements ? !w->q4 : !w->f32))
     return -1;
   proj_lmHead(*w, input, out, rows);
@@ -633,7 +636,7 @@ extern "C" int32_t mtp_forward(const BJ47WeightsV1 *w, const float *embedding,
                                const BJ47FrameV1 *frame, float *out, int rows) {
   if (!w || !w->f32 || (kernelInfo.base.i8_elements && !w->q4) || !embedding ||
       !hidden || !frame || !frame->aux || !out ||
-      (rows != 1 && rows != 2 && rows != chunk))
+      ((rows < 1 || rows > 4) && rows != chunk))
     return -1;
   const auto valid =
       static_cast<const BJ47FrameRowsV2 *>(frame->aux)->valid_rows;
@@ -655,19 +658,28 @@ extern "C" int32_t mtp_forward(const BJ47WeightsV1 *w, const float *embedding,
   return 0;
 }
 #else
-extern "C" int32_t layer_verify_2(const BJ47WeightsV1 *w, const float *input,
-                                  float *a, float *b, const BJ47FrameV1 *frame,
-                                  float *out) {
+extern "C" int32_t layer_verify(const BJ47WeightsV1 *w, const float *input,
+                                float *a, float *b, const BJ47FrameV1 *frame,
+                                float *out) {
   if (!frame || !frame->aux)
     return -1;
   const auto *aux = static_cast<const BJ47VerifyRows *>(frame->aux);
-  if (aux->rows.valid_rows != 2)
+  if (aux->rows.valid_rows < 2 || aux->rows.valid_rows > 4)
     return -2;
 #if HYBRID_ROLE == 4
   if (!aux->conv_snapshot || !aux->ssm_snapshot)
     return -1;
 #endif
-  return layer(w, input, a, b, frame, out, 2);
+  return layer(w, input, a, b, frame, out,
+               static_cast<int>(aux->rows.valid_rows));
+}
+extern "C" int32_t layer_verify_2(const BJ47WeightsV1 *w, const float *input,
+                                  float *a, float *b, const BJ47FrameV1 *frame,
+                                  float *out) {
+  if (!frame || !frame->aux ||
+      static_cast<const BJ47FrameRowsV2 *>(frame->aux)->valid_rows != 2)
+    return -2;
+  return layer_verify(w, input, a, b, frame, out);
 }
 extern "C" int32_t layer_prefill(const BJ47WeightsV1 *w, const float *input,
                                  float *a, float *b, const BJ47FrameV1 *frame,

@@ -322,7 +322,9 @@ inline int32_t embed<{rows}>(const EmbedElement *table, const int64_t *ids, floa
             and not (owner == "gdn" and name in ("inProjA", "inProjB"))
         }
         for n, k in sorted(set(projections.values())):
-            for rows in [1, 2] if owner == "head" else [1, 2, d["chunk"]]:
+            for rows in (
+                [1, 2, 3, 4] if owner == "head" else [1, 2, 3, 4, d["chunk"]]
+            ):
                 mlir.append(ir.projection(n, k, rows))
                 header += f"""
 extern "C" void _mlir_ciface_project_{rows}_{n}_{k}(Descriptor<2> *, Descriptor<2> *, Descriptor<2> *);
@@ -338,6 +340,8 @@ inline void project<{rows}, {n}, {k}>(const float *w, const float *x, float *y) 
 inline void proj_{name}(const BJ47WeightsV1 &w, const float *x, float *y, int rows) {{
   if (rows == 1) project<1, {n}, {k}>(w.f32 + {name}, x, y);
   else if (rows == 2) project<2, {n}, {k}>(w.f32 + {name}, x, y);
+  else if (rows == 3) project<3, {n}, {k}>(w.f32 + {name}, x, y);
+  else if (rows == 4) project<4, {n}, {k}>(w.f32 + {name}, x, y);
   {"" if owner == "head" else f"else project<chunk, {n}, {k}>(w.f32 + {name}, x, y);"}
 }}
 """
@@ -366,7 +370,14 @@ inline void deltaStep(float *s, const float *q, const float *k, const float *v,
         elif owner == "mtp":
             symbols.append("mtp_forward")
         else:
-            symbols.extend(["layer_prefill", "layer_decode", "layer_verify_2"])
+            symbols.extend(
+                [
+                    "layer_prefill",
+                    "layer_decode",
+                    "layer_verify_2",
+                    "layer_verify",
+                ]
+            )
         if owner in ("full_attn", "mtp"):
             symbols.extend(["prepare_prefill", "prepare_decode"])
     return header, "\n".join(mlir), symbols
@@ -522,67 +533,88 @@ def export_bundle(args):
     role_names = [
         role for role in ROLE_IDS if OWNERS[role] in {"embed", "head", *types}
     ]
-    index = weights_index(args.checkpoint)
-    mtp_keys = {key for key in index if key.startswith("mtp.")}
-    has_mtp = bool(mtp_keys) and not getattr(args, "no_mtp", False)
-    if has_mtp:
-        expected = {field for field, _ in schema["mtp"].values()}
-        if mtp_keys != expected:
-            raise ValueError(
-                f"unexpected MTP schema: {sorted(mtp_keys ^ expected)}"
-            )
-        role_names.append("mtp_layer")
     args.work.mkdir(parents=True, exist_ok=True)
     vocab_path = args.output / "vocab.txt"
-    assets = {}
-    tokenizer_dir = args.tokenizer_dir or args.checkpoint
-    if (tokenizer_dir / "tokenizer.json").exists():
-        for name in (
-            "tokenizer.json",
-            "tokenizer_config.json",
-            "chat_template.jinja",
-            "qwen_bpe.py",
+    original = None
+    if getattr(args, "template_index", None):
+        original = json.loads(args.template_index.read_text())
+        identifier = original.pop("bundle_id")
+        if (
+            identifier != digest(original)
+            or original["shape_id"] != shape
+            or original["layer_types"] != types
+            or original["pack_version"]
+            != f"qwen3_5-{args.variant}/{2 if quant else 1}"
+            or original["prefill_ime"] != args.prefill_ime
         ):
-            src = (
-                ROOT / "tools/route_b_serve" / name
-                if name.endswith(".py")
-                else tokenizer_dir / name
-            )
-            dst = args.output / name
-            shutil.copyfile(src, dst)
-            assets[name] = file_digest(dst)
-        data = json.loads((args.output / "tokenizer.json").read_bytes())
-        from route_b_hybrid_unicode import build_tables
-
-        unicode_asset = args.output / "unicode.json"
-        unicode_asset.write_text(canonical(build_tables()), encoding="utf-8")
-        assets[unicode_asset.name] = file_digest(unicode_asset)
-        added = {item["content"]: item["id"] for item in data["added_tokens"]}
-        for token, expected in {
-            "<|endoftext|>": 248044,
-            "<|im_start|>": 248045,
-            "<|im_end|>": 248046,
-            "<think>": 248068,
-            "</think>": 248069,
-        }.items():
-            if added.get(token) != expected:
-                raise ValueError(f"unexpected tokenizer id for {token}")
-        tokens = [""] * dims["vocab"]
-        for token, i in data["model"]["vocab"].items():
-            tokens[i] = token
-        for item in data["added_tokens"]:
-            tokens[item["id"]] = item["content"]
-        vocab_path.write_text("\n".join(tokens) + "\n", encoding="utf-8")
-    elif quant or args.tokenizer_dir:
-        raise ValueError(
-            "w4g32 and --tokenizer-dir require the official tokenizer assets"
-        )
-    elif args.vocab is not None:
-        shutil.copyfile(args.vocab, vocab_path)
+            raise ValueError("incompatible template index or config")
+        has_mtp = original["has_mtp"]
+        if has_mtp:
+            role_names.append("mtp_layer")
     else:
-        raise ValueError(
-            "provide --vocab for a legacy f32 fixture or --tokenizer-dir"
-        )
+        index = weights_index(args.checkpoint)
+        mtp_keys = {key for key in index if key.startswith("mtp.")}
+        has_mtp = bool(mtp_keys) and not getattr(args, "no_mtp", False)
+        if has_mtp:
+            expected = {field for field, _ in schema["mtp"].values()}
+            if mtp_keys != expected:
+                raise ValueError(
+                    f"unexpected MTP schema: {sorted(mtp_keys ^ expected)}"
+                )
+            role_names.append("mtp_layer")
+        assets = {}
+        tokenizer_dir = args.tokenizer_dir or args.checkpoint
+        if (tokenizer_dir / "tokenizer.json").exists():
+            for name in (
+                "tokenizer.json",
+                "tokenizer_config.json",
+                "chat_template.jinja",
+                "qwen_bpe.py",
+            ):
+                src = (
+                    ROOT / "tools/route_b_serve" / name
+                    if name.endswith(".py")
+                    else tokenizer_dir / name
+                )
+                dst = args.output / name
+                shutil.copyfile(src, dst)
+                assets[name] = file_digest(dst)
+            data = json.loads((args.output / "tokenizer.json").read_bytes())
+            from route_b_hybrid_unicode import build_tables
+
+            unicode_asset = args.output / "unicode.json"
+            unicode_asset.write_text(
+                canonical(build_tables()), encoding="utf-8"
+            )
+            assets[unicode_asset.name] = file_digest(unicode_asset)
+            added = {
+                item["content"]: item["id"] for item in data["added_tokens"]
+            }
+            for token, expected in {
+                "<|endoftext|>": 248044,
+                "<|im_start|>": 248045,
+                "<|im_end|>": 248046,
+                "<think>": 248068,
+                "</think>": 248069,
+            }.items():
+                if added.get(token) != expected:
+                    raise ValueError(f"unexpected tokenizer id for {token}")
+            tokens = [""] * dims["vocab"]
+            for token, i in data["model"]["vocab"].items():
+                tokens[i] = token
+            for item in data["added_tokens"]:
+                tokens[item["id"]] = item["content"]
+            vocab_path.write_text("\n".join(tokens) + "\n", encoding="utf-8")
+        elif quant or args.tokenizer_dir:
+            raise ValueError(
+                "w4g32 and --tokenizer-dir require the official tokenizer assets"
+            )
+        elif args.vocab is not None:
+            shutil.copyfile(args.vocab, vocab_path)
+        else:
+            raise ValueError(
+                "provide --vocab for a legacy f32 fixture or --tokenizer-dir"
+            )
     kernels, weights, layouts = [], [], {}
     compiled = {}
     for role in role_names:
@@ -616,7 +648,7 @@ def export_bundle(args):
             offsets[name] = count
             count += math.prod(weight_shape)
         ids = [i for i, kind in enumerate(types) if kind == owner]
-        for layer in ids or [None]:
+        for layer in [] if original else ids or [None]:
             label = owner if layer is None else f"{owner}-{layer}"
             path = args.output / f"{label}.{dtype}"
             pack(
@@ -663,48 +695,67 @@ def export_bundle(args):
                 "shape_id": shape,
             }
         )
-    if "full_attn" in types or has_mtp:
-        rotary = dims["rotaryDim"]
-        freq = 1.0 / (
-            rope["rope_theta"]
-            ** (torch.arange(0, rotary, 2, dtype=torch.float32) / rotary)
-        )
-        path = args.output / "rope.f32"
-        path.write_bytes(freq.numpy().tobytes())
-        layouts["rope"] = digest({"inv_freq": rotary // 2})
-        weights.append(
-            weight_receipt(path, "rope", "f32", rotary // 2, layouts["rope"])
-        )
-    manifest = {
-        "format": "bj47.route-b/1",
-        "model_id": args.model_id,
-        "architecture": "Qwen3_5ForConditionalGeneration",
-        "variant": args.variant,
-        "kernels": "k3",
-        "prefill_ime": args.prefill_ime,
-        "activation_type": "f32",
-        "total_layers": len(types),
-        "layer_types": types,
-        "activation_width": dims["width"],
-        "context": dims["context"],
-        "prefill_chunk": dims["chunk"],
-        "kv_heads": dims["kvHeads"],
-        "head_dim": dims["headDim"],
-        "vocab_size": dims["vocab"],
-        "eos_id": c["eos_token_id"],
-        "tokenizer": args.tokenizer,
-        "stop_token_ids": [248044, 248046],
-        "vocab_file": vocab_path.name,
-        "vocab_sha256": file_digest(vocab_path),
-        "pack_version": f"qwen3_5-{args.variant}/{2 if quant else 1}",
-        "has_mtp": has_mtp,
-        "shape_id": shape,
-        "layouts": layouts,
-        "templates": kernels,
-        "weights": weights,
-    }
-    if assets:
-        manifest["tokenizer_assets"] = assets
+    if original:
+        for entry in kernels:
+            previous = next(
+                k for k in original["templates"] if k["role"] == entry["role"]
+            )
+            for key in (
+                "layout_id",
+                "shape_id",
+                "f32_elements",
+                "i8_elements",
+                "path",
+                "abi_version",
+            ):
+                if entry[key] != previous[key]:
+                    raise ValueError(f"incompatible {entry['role']} {key}")
+        manifest = original | {"templates": kernels}
+    else:
+        if "full_attn" in types or has_mtp:
+            rotary = dims["rotaryDim"]
+            freq = 1.0 / (
+                rope["rope_theta"]
+                ** (torch.arange(0, rotary, 2, dtype=torch.float32) / rotary)
+            )
+            path = args.output / "rope.f32"
+            path.write_bytes(freq.numpy().tobytes())
+            layouts["rope"] = digest({"inv_freq": rotary // 2})
+            weights.append(
+                weight_receipt(
+                    path, "rope", "f32", rotary // 2, layouts["rope"]
+                )
+            )
+        manifest = {
+            "format": "bj47.route-b/1",
+            "model_id": args.model_id,
+            "architecture": "Qwen3_5ForConditionalGeneration",
+            "variant": args.variant,
+            "kernels": "k3",
+            "prefill_ime": args.prefill_ime,
+            "activation_type": "f32",
+            "total_layers": len(types),
+            "layer_types": types,
+            "activation_width": dims["width"],
+            "context": dims["context"],
+            "prefill_chunk": dims["chunk"],
+            "kv_heads": dims["kvHeads"],
+            "head_dim": dims["headDim"],
+            "vocab_size": dims["vocab"],
+            "eos_id": c["eos_token_id"],
+            "tokenizer": args.tokenizer,
+            "stop_token_ids": [248044, 248046],
+            "vocab_file": vocab_path.name,
+            "vocab_sha256": file_digest(vocab_path),
+            "pack_version": f"qwen3_5-{args.variant}/{2 if quant else 1}",
+            "has_mtp": has_mtp,
+            "shape_id": shape,
+            "layouts": layouts,
+            "templates": kernels,
+            "weights": weights,
+        }
+        if assets:
+            manifest["tokenizer_assets"] = assets
     if quant:
         manifest.update(
             runtime=runtime.name,
@@ -755,6 +806,11 @@ if __name__ == "__main__":
     parser.add_argument("--embed-dtype", choices=["f16", "f32"], required=True)
     parser.add_argument(
         "--tokenizer", choices=["qwen3_5", "qwen3_8"], default="qwen3_8"
+    )
+    parser.add_argument(
+        "--template-index",
+        type=Path,
+        help="Rebuild only DSOs and manifest for this existing pack. Requires only config.json from --checkpoint.",
     )
     parser.add_argument("--tokenizer-dir", type=Path)
     parser.add_argument("--vocab", type=Path)

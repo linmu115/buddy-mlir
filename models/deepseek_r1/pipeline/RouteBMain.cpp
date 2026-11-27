@@ -16,6 +16,8 @@ void run(int argc, char **argv, int rank, int size) {
   auto wire = pipeline::WireDtype::Native; // Route B computes in f32.
   auto transport = pipeline::Transport::Blocking;
   bool verify = false, serve = false, mtp = false;
+  pipeline::mtp::Options spec;
+  bool legacyMtp = false, explicitDepth = false;
   int slots = 2;
   std::optional<bool> thinking;
   std::optional<std::string> list, single;
@@ -26,7 +28,8 @@ void run(int argc, char **argv, int rank, int size) {
       continue;
     }
     if (opt == "--mtp") {
-      mtp = true;
+      mtp = legacyMtp = true;
+      spec.mode = pipeline::mtp::Mode::Mtp;
       continue;
     }
     if (opt == "--serve") {
@@ -44,7 +47,32 @@ void run(int argc, char **argv, int rank, int size) {
       bundle = val;
     else if (opt == "--ranges")
       list = val;
-    else if (opt == "--stage-range")
+    else if (opt == "--spec-mode") {
+      mtp = true;
+      legacyMtp = false;
+      if (val == "mtp")
+        spec.mode = pipeline::mtp::Mode::Mtp;
+      else if (val == "ngram")
+        spec.mode = pipeline::mtp::Mode::Ngram;
+      else if (val == "dspark")
+        spec.mode = pipeline::mtp::Mode::DSpark;
+      else
+        throw std::invalid_argument("--spec-mode expects mtp, ngram or dspark");
+    } else if (opt == "--max-draft") {
+      explicitDepth = mtp = true;
+      auto [end, ec] =
+          std::from_chars(val.data(), val.data() + val.size(), spec.maxDraft);
+      if (ec != std::errc{} || end != val.data() + val.size() ||
+          spec.maxDraft < 1 || spec.maxDraft > 3)
+        throw std::invalid_argument("--max-draft expects 1..3");
+    } else if (opt == "--dspark-tau" || opt == "--dspark-min-p") {
+      size_t used = 0;
+      double p = std::stod(val, &used);
+      if (used != val.size() || !(p >= 0 && p <= 1))
+        throw std::invalid_argument(opt + " expects a probability in [0,1]");
+      (opt == "--dspark-tau" ? spec.tau : spec.minP) = p;
+      mtp = true;
+    } else if (opt == "--stage-range")
       single = val;
     else if (opt == "--prompt")
       prompts.push_back(std::move(val));
@@ -85,15 +113,22 @@ void run(int argc, char **argv, int rank, int size) {
   const int streamCount = static_cast<int>(prompts.size());
   const int slotCount = serve ? slots : streamCount;
   auto b = TemplateBundle::load(bundle);
-  if (mtp && !b.hasMtp)
+  if (legacyMtp && !explicitDepth)
+    spec.maxDraft = 1;
+  const bool predictor = spec.mode != pipeline::mtp::Mode::Ngram;
+  if (mtp && !b.hybrid)
+    throw std::invalid_argument("speculation requires a hybrid bundle");
+  if (mtp && predictor && !b.hasMtp)
     throw std::invalid_argument(
         "--mtp requires a bundle with predictor weights");
   auto total = b.config.totalLayers;
   LayerRange range{0, total};
-  std::string planIdentity = b.id + ",mtp=" + std::to_string(mtp) +
-                             ",streamCount=" + std::to_string(streamCount) +
-                             ",serveMode=" + std::to_string(serve) +
-                             ",slots=" + std::to_string(slots);
+  std::string planIdentity =
+      b.id + ",mtp=" + std::to_string(mtp) +
+      nlohmann::json({int(spec.mode), spec.maxDraft, spec.tau, spec.minP})
+          .dump() +
+      ",streamCount=" + std::to_string(streamCount) +
+      ",serveMode=" + std::to_string(serve) + ",slots=" + std::to_string(slots);
   if (list && single)
     throw std::invalid_argument("conflicting range options");
   if (list) {
@@ -117,7 +152,8 @@ void run(int argc, char **argv, int rank, int size) {
   pipeline::checkAllStages(MPI_COMM_WORLD, rank, size, b.config, check);
   if (rank == 0)
     b.verifyVocab();
-  auto stage = makeTemplateStage(b, range, verify, slotCount, mtp);
+  auto stage = makeTemplateStage(b, range, verify, slotCount, mtp,
+                                 spec.maxDraft, predictor);
   checkLocalConfig(b.spec, stage->configuration());
   auto opts = makeGenerateOptions(b.spec, b.vocab.string(), cfg,
                                   stage->configuration(), rank, size);
@@ -144,7 +180,7 @@ void run(int argc, char **argv, int rank, int size) {
     pipeline::mtp::generate(
         opts, *stage, MPI_COMM_WORLD, rank, size,
         b.weights.count({"embed", -1, "f16"}), serve, prompts,
-        list.value_or(single.value_or("0:" + std::to_string(total))));
+        list.value_or(single.value_or("0:" + std::to_string(total))), spec);
   } else if (serve) {
     pipeline::generateResident(
         opts, *stage, MPI_COMM_WORLD, rank, size, slots,

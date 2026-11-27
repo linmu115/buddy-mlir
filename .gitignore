@@ -41,3 +41,6 @@ ttrt-artifacts/
 # SyncBots agent output (upgrade logs / iteration summaries)
 syncbots-output/
 llm_config.yaml
+
+# Locally staged 27B speculative-decoding DSOs and host executable.
+/stage-k3-27b-spec/

@@ -1573,6 +1573,36 @@ def _tile_fn(ty, spec):
     fn = _Fn(f"{spec['name']}__tile", _tile_types(ty, spec), [], public=False)
     a = dict(zip(names, fn.args))
     vf = _vec(NB, ty.f32)
+    if spec.get("verify"):
+        # Strip-mine the 128 columns so four fp32 sums and four gated
+        # results fit in the RVV register file. Each byte belongs to one strip.
+        lanes = 32 if spec["kind"] == "glu" and m == 4 else 64
+        with ir.InsertionPoint(fn.entry):
+            strips = scf.ForOp(fn.idx(0), fn.idx(NB), fn.idx(lanes))
+            with ir.InsertionPoint(strips.body):
+                col = strips.induction_variable
+                rows = [fn.idx(r) for r in range(m)]
+                if spec["kind"] == "glu":
+                    tg = _muli(a["wt"], fn.idx(2))
+                    gate = _accumulate(fn, ty, spec, a, tg, rows, lanes=lanes, column=col)
+                    up = _accumulate(
+                        fn, ty, spec, a, _addi(tg, fn.idx(1)), rows, lanes=lanes, column=col
+                    )
+                    vals = [
+                        _silu_mul(fn, ty, g, u, lanes) for g, u in zip(gate, up)
+                    ]
+                else:
+                    vals = _accumulate(
+                        fn, ty, spec, a, a["wt"], rows, lanes=lanes, column=col
+                    )
+                for row, value in zip(rows, vals):
+                    at = [row, _addi(a["ocol"], col)]
+                    if spec.get("residual"):
+                        value = _residual_sum(fn, ty, spec, value, a["res"], at)
+                    vector.StoreOp(value, a["out"], at)
+                scf.YieldOp([])
+            func.ReturnOp([])
+        return
     with ir.InsertionPoint(fn.entry):
         loop = scf.ForOp(fn.idx(0), fn.idx(m), fn.idx(mb))
         with ir.InsertionPoint(loop.body):
